@@ -1,0 +1,5 @@
+[2026-09-02T11:30:45.683Z] [dispatch] pool type=ANALYZE task=ANALYZE attempt=1 session=session-2002a3e9-3790-43af-8aac-16aca465af3a ui=http://127.0.0.1:53950
+[2026-09-02T11:36:46.406Z] [dispatch] pool type=ANALYZE task=ANALYZE attempt=1 session=session-07813037-d8d3-410b-adee-6db9d09248f7 ui=http://127.0.0.1:55215
+[2026-09-02T11:38:47.654Z] [settle] outbox written task=ANALYZE ms=123018
+[2026-09-02T11:38:53.118Z] [error] state=ANALYZING GPT_LOGIN_REQUIRED: ChatGPT 未登录
+[2026-09-02T11:38:55.332Z] [error] state=ERROR GPT_LOGIN_REQUIRED: ChatGPT 未登录

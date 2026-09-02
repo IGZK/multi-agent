@@ -1,0 +1,42 @@
+2026/09/02-00:20:51.472 2864 Reusing MANIFEST C:\Users\Administrator\Desktop\双agent工作台\browser-profile\Default\Local Storage\leveldb/MANIFEST-000001
+2026/09/02-00:20:51.474 2864 Recovering log #91
+2026/09/02-00:20:51.475 2864 Reusing old log C:\Users\Administrator\Desktop\双agent工作台\browser-profile\Default\Local Storage\leveldb/000091.log 
+2026/09/02-00:21:51.489 616c Level-0 table #95: started
+2026/09/02-00:21:51.494 616c Level-0 table #95: 93346 bytes OK
+2026/09/02-00:21:51.497 616c Delete type=0 #91
+2026/09/02-00:23:39.277 616c Level-0 table #97: started
+2026/09/02-00:23:39.279 616c Level-0 table #97: 44035 bytes OK
+2026/09/02-00:23:39.281 616c Delete type=0 #94
+2026/09/02-00:23:39.282 616c Compacting 4@0 + 1@1 files
+2026/09/02-00:23:39.285 616c Generated table #98@0: 29 keys, 45140 bytes
+2026/09/02-00:23:39.285 616c Compacted 4@0 + 1@1 files => 45140 bytes
+2026/09/02-00:23:39.286 616c compacted to: files[ 0 1 1 0 0 0 0 ]
+2026/09/02-00:23:39.286 616c Delete type=2 #88
+2026/09/02-00:23:39.286 616c Delete type=2 #90
+2026/09/02-00:23:39.286 616c Delete type=2 #92
+2026/09/02-00:23:39.286 616c Delete type=2 #95
+2026/09/02-00:23:39.287 616c Delete type=2 #97
+2026/09/02-00:28:03.954 616c Level-0 table #100: started
+2026/09/02-00:28:03.956 616c Level-0 table #100: 38263 bytes OK
+2026/09/02-00:28:03.957 616c Delete type=0 #96
+2026/09/02-00:33:24.235 616c Level-0 table #102: started
+2026/09/02-00:33:24.238 616c Level-0 table #102: 38023 bytes OK
+2026/09/02-00:33:24.240 616c Delete type=0 #99
+2026/09/02-00:38:05.407 616c Level-0 table #104: started
+2026/09/02-00:38:05.410 616c Level-0 table #104: 38019 bytes OK
+2026/09/02-00:38:05.411 616c Delete type=0 #101
+2026/09/02-00:43:03.900 616c Level-0 table #106: started
+2026/09/02-00:43:03.903 616c Level-0 table #106: 37953 bytes OK
+2026/09/02-00:43:03.905 616c Delete type=0 #103
+2026/09/02-00:43:03.905 616c Compacting 4@0 + 1@1 files
+2026/09/02-00:43:03.908 616c Generated table #107@0: 29 keys, 45169 bytes
+2026/09/02-00:43:03.908 616c Compacted 4@0 + 1@1 files => 45169 bytes
+2026/09/02-00:43:03.909 616c compacted to: files[ 0 1 1 0 0 0 0 ]
+2026/09/02-00:43:03.910 616c Delete type=2 #98
+2026/09/02-00:43:03.910 616c Delete type=2 #100
+2026/09/02-00:43:03.910 616c Delete type=2 #102
+2026/09/02-00:43:03.910 616c Delete type=2 #104
+2026/09/02-00:43:03.910 616c Delete type=2 #106
+2026/09/02-00:47:52.673 616c Level-0 table #109: started
+2026/09/02-00:47:52.676 616c Level-0 table #109: 39432 bytes OK
+2026/09/02-00:47:52.677 616c Delete type=0 #105

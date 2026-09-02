@@ -1,0 +1,6 @@
+{
+  "type": "TASK_DONE",
+  "task_id": "ANALYZE",
+  "report_file": ".gpt_workspace/project_analysis.md",
+  "summary": "重新生成最终项目分析：全部8项任务已完成、0失败；重构目标全部达成——稳定角色/协议下沉为仅工作台调用生效的底层Skill(skills/workbench-executor/SKILL.md+供给/激活/上下文门控三层保障)，同项目复用同一Harness会话(每项目dsh web服务+持久会话,按projectId隔离,崩溃自动恢复)，项目初始化与Task消息精简(init -79.5%、task.json -27.6%、后续合计-14.9%)，增量上下文context_cache+计数引用，保留重试/REPLAN/审查能力；对照源码核实getOrCreateSession/workbench_skill.mjs/buildTaskMessage/context_cache均存在。已产出project_analysis.md及时间戳副本(analysis/project_analysis-20260902-193803.md)。建议重启工作台后跑真实2-3任务项目做最终回归。"
+}

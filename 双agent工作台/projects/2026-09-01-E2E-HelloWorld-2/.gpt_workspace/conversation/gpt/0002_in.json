@@ -1,0 +1,5 @@
+{
+  "dir": "in",
+  "ts": "2026-09-01T13:26:52.533Z",
+  "text": "<GPT_RESPONSE>\n<STATUS>READY</STATUS>\n<PLAN>\nstatus: READY\nproject_name: E2E-HelloWorld\nobjective: 创建一个可直接运行的 Python Hello World 项目，并提供 README 说明运行方法。\n\ngoals:\n\n创建最小可运行的 Python Hello World 程序\n\n添加 README.md，明确说明项目用途、运行环境和运行方法\n\n验证程序能够正常执行并输出 Hello World\n\ntasks:\n\nid: TASK-001\ndescription: 创建 Python Hello World 主程序文件，实现运行后输出“Hello, World!”\npriority: high\ndependencies:\n\nid: TASK-002\ndescription: 创建 README.md，说明项目简介、Python 环境要求以及从项目目录运行程序的方法，并与实际文件保持一致\npriority: high\ndependencies:\n\nTASK-001\n\nid: TASK-003\ndescription: 运行 Hello World 程序进行最终验证，并检查 README 中描述的文件名和运行命令与项目实际结构一致\npriority: high\ndependencies:\n\nTASK-002\n\nacceptance_criteria:\n\n项目包含可运行的 Python Hello World 程序\n\n程序直接执行成功且退出码为 0\n\n程序输出包含“Hello, World!”\n\n项目包含 README.md\n\nREADME.md 清楚说明运行方法和必要的 Python 环境要求\n\nREADME 中的运行命令可以直接用于运行实际程序\n\n不引入不必要的第三方依赖\n\n所有任务完成后项目结构简洁、无明显无关文件\n\nconstraints:\n\n使用 Python\n\n不使用第三方依赖\n\n保持项目最小化，不添加与目标无关的功能或文件\n\n以实际运行测试结果作为最终验收依据\n\nquestions_for_executor:\n\n按任务依赖顺序执行；每完成一个任务后验证其产出\n\n不要擅自扩大项目范围\n\n</PLAN>\n\n</GPT_RESPONSE>"
+}

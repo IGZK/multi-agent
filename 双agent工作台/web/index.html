@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>双 Agent 协作工作台</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">🤝 双 Agent 协作工作台</div>
+    <div class="top-right">
+      <button class="btn small" id="btnTheme" type="button" title="切换深浅色主题">🌙 深色</button>
+      <div class="top-status" id="sysStatus">系统状态加载中…</div>
+    </div>
+  </header>
+
+  <div class="layout">
+    <!-- ============ 左侧：项目上下文 + 文件夹选择 ============ -->
+    <aside class="sidebar">
+      <button id="btnNewProject" class="btn primary new-project-button" type="button">＋ 新建项目</button>
+      <!-- 当前项目（含文件夹选择），未选中时隐藏 -->
+      <div id="currentProjBox" class="current-project hidden">
+        <div class="curp-head">
+          <span class="curp-label">当前项目</span>
+          <span class="badge" id="curpState">-</span>
+        </div>
+        <div class="curp-name" id="curpName">（未选择）</div>
+        <div class="curp-folder">
+          <div class="curp-folder-title">📁 项目文件夹</div>
+          <div class="curp-dir-row">
+            <span class="curp-dir" id="dirHint" title=""></span>
+            <button class="btn small" id="btnSetDir" title="用鼠标选择本项目的本地文件夹">修改</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="proj-list-header">项目列表</div>
+      <ul id="projList" class="proj-list"></ul>
+      <div class="sidebar-footer">
+        <div id="sysInfo" class="sys-info"></div>
+      </div>
+    </aside>
+
+    <!-- ============ 右侧：对话工作台 ============ -->
+    <main class="main">
+      <div id="emptyHint" class="empty-hint">点击左上角“新建项目”，或从左侧选择一个项目。</div>
+      <div id="createView" class="create-view hidden">
+        <div class="create-intro">
+          <h1>开始一个新项目</h1>
+          <p>描述目标后，GPT 负责规划，DeepSeek 负责执行。</p>
+        </div>
+        <div class="create-composer">
+          <input id="projName" placeholder="项目名称（如：计算器）" />
+          <textarea id="projTask" rows="4" placeholder="描述你想完成的任务…"></textarea>
+          <div class="dir-pick-row">
+            <input id="projDir" placeholder="项目文件夹（可选，留空使用默认目录）" />
+            <button id="btnPickDir" class="btn small" type="button">📁 选择</button>
+          </div>
+          <div class="create-options">
+            <input id="projCategory" placeholder="分类（可选）" />
+            <label class="ds-model-row"><span class="mini-label">DeepSeek 模型</span><select id="dsModel"><option value="">跟随默认</option></select></label>
+            <label class="ds-model-row"><span class="mini-label">推理等级</span><select id="dsReasoning">
+              <option value="">跟随默认</option><option value="off">off</option><option value="low">low</option><option value="high">high</option><option value="max">max</option>
+            </select></label>
+          </div>
+          <button id="btnCreate" class="btn primary">创建并开始</button>
+        </div>
+      </div>
+      <div id="detail" class="detail hidden">
+        <!-- 项目顶部信息/状态/设置（过高时可独立滚动，保证底部输入区始终固定） -->
+        <div class="detail-top">
+          <!-- 项目工具栏 -->
+          <div class="detail-head">
+            <h2 id="dName">项目</h2>
+            <span id="dState" class="badge">-</span>
+            <div class="actions">
+              <button class="btn small" id="btnExecWindow" title="打开本项目的 DeepSeek 执行窗口（实时查看任务执行过程）">🖥 打开执行窗口</button>
+              <button class="btn small" id="btnWindow">🖥 显示浏览器</button>
+              <button class="btn small" id="btnPause">⏸ 暂停</button>
+              <button class="btn small" id="btnResume">▶ 继续</button>
+              <button class="btn small" id="btnRetry">🔄 重试</button>
+            </div>
+          </div>
+
+          <!-- 状态/设置带 -->
+          <div id="dGptLive" class="gpt-live hidden"></div>
+          <div class="meta" id="dMeta"></div>
+          <div id="dPending" class="pending-banner hidden"></div>
+          <div id="dExecUi" class="exec-ui-banner hidden"></div>
+          <div id="dError" class="error-banner hidden"></div>
+
+          <!-- 次级导航 -->
+          <div class="tabs">
+            <button class="tab active" data-tab="chat">GPT 对话</button>
+            <button class="tab" data-tab="overview">概览</button>
+            <button class="tab" data-tab="tasks">任务进度</button>
+            <button class="tab" data-tab="plan">GPT 规划</button>
+            <button class="tab" data-tab="analysis">项目分析</button>
+            <button class="tab" data-tab="logs">日志</button>
+          </div>
+        </div>
+
+        <!-- 主体：对话为主视图，次级面板可切换 -->
+        <div class="workbench-body">
+          <div id="convoView" class="convo-scroll">
+            <div id="chatList" class="chat-list"></div>
+          </div>
+
+          <section class="tab-body hidden" id="tab-overview">
+            <div class="card"><h4>用户任务</h4><pre id="oTask"></pre></div>
+            <div class="card"><h4>当前执行</h4><pre id="oCurrent"></pre></div>
+            <div class="card"><h4>最近执行记录</h4><pre id="oRuns"></pre></div>
+          </section>
+
+          <section class="tab-body hidden" id="tab-tasks">
+            <table class="task-table" id="taskTable"><thead><tr><th>ID</th><th>描述</th><th>优先级</th><th>依赖</th><th>状态</th></tr></thead><tbody></tbody></table>
+          </section>
+
+          <section class="tab-body hidden" id="tab-plan">
+            <pre class="file-view" id="planView">（暂无规划）</pre>
+          </section>
+
+          <section class="tab-body hidden" id="tab-analysis">
+            <pre class="file-view" id="analysisView">（暂无分析，任务执行中自动生成）</pre>
+          </section>
+
+          <section class="tab-body hidden" id="tab-logs">
+            <pre class="file-view logs" id="logView"></pre>
+          </section>
+        </div>
+
+        <!-- 底部输入区（Composer）：输入框居中，右侧为操作栏（模型/推理在 TASK-005 加入） -->
+        <div class="composer" id="composer">
+          <div class="composer-attachments" id="attachList"></div>
+          <div class="composer-main">
+            <div class="composer-left">
+              <button class="icon-btn" id="btnAttach" type="button" title="添加文件（可多选）">📎</button>
+              <button class="icon-btn" id="btnAttachPhoto" type="button" title="添加照片（可多选）">📷</button>
+              <input type="file" id="fileInput" multiple hidden />
+              <input type="file" id="photoInput" accept="image/*" multiple hidden />
+            </div>
+            <div class="composer-input-wrap">
+              <textarea id="composerInput" rows="1" placeholder="给 GPT-5.6 Sol 发送消息…（Enter 发送，Shift+Enter 换行）"></textarea>
+            </div>
+            <div class="composer-ops">
+              <div class="composer-model-slot" id="composerModelSlot">
+                <label class="cs-field" title="DeepSeek 模型">
+                  <span class="cs-label">模型</span>
+                  <select id="cModel" class="composer-select"><option value="">默认</option></select>
+                </label>
+                <label class="cs-field" title="推理强度">
+                  <span class="cs-label">推理</span>
+                  <select id="cReasoning" class="composer-select">
+                    <option value="">默认</option>
+                    <option value="off">off</option>
+                    <option value="low">low</option>
+                    <option value="high">high</option>
+                    <option value="max">max</option>
+                  </select>
+                </label>
+              </div>
+              <button class="btn primary send" id="btnComposerSend" type="button" title="发送到当前项目">发送</button>
+            </div>
+          </div>
+          <div class="composer-hint">Enter 发送 · Shift+Enter 换行 · <span id="composerSaveStatus" class="composer-save-status"></span></div>
+        </div>
+      </div>
+    </main>
+  </div>
+  <script src="/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,417 @@
+// 可见执行模块：为每个项目维护一个独立的 DeepSeek Harness Web 服务（专属端口），
+// 通过官方 HTTP RPC（/api/<method>）创建会话并提交任务，让用户能在浏览器窗口中
+// 实时看到"当前正在执行的任务"。会话内容、工具调用、思考过程全部实时可见。
+//
+// RPC 信封：POST /api/<method>
+//   {"type":"client-request","rpcId":"...","method":"<method>","payload":{...}}
+// 响应：
+//   {"type":"server-response","rpcId":"...","result":{"ok":true,"value":...}}
+import fs from "node:fs";
+import http from "node:http";
+import net from "node:net";
+import path from "node:path";
+import os from "node:os";
+import { spawn, execFile } from "node:child_process";
+import { sleep } from "./logger.mjs";
+
+/** 与 dsh Web GUI 通信的官方 RPC 客户端。 */
+export function rpc(port, method, payload, timeoutMs = 30000) {
+  return new Promise((resolve, reject) => {
+    const body = JSON.stringify({
+      type: "client-request",
+      rpcId: `rpc-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+      method,
+      payload,
+    });
+    const req = http.request({
+      host: "127.0.0.1",
+      port,
+      path: `/api/${method}`,
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Content-Length": Buffer.byteLength(body),
+      },
+    }, (res) => {
+      let data = "";
+      res.on("data", (c) => { data += c; });
+      res.on("end", () => {
+        try {
+          const j = JSON.parse(data);
+          if (j && j.type === "server-response" && j.result && j.result.ok === true) {
+            return resolve(j.result.value);
+          }
+          reject(new Error(`${method} failed: ${data.slice(0, 300)}`));
+        } catch (e) {
+          reject(new Error(`${method} bad json: ${data.slice(0, 300)}`));
+        }
+      });
+    });
+    req.setTimeout(timeoutMs, () => req.destroy(new Error(`${method} timeout`)));
+    req.on("error", reject);
+    req.end(body);
+  });
+}
+
+/** 找到一个空闲端口（OS 分配后立刻释放，小概率竞争可接受）。 */
+export function findFreePort(host = "127.0.0.1") {
+  return new Promise((resolve, reject) => {
+    const s = net.createServer();
+    s.once("error", reject);
+    s.listen(0, host, () => {
+      const port = s.address().port;
+      s.close(() => resolve(port));
+    });
+  });
+}
+
+/** 轮询等待 dsh web 服务就绪（/api/host.describe 可响应）。 */
+export async function waitPort(port, timeoutMs) {
+  const t0 = Date.now();
+  while (Date.now() - t0 < timeoutMs) {
+    try {
+      await rpc(port, "host.describe", {}, 3000);
+      return true;
+    } catch {
+      await sleep(800);
+    }
+  }
+  return false;
+}
+
+/** 打开一个新的浏览器窗口显示指定 URL（优先 Chrome --new-window，回退系统默认浏览器）。 */
+export function openBrowserWindow(url, chromePath = "") {
+  if (!url) return false;
+  const candidates = [
+    chromePath,
+    "C:/Program Files/Google/Chrome/Application/chrome.exe",
+    "C:/Program Files (x86)/Google/Chrome/Application/chrome.exe",
+  ].filter(Boolean);
+  for (const exe of candidates) {
+    if (fs.existsSync(exe)) {
+      try {
+        const c = spawn(exe, ["--new-window", url], { detached: true, stdio: "ignore" });
+        c.unref?.();
+        return true;
+      } catch { /* 尝试下一个 */ }
+    }
+  }
+  try {
+    const c = spawn("cmd", ["/c", "start", '""', url], { detached: true, stdio: "ignore", windowsHide: true });
+    c.unref?.();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+const DEFAULT_BUNDLES = ["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-web-app"];
+
+/**
+ * 每个项目一个可见执行服务（专属端口的 dsh web 进程 + 会话池）。
+ * 服务在项目首次执行任务时启动，随任务复用；项目完成/暂停后释放。
+ */
+export class UiExecutor {
+  constructor(cfg, logger) {
+    this.cfg = cfg; // config.deepseek（含 visible/uiProfile/uiOpenWindow/uiBootTimeoutMs/uiChromePath）
+    this.logger = logger;
+    this.servers = new Map(); // projectId -> {port,url,child,fd,logFile,startedAt,sessions:Map}
+    this.disposeTimers = new Map(); // projectId -> timeout
+  }
+
+  log(level, msg) { this.logger?.[level]?.("dsh-ui", msg); }
+
+  get profileName() { return this.cfg.uiProfile || "workbench-exec"; }
+
+  dshHome() { return process.env.DSH_HOME || path.join(os.homedir(), ".dsh"); }
+
+  /** 确保专用可见执行 profile 存在（首次自动创建，结构与 headless profile 一致）。 */
+  ensureProfile() {
+    const name = this.profileName;
+    const dir = path.join(this.dshHome(), "profiles", name);
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({
+        name: `dsh-profile-${name}`,
+        private: true,
+        dependencies: {},
+        dsh: { profile: { bundles: DEFAULT_BUNDLES } },
+      }, null, 2), "utf8");
+      fs.writeFileSync(path.join(dir, "pnpm-workspace.yaml"), "packages:\n  - .\n\nnodeLinker: hoisted\nautoInstallPeers: false\n", "utf8");
+      fs.writeFileSync(path.join(dir, "cordis.yml"), "[]\n", "utf8");
+      fs.writeFileSync(path.join(dir, "cordis.patch.yml"), "[]\n", "utf8");
+      this.log("info", `已创建可见执行 profile: ${dir}`);
+    }
+    return { name, dir };
+  }
+
+  /** 服务进程是否存活且 API 可用。 */
+  async isAlive(server) {
+    if (!server || !server.child || server.child.exitCode !== null) return false;
+    try {
+      await rpc(server.port, "host.describe", {}, 4000);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * 获取（必要时启动）某项目的可见执行服务。
+   * @returns {port,url,...} 或 null（启动失败，调用方应回退 headless）
+   */
+  async ensureServer(projectId, logDir) {
+    const existing = this.servers.get(projectId);
+    if (existing) {
+      if (await this.isAlive(existing)) {
+        this.cancelDispose(projectId);
+        return existing;
+      }
+      this.disposeServer(projectId);
+    }
+    this.ensureProfile();
+    const port = await findFreePort();
+    const logFile = path.join(logDir, `executor-ui-${Date.now()}.log`);
+    fs.mkdirSync(logDir, { recursive: true });
+    const fd = fs.openSync(logFile, "a");
+    const args = [
+      this.cfg.dshBin,
+      "--profile", this.profileName,
+      "--port", String(port),
+      "--no-open",
+    ];
+    this.log("info", `启动可见执行服务: port=${port} profile=${this.profileName}（project=${projectId}）`);
+    let child;
+    try {
+      child = spawn(this.cfg.nodeBin || "node", args, {
+        cwd: os.homedir(),
+        stdio: ["ignore", fd, fd],
+        windowsHide: true,
+      });
+    } catch (e) {
+      try { fs.closeSync(fd); } catch { /* ignore */ }
+      throw e;
+    }
+    const server = {
+      port,
+      url: `http://127.0.0.1:${port}`,
+      child,
+      fd,
+      logFile,
+      startedAt: Date.now(),
+      sessionId: null, // 项目级复用会话（一个项目一个会话）
+      sessions: new Map(), // sessionId -> {taskId, startedAt}
+    };
+    this.servers.set(projectId, server);
+    this.cancelDispose(projectId);
+
+    const up = await Promise.race([
+      waitPort(port, this.cfg.uiBootTimeoutMs ?? 90000),
+      new Promise((resolve) => child.once("exit", () => resolve(false))), // 服务启动即崩溃 → 快速失败
+    ]);
+    if (!up) {
+      const bootMs = Date.now() - server.startedAt;
+      this.log("error", `可见执行服务 ${port} 启动失败（${Math.round(bootMs / 1000)}s），日志: ${logFile}`);
+      this.disposeServer(projectId);
+      return null;
+    }
+    this.log("info", `可见执行服务就绪: ${server.url}`);
+    return server;
+  }
+
+  /**
+   * 获取（必要时创建）项目的执行会话 —— 一个项目一个会话。
+   * 若已有会话且仍在 session.list 中则直接复用（跨任务不重开会话、不重复注入系统提示词）；
+   * 否则新建会话并记录。返回 {sessionId, reused}。
+   */
+  async getOrCreateSession(projectId, sourceDir) {
+    const s = this.servers.get(projectId);
+    if (!s) throw new Error("可见执行服务未就绪");
+    if (s.sessionId) {
+      try {
+        const list = await rpc(s.port, "session.list", {}, 15000);
+        if ((list.items || []).some((x) => x.sessionId === s.sessionId)) {
+          return { sessionId: s.sessionId, reused: true };
+        }
+      } catch { /* 单次查询失败按失效处理 */ }
+      s.sessionId = null;
+    }
+    const created = await rpc(s.port, "session.create", { cwd: sourceDir }, 60000);
+    if (!created || !created.sessionId) throw new Error("session.create 未返回 sessionId");
+    s.sessionId = created.sessionId;
+    return { sessionId: created.sessionId, reused: false };
+  }
+
+  /** 为会话选择模型/推理等级。selection = {provider, model, reasoningEffort?}。 */
+  async selectModel(projectId, sessionId, selection) {
+    const s = this.servers.get(projectId);
+    if (!s) throw new Error("可见执行服务未就绪");
+    const res = await rpc(s.port, "session.selectModel", {
+      sessionId,
+      provider: selection.provider,
+      model: selection.model,
+      ...(selection.reasoningEffort === void 0 || selection.reasoningEffort === "" ? {} : { reasoningEffort: selection.reasoningEffort }),
+    }, 30000);
+    return res?.selected || null;
+  }
+
+  /**
+   * 探测可用的 DeepSeek 模型目录（用于 Dashboard 下拉框）。
+   * 起一个临时 dsh web 服务 + 临时会话查询 session.models，用完即关；
+   * 结果缓存，失败时回退到内置目录。
+   */
+  async probeModels() {
+    if (this.catalogCache) return this.catalogCache;
+    const FALLBACK = {
+      current: null,
+      groups: [{
+        id: "deepseek-official",
+        name: "DeepSeek 官方",
+        models: [
+          { id: "deepseek-v4-flash", name: "DeepSeek-V4-Flash" },
+          { id: "deepseek-v4-pro", name: "DeepSeek-V4-Pro" },
+          { id: "deepseek-v4-flash-vision-exp", name: "DeepSeek-V4-Flash-Vision-Exp" },
+        ],
+      }],
+      reasoningEfforts: ["off", "low", "high", "max"],
+      fallback: true,
+    };
+    let port;
+    let fd;
+    let child;
+    try {
+      this.ensureProfile();
+      port = await findFreePort();
+      const logFile = path.join(os.tmpdir(), `dsh-model-probe-${Date.now()}.log`);
+      fd = fs.openSync(logFile, "a");
+      child = spawn(this.cfg.nodeBin || "node", [
+        this.cfg.dshBin, "--profile", this.profileName, "--port", String(port), "--no-open",
+      ], { cwd: os.homedir(), stdio: ["ignore", fd, fd], windowsHide: true });
+      const up = await Promise.race([
+        waitPort(port, this.cfg.uiBootTimeoutMs ?? 60000),
+        new Promise((resolve) => child.once("exit", () => resolve(false))),
+      ]);
+      if (!up) return FALLBACK;
+      const created = await rpc(port, "session.create", { cwd: os.homedir() }, 60000);
+      const res = await rpc(port, "session.models", { sessionId: created.sessionId }, 30000);
+      this.catalogCache = {
+        current: res.current || null,
+        groups: res.groups || FALLBACK.groups,
+        reasoningEfforts: ["off", "low", "high", "max"],
+        fallback: !(res.groups && res.groups.length),
+      };
+      return this.catalogCache;
+    } catch (e) {
+      this.log("warn", `模型目录探测失败（使用内置目录）: ${e.message}`);
+      return FALLBACK;
+    } finally {
+      if (child && child.exitCode === null) {
+        execFile("taskkill", ["/PID", String(child.pid), "/T", "/F"], { stdio: "ignore", windowsHide: true }, () => {});
+      }
+      if (fd !== undefined) { try { fs.closeSync(fd); } catch { /* ignore */ } }
+    }
+  }
+
+  /** 向会话提交任务提示词（等价于用户在窗口里输入并回车）。 */
+  async submitPrompt(projectId, sessionId, prompt, taskId) {
+    const s = this.servers.get(projectId);
+    if (!s) throw new Error("可见执行服务未就绪");
+    const res = await rpc(s.port, "session.prompt", {
+      sessionId,
+      mode: "queue",
+      content: [{ type: "text", text: prompt }],
+    }, 60000);
+    s.sessions.set(sessionId, { taskId: taskId || "-", startedAt: Date.now() });
+    return res;
+  }
+
+  /** 查询会话运行状态；服务不可用返回 null。 */
+  async sessionState(projectId, sessionId) {
+    const s = this.servers.get(projectId);
+    if (!s) return null;
+    const list = await rpc(s.port, "session.list", {}, 15000);
+    const row = (list.items || []).find((x) => x.sessionId === sessionId);
+    if (!row) return null;
+    return { running: !!row.running, blank: !!row.blank, updatedAt: row.updatedAt };
+  }
+
+  /** 取消正在运行的会话。 */
+  async cancelSession(projectId, sessionId) {
+    const s = this.servers.get(projectId);
+    if (!s) return false;
+    try {
+      await rpc(s.port, "session.cancel", { sessionId }, 15000);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** 打开该项目的执行窗口（新浏览器窗口）。 */
+  openWindow(projectId) {
+    const s = this.servers.get(projectId);
+    if (!s) return null;
+    const opened = openBrowserWindow(s.url, this.cfg.uiChromePath || "");
+    return { url: s.url, opened };
+  }
+
+  /** 关闭某项目的可见执行服务。 */
+  disposeServer(projectId) {
+    this.cancelDispose(projectId);
+    const s = this.servers.get(projectId);
+    if (!s) return;
+    this.servers.delete(projectId);
+    try {
+      if (s.child && s.child.exitCode === null) {
+        execFile("taskkill", ["/PID", String(s.child.pid), "/T", "/F"], { stdio: "ignore", windowsHide: true }, () => {});
+      }
+    } catch { /* ignore */ }
+    try { fs.closeSync(s.fd); } catch { /* ignore */ }
+    this.log("info", `可见执行服务已关闭: ${s.url}（project=${projectId}）`);
+  }
+
+  /** 延时关闭（项目完成后给用户留出查看窗口的时间；新任务到来会取消延时）。 */
+  scheduleDispose(projectId, delayMs = 30000) {
+    if (!this.servers.has(projectId)) return;
+    this.cancelDispose(projectId);
+    const t = setTimeout(() => this.disposeServer(projectId), delayMs);
+    t.unref?.();
+    this.disposeTimers.set(projectId, t);
+  }
+
+  cancelDispose(projectId) {
+    const t = this.disposeTimers.get(projectId);
+    if (t) {
+      clearTimeout(t);
+      this.disposeTimers.delete(projectId);
+    }
+  }
+
+  /** 项目级信息（Dashboard 用）。 */
+  info(projectId) {
+    const s = this.servers.get(projectId);
+    if (!s) return null;
+    return {
+      url: s.url,
+      port: s.port,
+      startedAt: s.startedAt,
+      sessionId: s.sessionId || null,
+      sessions: [...s.sessions.values()].map((v) => ({ taskId: v.taskId, startedAt: v.startedAt })),
+    };
+  }
+
+  /** 全部服务清单（Dashboard 系统状态用）。 */
+  list() {
+    return [...this.servers.entries()].map(([projectId, s]) => ({
+      projectId,
+      url: s.url,
+      port: s.port,
+      startedAt: s.startedAt,
+    }));
+  }
+
+  /** 退出前关闭全部服务。 */
+  shutdownAll() {
+    for (const id of [...this.servers.keys()]) this.disposeServer(id);
+  }
+}
