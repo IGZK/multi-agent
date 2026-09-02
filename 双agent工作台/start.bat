@@ -1,12 +1,13 @@
 @echo off
 chcp 65001 >nul
 cd /d "%~dp0"
+rem Keep this launcher ASCII-only: cmd parses a batch file before chcp can fix UTF-8 text.
 echo ============================================
-echo   双 Agent 协作工作台
+echo   Dual Agent Workbench
 echo   Dashboard: http://127.0.0.1:3700
-echo   稍后会自动打开浏览器…
+echo   Opening the browser shortly...
 echo ============================================
-rem 后台等待 4 秒后自动打开 Dashboard（服务启动通常需要几秒）
+rem Wait four seconds, then open the Dashboard while Node starts.
 start "" cmd /c "timeout /t 4 /nobreak >nul & explorer http://127.0.0.1:3700"
 node controller\index.mjs
 pause

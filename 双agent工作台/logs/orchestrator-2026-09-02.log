@@ -128,3 +128,71 @@
 [2026-09-02T11:39:48.992Z] [INFO] [main] DeepSeek Runner 模式: real（headless profile，执行过程在可见窗口实时展示）
 [2026-09-02T11:39:48.992Z] [INFO] [main] 项目目录: C:\Users\Administrator\Desktop\双agent\双agent工作台\projects
 [2026-09-02T11:39:48.992Z] [ERROR] [main] 另一个工作台实例正在使用同一项目目录（PID 19996，启动于 2026-09-02T11:36:44.619Z）。如需强制启动，先结束该进程或删除 C:\Users\Administrator\Desktop\双agent\双agent工作台\logs\workbench-default.lock
+[2026-09-02T11:50:38.934Z] [INFO] [main] 收到退出信号，正在关闭…
+[2026-09-02T11:50:38.936Z] [INFO] [dsh-ui] 可见执行服务已关闭: http://127.0.0.1:55215（project=2026-09-02-项目更新）
+[2026-09-02T11:50:44.407Z] [INFO] [main] ============================================
+[2026-09-02T11:50:44.408Z] [INFO] [main] 双 Agent 协作工作台启动
+[2026-09-02T11:50:44.408Z] [INFO] [main] GPT Bridge 模式: real（模型目标: GPT-5.6 Sol）
+[2026-09-02T11:50:44.408Z] [INFO] [main] DeepSeek Runner 模式: real（headless profile，执行过程在可见窗口实时展示）
+[2026-09-02T11:50:44.408Z] [INFO] [main] 项目目录: C:\Users\Administrator\Desktop\双agent\双agent工作台\projects
+[2026-09-02T11:50:44.413Z] [INFO] [dashboard] Dashboard: http://127.0.0.1:3700
+[2026-09-02T11:50:44.421Z] [INFO] [orch:-] 扫描到 3 个项目
+[2026-09-02T11:50:44.422Z] [INFO] [orch:2026-09-02-项目更新] 恢复项目（状态: ERROR）
+[2026-09-02T11:50:44.422Z] [INFO] [orch:2026-09-02-项目更新] 循环启动（cwd: C:\Users\Administrator\Desktop\双agent\双agent工作台\projects\2026-09-02-项目更新）
+[2026-09-02T11:52:01.913Z] [INFO] [main] ============================================
+[2026-09-02T11:52:01.913Z] [INFO] [main] 双 Agent 协作工作台启动
+[2026-09-02T11:52:01.914Z] [INFO] [main] GPT Bridge 模式: real（模型目标: GPT-5.6 Sol）
+[2026-09-02T11:52:01.914Z] [INFO] [main] DeepSeek Runner 模式: real（headless profile，执行过程在可见窗口实时展示）
+[2026-09-02T11:52:01.914Z] [INFO] [main] 项目目录: C:\Users\Administrator\Desktop\双agent\双agent工作台\projects
+[2026-09-02T11:52:01.915Z] [ERROR] [main] 另一个工作台实例正在使用同一项目目录（PID 13896，启动于 2026-09-02T11:50:44.409Z）。如需强制启动，先结束该进程或删除 C:\Users\Administrator\Desktop\双agent\双agent工作台\logs\workbench-default.lock
+[2026-09-02T11:52:15.641Z] [INFO] [orch:2026-09-02-项目更新] 循环结束
+[2026-09-02T11:54:02.068Z] [INFO] [main] 收到退出信号，正在关闭…
+[2026-09-02T11:54:05.226Z] [INFO] [main] ============================================
+[2026-09-02T11:54:05.227Z] [INFO] [main] 双 Agent 协作工作台启动
+[2026-09-02T11:54:05.227Z] [INFO] [main] GPT Bridge 模式: real（模型目标: GPT-5.6 Sol）
+[2026-09-02T11:54:05.227Z] [INFO] [main] DeepSeek Runner 模式: real（headless profile，执行过程在可见窗口实时展示）
+[2026-09-02T11:54:05.227Z] [INFO] [main] 项目目录: C:\Users\Administrator\Desktop\双agent\双agent工作台\projects
+[2026-09-02T11:54:05.232Z] [INFO] [dashboard] Dashboard: http://127.0.0.1:3700
+[2026-09-02T11:54:05.240Z] [INFO] [orch:-] 扫描到 3 个项目
+[2026-09-02T11:55:11.543Z] [INFO] [main] ============================================
+[2026-09-02T11:55:11.544Z] [INFO] [main] 双 Agent 协作工作台启动
+[2026-09-02T11:55:11.544Z] [INFO] [main] GPT Bridge 模式: real（模型目标: GPT-5.6 Sol）
+[2026-09-02T11:55:11.545Z] [INFO] [main] DeepSeek Runner 模式: real（headless profile，执行过程在可见窗口实时展示）
+[2026-09-02T11:55:11.545Z] [INFO] [main] 项目目录: C:\Users\Administrator\Desktop\双agent\双agent工作台\projects
+[2026-09-02T11:55:11.545Z] [ERROR] [main] 另一个工作台实例正在使用同一项目目录（PID 21132，启动于 2026-09-02T11:54:05.227Z）。如需强制启动，先结束该进程或删除 C:\Users\Administrator\Desktop\双agent\双agent工作台\logs\workbench-default.lock
+[2026-09-02T11:58:24.382Z] [INFO] [main] ============================================
+[2026-09-02T11:58:24.383Z] [INFO] [main] 双 Agent 协作工作台启动
+[2026-09-02T11:58:24.383Z] [INFO] [main] GPT Bridge 模式: real（模型目标: GPT-5.6 Sol）
+[2026-09-02T11:58:24.383Z] [INFO] [main] DeepSeek Runner 模式: real（headless profile，执行过程在可见窗口实时展示）
+[2026-09-02T11:58:24.384Z] [INFO] [main] 项目目录: C:\Users\Administrator\Desktop\双agent\双agent工作台\projects
+[2026-09-02T11:58:24.384Z] [ERROR] [main] 另一个工作台实例正在使用同一项目目录（PID 21132，启动于 2026-09-02T11:54:05.227Z）。如需强制启动，先结束该进程或删除 C:\Users\Administrator\Desktop\双agent\双agent工作台\logs\workbench-default.lock
+[2026-09-02T12:15:15.431Z] [INFO] [main] 收到退出信号，正在关闭…
+[2026-09-02T12:15:20.709Z] [INFO] [main] ============================================
+[2026-09-02T12:15:20.710Z] [INFO] [main] 双 Agent 协作工作台启动
+[2026-09-02T12:15:20.710Z] [INFO] [main] GPT Bridge 模式: real（模型目标: GPT-5.6 Sol）
+[2026-09-02T12:15:20.710Z] [INFO] [main] DeepSeek Runner 模式: real（headless profile，执行过程在可见窗口实时展示）
+[2026-09-02T12:15:20.710Z] [INFO] [main] 项目目录: C:\Users\Administrator\Desktop\双agent\双agent工作台\projects
+[2026-09-02T12:15:20.715Z] [INFO] [dashboard] Dashboard: http://127.0.0.1:3700
+[2026-09-02T12:15:20.724Z] [INFO] [orch:-] 扫描到 3 个项目
+[2026-09-02T12:17:30.428Z] [INFO] [main] 收到退出信号，正在关闭…
+[2026-09-02T12:20:24.625Z] [INFO] [main] ============================================
+[2026-09-02T12:20:24.626Z] [INFO] [main] 双 Agent 协作工作台启动
+[2026-09-02T12:20:24.626Z] [INFO] [main] GPT Bridge 模式: real（模型目标: GPT-5.6 Sol）
+[2026-09-02T12:20:24.626Z] [INFO] [main] DeepSeek Runner 模式: real（headless profile，执行过程在可见窗口实时展示）
+[2026-09-02T12:20:24.627Z] [INFO] [main] 项目目录: C:\Users\Administrator\Desktop\双agent\双agent工作台\projects
+[2026-09-02T12:20:24.631Z] [INFO] [dashboard] Dashboard: http://127.0.0.1:3700
+[2026-09-02T12:20:24.640Z] [INFO] [orch:-] 扫描到 3 个项目
+[2026-09-02T12:33:38.973Z] [INFO] [main] ============================================
+[2026-09-02T12:33:38.974Z] [INFO] [main] 双 Agent 协作工作台启动
+[2026-09-02T12:33:38.974Z] [INFO] [main] GPT Bridge 模式: real（模型目标: GPT-5.6 Sol）
+[2026-09-02T12:33:38.974Z] [INFO] [main] DeepSeek Runner 模式: real（headless profile，执行过程在可见窗口实时展示）
+[2026-09-02T12:33:38.974Z] [INFO] [main] 项目目录: C:\Users\Administrator\Desktop\双agent\双agent工作台\projects
+[2026-09-02T12:33:38.978Z] [INFO] [dashboard] Dashboard: http://127.0.0.1:3700
+[2026-09-02T12:33:38.987Z] [INFO] [orch:-] 扫描到 3 个项目
+[2026-09-02T12:45:53.478Z] [INFO] [main] ============================================
+[2026-09-02T12:45:53.479Z] [INFO] [main] 双 Agent 协作工作台启动
+[2026-09-02T12:45:53.479Z] [INFO] [main] GPT Bridge 模式: real（模型目标: GPT-5.6 Sol）
+[2026-09-02T12:45:53.479Z] [INFO] [main] DeepSeek Runner 模式: real（headless profile，执行过程在可见窗口实时展示）
+[2026-09-02T12:45:53.479Z] [INFO] [main] 项目目录: C:\Users\Administrator\Desktop\双agent\双agent工作台\projects
+[2026-09-02T12:45:53.483Z] [INFO] [dashboard] Dashboard: http://127.0.0.1:3700
+[2026-09-02T12:45:53.492Z] [INFO] [orch:-] 扫描到 3 个项目

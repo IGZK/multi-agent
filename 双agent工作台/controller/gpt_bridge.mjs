@@ -417,7 +417,45 @@ export class GptBridge {
     return null;
   }
 
-  async sendMessage(text) {
+  async attachFiles(files) {
+    const paths = (Array.isArray(files) ? files : []).filter((file) => typeof file === "string" && fs.existsSync(file));
+    if (!paths.length) return;
+    let inputs = this.page.locator('input[type="file"]');
+    let count = await inputs.count();
+    if (!count) {
+      const attachButtons = [
+        'button[aria-label*="Attach" i]',
+        'button[aria-label*="附件" i]',
+        'button[data-testid*="attach" i]',
+      ];
+      for (const selector of attachButtons) {
+        const button = this.page.locator(selector).first();
+        if (await button.isVisible({ timeout: 800 }).catch(() => false)) {
+          await button.click().catch(() => {});
+          await sleep(400);
+          break;
+        }
+      }
+      inputs = this.page.locator('input[type="file"]');
+      count = await inputs.count();
+    }
+    for (let i = 0; i < count; i++) {
+      const input = inputs.nth(i);
+      const multiple = await input.getAttribute("multiple").catch(() => null);
+      if (count > 1 && multiple === null) continue;
+      try {
+        await input.setInputFiles(paths);
+        await sleep(700);
+        this.log("info", `已将 ${paths.length} 个附件上传到 GPT composer`);
+        return;
+      } catch (e) {
+        this.log("warn", `GPT 附件入口不可用（${e.message}），尝试下一个`);
+      }
+    }
+    throw new BridgeError("GPT_PAGE_ERROR", "找不到 ChatGPT 附件上传入口");
+  }
+
+  async sendMessage(text, options = {}) {
     await this.ensureBrowser();
     const state = await this.detectState();
     if (!state.loggedIn) throw new BridgeError("GPT_LOGIN_REQUIRED", "未登录，无法发送");
@@ -444,6 +482,13 @@ export class GptBridge {
       await this.page.keyboard.press("Delete");
       await sleep(200);
     } catch { /* ignore */ }
+
+    if (Array.isArray(options.files) && options.files.length) {
+      await this.attachFiles(options.files);
+      // 文件选择会让浏览器焦点离开消息输入框，重新聚焦后再插入文字。
+      await composer.click();
+      await sleep(300);
+    }
 
     // 主路径：insertText（换行安全、长文本可靠）
     await this.page.keyboard.insertText(text);
@@ -712,10 +757,10 @@ questions_for_executor: []`;
   }
   async assistantCount() { return this.count; }
 
-  async sendMessage(text) {
+  async sendMessage(text, options = {}) {
     await sleep(this.delay);
     this.setLive("sending", "（mock）发送消息…");
-    this.messages.push({ ts: Date.now(), dir: "out", text });
+    this.messages.push({ ts: Date.now(), dir: "out", text, files: options.files || [] });
     this.log("info", `（mock）消息已发送（${text.length} 字符）`);
     // 依据消息类型生成回复
     const type = (text.match(/<MSG_TYPE>([\s\S]*?)<\/MSG_TYPE>/) || [])[1]?.trim().toUpperCase();

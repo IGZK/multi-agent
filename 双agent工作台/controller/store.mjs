@@ -64,7 +64,6 @@ export function initialProjectState(projectId, name, task) {
     error_count: 0,
     last_error: null,
     protocol_reprompts: 0,
-    category: null,      // 项目分类（用户自定义，用于左侧分组）
     archived: false,     // 是否已归档
     deepseek_selection: null, // 项目级 DeepSeek 模型选择 {provider, model, reasoningEffort}
     gpt: {
@@ -190,7 +189,7 @@ export class ProjectStore {
         state: state.state,
         updated_at: state.updated_at,
         created_at: state.created_at,
-        category: state.category || null,
+        source_dir: this.sourceDir(entry.name),
         archived: !!state.archived,
       });
     }

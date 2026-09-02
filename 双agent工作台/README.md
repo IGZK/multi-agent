@@ -11,14 +11,18 @@ npm install
 .\start.bat
 ```
 
+`start.bat` intentionally contains ASCII-only launcher text. Windows `cmd` may parse a UTF-8 batch file before the code-page switch and turn Chinese text into commands or invalid paths; the Dashboard itself remains fully localized.
+
 然后打开 <http://127.0.0.1:3700>。首次使用时，在工作台专用 Chrome 窗口中登录 ChatGPT；登录态保存在本机 `browser-profile/`。
 
 在左上角点击“新建项目”，右侧底部会显示创建区：
 
-1. 填写项目名和目标。
-2. 可选一个已有本地目录；留空则使用 `projects/<项目>/source/`。
+1. 描述你想构建的内容。
+2. 可选一个已有本地工作目录；留空则使用工作台默认源码目录。
 3. 可选 DeepSeek 模型和推理等级。
-4. 点击“创建并开始”。
+4. 点击右下角箭头创建并开始。项目名称会根据工作目录或任务首行自动生成。
+
+进入项目后，先在对话框左上选择工作文件夹，再点击左下角“＋”或相机按钮添加附件；附件会随下一条消息上传给 GPT。文件拖拽到输入框不会被工作台拦截。
 
 之后流程自动运行：
 
@@ -33,10 +37,10 @@ npm install
 - 多项目断点恢复：状态写入每个项目的 `.gpt_workspace/project_state.json`。
 - 会话隔离：每个项目有独立 GPT 会话；共享的浏览器页面按完整“发送—等待回复”周期串行使用。
 - 执行会话复用：同一项目复用 DeepSeek Harness 会话，失效时自动重建。
-- 暂停与删除：会取消正在执行的任务，迟到结果不会覆盖暂停状态或重建已删除项目。
-- 真实附件：文件上传到项目 `.gpt_workspace/attachments/`，GPT 收到的是可供执行者读取的本地路径。
+- 暂停、结束与删除：暂停可恢复；手动结束会进入 `CANCELED` 并保留记录；删除会移除工作区。迟到结果不会覆盖终止状态。
+- GPT 附件：在 GPT 对话框点击左下角“＋”或相机按钮；文件先保存到项目 `.gpt_workspace/attachments/`，发送时再通过 ChatGPT 浏览器 composer 上传给 GPT。
 - 计划依赖：只有依赖已完成的任务才会执行；循环或缺失依赖会交回 GPT 重规划。
-- 项目管理：重命名、分类、归档、修改源码目录、选择模型。
+- 项目管理：按源码工作目录分组、重命名、归档、修改源码目录、选择模型。
 
 ## 数据目录
 
@@ -54,7 +58,7 @@ npm install
 │       ├── project_analysis.md 项目分析
 │       ├── attachments/        上传附件
 │       ├── conversation/gpt/   GPT 消息记录
-│       ├── executor_reports/   执行报告
+│       ├── executor_reports/  执行报告
 │       ├── inbox/              发给执行者的任务信封
 │       └── outbox/             执行者返回的结果信封
 ├── browser-profile/            专用 Chrome 登录态（不要提交或共享）
@@ -107,6 +111,7 @@ node controller\visible_probe.mjs
 
 - 页面提示“工作台后台未运行”：重新运行 `start.bat`。浏览器页面可以继续保留，后台恢复后项目列表会自动重新加载。
 - 点击删除时出现网络错误并不表示项目已经删除；应先恢复后台，再从项目列表确认状态。
+- 启动窗口出现乱码或“文件名、目录名或卷标语法不正确”：确认使用项目根目录中的最新版 `start.bat`，不要用旧副本启动。
 
 ## 维护约定
 

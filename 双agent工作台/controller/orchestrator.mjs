@@ -780,7 +780,9 @@ export class Orchestrator {
       }
       const msg = wrapOrchestratorMsg(type, content);
       const baseline = await this.bridge.assistantCount();
-      await this.bridge.sendMessage(msg);
+      const files = (Array.isArray(opts.attachments) ? opts.attachments : [])
+        .map((a) => this.store.resolveWorkspacePath(projectId, a.relative_path));
+      await this.bridge.sendMessage(msg, { files });
       this.assertProjectActive(projectId, epoch);
       this.store.recordGptMessage(projectId, "out", msg, { type });
       const url = this.bridge.page?.url?.() || null;
@@ -923,9 +925,6 @@ export class Orchestrator {
     if (opts.deepseek_selection) {
       this.store.writeState(id, { deepseek_selection: opts.deepseek_selection });
     }
-    if (opts.category) {
-      this.store.writeState(id, { category: opts.category });
-    }
     this.startLoop(id);
     return id;
   }
@@ -946,15 +945,6 @@ export class Orchestrator {
     if (!st) throw new Error(`项目不存在: ${projectId}`);
     this.store.writeState(projectId, { archived: !!archived });
     return !!archived;
-  }
-
-  /** 设置项目分类 */
-  async setProjectCategory(projectId, category) {
-    const st = this.store.readState(projectId);
-    if (!st) throw new Error(`项目不存在: ${projectId}`);
-    const cat = String(category || "").trim();
-    this.store.writeState(projectId, { category: cat });
-    return cat;
   }
 
   /** 设置项目的 DeepSeek 模型选择 */
@@ -1023,6 +1013,19 @@ export class Orchestrator {
     return result;
   }
 
+  async endProject(projectId) {
+    const st = this.store.readState(projectId);
+    if (!st || ["COMPLETED", "CANCELED"].includes(st.state)) return st;
+    this.invalidateProject(projectId);
+    this.runner.kill(projectId);
+    const result = this.store.transition(projectId, "CANCELED", {
+      pending: { text: "项目已由用户手动结束。", ts: nowIso() },
+      milestone: { text: "用户手动结束", ts: nowIso() },
+    });
+    if (!this.gptWaitingProjects.has(projectId) && !this.gptIsActive(projectId)) this.releaseGpt(projectId);
+    return result;
+  }
+
   async resume(projectId) {
     const st = this.store.readState(projectId);
     if (!st || st.state !== "PAUSED") return st;
@@ -1047,10 +1050,10 @@ export class Orchestrator {
     return this.store.transition(projectId, retry);
   }
 
-  async injectMessage(projectId, text) {
+  async injectMessage(projectId, text, attachments = []) {
     const st = this.store.readState(projectId);
     if (!st) throw new Error(`项目不存在: ${projectId}`);
-    await this.sendToGpt(projectId, "USER", text);
+    await this.sendToGpt(projectId, "USER", text, { attachments });
     return this.store.transition(projectId, "WAITING_FOR_GPT");
   }
 }

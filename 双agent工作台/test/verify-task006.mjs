@@ -60,14 +60,11 @@ R.afterRetry = await page.evaluate(() => {
   return c ? c.className : null;
 });
 
-// 5) 拖拽高亮
-R.dragHighlight = await page.evaluate(() => {
+// 5) 旧拖拽入口已移除，避免浏览器接管文件
+R.dragUploadRemoved = await page.evaluate(() => {
   const el = document.querySelector("#composer");
   el.dispatchEvent(new DragEvent("dragenter", { bubbles: true }));
-  const on = el.classList.contains("dragging");
-  el.dispatchEvent(new DragEvent("dragleave", { bubbles: true }));
-  const off = !el.classList.contains("dragging");
-  return { on, off };
+  return !el.classList.contains("dragging");
 });
 
 console.log(JSON.stringify({ R, consoleErrors: errors }, null, 2));

@@ -165,13 +165,11 @@ function renderProjectList() {
     if (p.id === currentProjectId) li.classList.add("active");
     if (p.archived) li.classList.add("archived");
     const [label, cls] = STATE_META[p.state] || [p.state, ""];
-    const catTag = p.category ? `<span class="p-meta" style="color:var(--accent)">📁 ${escapeHtml(p.category)}</span>` : "";
     li.innerHTML = `
       <div class="p-name">${escapeHtml(p.name || p.id)}</div>
-      <div class="p-meta"><span class="badge ${cls}" style="padding:2px 8px;font-size:11px">${label}</span> · ${(p.updated_at || "").replace("T", " ").slice(0, 16)}${catTag ? " · " + catTag : ""}</div>
+      <div class="p-meta"><span class="badge ${cls}" style="padding:2px 8px;font-size:11px">${label}</span> · ${(p.updated_at || "").replace("T", " ").slice(0, 16)}</div>
       <div class="p-actions">
         <button data-act="rename" title="重命名">✎ 重命名</button>
-        <button data-act="category" title="分类">📁 分类</button>
         <button data-act="archive" title="归档/取消归档">${p.archived ? "🗂 取消归档" : "🗄 归档"}</button>
         <button data-act="delete" class="danger" title="删除项目（不可恢复）">🗑 删除</button>
       </div>`;
@@ -182,17 +180,18 @@ function renderProjectList() {
     ul.appendChild(li);
   };
 
-  // 分组：未归档按分类分组（未分类归“未分类”）
+  // 分组：按项目源码所在工作目录分组，避免维护与文件位置脱节的额外配置。
   const groups = new Map();
   for (const p of active) {
-    const key = p.category || "未分类";
+    const key = p.source_dir || "工作台默认目录";
     if (!groups.has(key)) groups.set(key, []);
     groups.get(key).push(p);
   }
-  for (const [cat, items] of [...groups.entries()].sort((a, b) => (a[0] === "未分类" ? 1 : b[0] === "未分类" ? -1 : a[0].localeCompare(b[0])))) {
+  for (const [location, items] of [...groups.entries()].sort((a, b) => a[0].localeCompare(b[0], "zh-CN"))) {
     const h = document.createElement("div");
     h.className = "proj-group";
-    h.textContent = `📂 ${cat}（${items.length}）`;
+    h.title = location;
+    h.textContent = `⌂ ${location}（${items.length}）`;
     ul.appendChild(h);
     items.forEach(renderItem);
   }
@@ -214,10 +213,6 @@ async function projectAction(p, act) {
     const name = prompt("重命名项目：", p.name || p.id);
     if (!name || !name.trim()) return;
     await actionWith("rename", { name: name.trim() }, id);
-  } else if (act === "category") {
-    const cat = prompt("设置分类（留空=取消分类）：", p.category || "");
-    if (cat === null) return;
-    await actionWith("category", { category: cat.trim() }, id);
   } else if (act === "archive") {
     await actionWith("archive", { archived: !p.archived }, id);
   } else if (act === "delete") {
@@ -275,7 +270,7 @@ async function refreshDetail() {
       ｜ 错误次数：${d.error_count} ｜ GPT 会话：${d.gpt?.conversation_url ? `<a href="${escapeHtml(d.gpt.conversation_url)}" target="_blank">打开</a>` : "（未创建）"}
       ｜ 模型：${escapeHtml(d.gpt?.model_selected || "默认")}`;
     $("#dMeta").innerHTML += `<br>GPT 上下文文件: <code>${escapeHtml(d.workspace_dir || "")}</code> ｜ 源码目录: <code>${escapeHtml(d.source_dir || "")}</code>`;
-    $("#dMeta").innerHTML += `<br>分类：${escapeHtml(d.category || "未分类")}${d.archived ? " ｜ 已归档" : ""} ｜ DeepSeek 模型：${d.deepseek_selection?.model ? escapeHtml(`${d.deepseek_selection.provider || "deepseek-official"}/${d.deepseek_selection.model}${d.deepseek_selection.reasoningEffort ? " · 推理=" + d.deepseek_selection.reasoningEffort : ""}`) : "跟随默认"}`;
+    $("#dMeta").innerHTML += `<br>${d.archived ? "已归档 ｜ " : ""}DeepSeek 模型：${d.deepseek_selection?.model ? escapeHtml(`${d.deepseek_selection.provider || "deepseek-official"}/${d.deepseek_selection.model}${d.deepseek_selection.reasoningEffort ? " · 推理=" + d.deepseek_selection.reasoningEffort : ""}`) : "跟随默认"}`;
     // 项目文件夹：空路径显示占位，长路径 title 全文
     const dirHint = $("#dirHint");
     if (dirHint) {
@@ -284,6 +279,11 @@ async function refreshDetail() {
       dirHint.title = src || "默认工作台目录（未指定）";
       dirHint.dataset.path = src;
       dirHint.classList.toggle("empty", !src);
+    }
+    const composerDirLabel = $("#composerDirLabel");
+    if (composerDirLabel) {
+      composerDirLabel.textContent = d.source_dir || "默认工作目录";
+      composerDirLabel.title = d.source_dir || "默认工作目录";
     }
 
     // 同步本项目 DeepSeek 模型选择到 Composer（正在编辑时不做覆盖）
@@ -446,7 +446,7 @@ function showCreateView() {
   $("#detail").classList.add("hidden");
   $("#createView").classList.remove("hidden");
   $("#currentProjBox").classList.add("hidden");
-  $("#projName").focus();
+  $("#projTask").focus();
 }
 $("#btnNewProject").addEventListener("click", showCreateView);
 
@@ -458,28 +458,25 @@ $("#btnPickDir").onclick = async () => {
     const res = await pickFolder($("#projDir").value.trim());
     if (res && res.path) {
       $("#projDir").value = res.path;
+      $("#projDirLabel").textContent = res.path;
       $("#projDir").style.borderColor = "var(--green)";
     }
   } catch (e) {
     alert(`选择文件夹失败：${e.message}\n\n你也可以直接在左侧输入框中手动填写绝对路径。`);
   } finally {
     $("#btnPickDir").disabled = false;
-    $("#btnPickDir").textContent = "📁 选择";
+    $("#btnPickDir").textContent = "📁";
   }
 };
-
 $("#btnCreate").onclick = async () => {
-  const name = $("#projName").value.trim();
   const task = $("#projTask").value.trim();
   const dir = $("#projDir").value.trim();
-  if (!name || !task) { alert("请填写项目名称与任务描述"); return; }
+  if (!task) { alert("请先描述你想构建的内容"); $("#projTask").focus(); return; }
   try {
     $("#btnCreate").disabled = true;
     $("#btnCreate").textContent = "创建中…";
-    const payload = { name, task };
+    const payload = { task };
     if (dir) payload.source_dir = dir;
-    const cat = $("#projCategory").value.trim();
-    if (cat) payload.category = cat;
     const sel = selectedModelPayload();
     if (sel) payload.deepseek_selection = sel;
     const res = await api("/api/projects", {
@@ -487,10 +484,10 @@ $("#btnCreate").onclick = async () => {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
     });
-    $("#projName").value = "";
     $("#projTask").value = "";
     $("#projDir").value = "";
-    $("#projCategory").value = "";
+    $("#projDirLabel").textContent = "未选择文件夹（将使用工作台默认目录）";
+    $("#projDir").style.borderColor = "";
     currentProjectId = res.id;
     $("#emptyHint").classList.add("hidden");
     $("#createView").classList.add("hidden");
@@ -500,7 +497,7 @@ $("#btnCreate").onclick = async () => {
     alert(`创建失败: ${e.message}`);
   } finally {
     $("#btnCreate").disabled = false;
-    $("#btnCreate").textContent = "🚀 创建并开始（全自动）";
+    $("#btnCreate").textContent = "↑";
   }
 };
 
@@ -518,6 +515,9 @@ async function action(name) {
 $("#btnPause").onclick = () => action("pause");
 $("#btnResume").onclick = () => action("resume");
 $("#btnRetry").onclick = () => action("retry");
+$("#btnEnd").onclick = () => {
+  if (confirm("确定结束这个项目？\n正在运行的任务会被终止，项目记录会保留，但结束后不能继续。")) action("end");
+};
 
 // 修改项目文件夹：改为点击按钮 → 弹出系统文件夹选择器（不再用 prompt 输入）
 $("#btnSetDir").onclick = async () => {
@@ -542,6 +542,7 @@ $("#btnSetDir").onclick = async () => {
     $("#btnSetDir").textContent = "修改";
   }
 };
+$("#btnComposerDir").onclick = () => $("#btnSetDir").click();
 
 // 显示/隐藏浏览器窗口
 let windowVisible = null;
@@ -651,6 +652,8 @@ async function sendComposer() {
 
 if (composerInput) {
   composerInput.addEventListener("input", () => autoGrow(composerInput));
+  // 拖拽上传已关闭，但阻止浏览器默认打开文件，避免误离开工作台。
+  ["dragover", "drop"].forEach((eventName) => composerInput.addEventListener(eventName, (e) => e.preventDefault()));
   composerInput.addEventListener("keydown", (e) => {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
@@ -799,23 +802,6 @@ if (btnAttachPhoto && photoInput) btnAttachPhoto.addEventListener("click", () =>
 if (fileInput) fileInput.addEventListener("change", () => { addFiles(fileInput.files); fileInput.value = ""; });
 if (photoInput) photoInput.addEventListener("change", () => { addFiles(photoInput.files); photoInput.value = ""; });
 
-// 拖拽上传
-const composerEl = $("#composer");
-if (composerEl) {
-  ["dragenter", "dragover"].forEach((ev) => composerEl.addEventListener(ev, (e) => {
-    e.preventDefault();
-    composerEl.classList.add("dragging");
-  }));
-  ["dragleave", "drop"].forEach((ev) => composerEl.addEventListener(ev, (e) => {
-    e.preventDefault();
-    composerEl.classList.remove("dragging");
-  }));
-  composerEl.addEventListener("drop", (e) => {
-    const files = e.dataTransfer && e.dataTransfer.files;
-    if (files && files.length) addFiles(files);
-  });
-}
-
 // Tabs
 $$(".tab").forEach((t) => {
   t.onclick = () => {
@@ -834,7 +820,7 @@ $$(".tab").forEach((t) => {
   };
 });
 
-// 主题切换（深浅色，默认暗色）
+// 主题切换（深浅色，默认浅色，贴近创建页的 Harness 风格）
 const themeBtn = $("#btnTheme");
 function applyTheme(t) {
   const theme = t === "light" ? "light" : "dark";
@@ -849,8 +835,8 @@ if (themeBtn) {
   });
 }
 (function initTheme() {
-  let t = "dark";
-  try { t = localStorage.getItem("wb-theme") || "dark"; } catch (e) {}
+  let t = "light";
+  try { t = localStorage.getItem("wb-theme") || "light"; } catch (e) {}
   applyTheme(t);
 })();
 

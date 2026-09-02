@@ -97,10 +97,11 @@ export class DashboardServer {
       workspace_dir: this.store.workspaceDir(projectId),
       gpt_live: this.bridge?.getLive?.() || null,
       executor_ui: this.runner?.uiInfo?.(projectId) || null,
-      category: st.category || null,
       archived: !!st.archived,
       deepseek_selection: st.deepseek_selection || null,
-      pending_elapsed_s: st.pending?.ts ? Math.round((Date.now() - new Date(st.pending.ts).getTime()) / 1000) : null,
+      pending_elapsed_s: ["COMPLETED", "CANCELED", "PAUSED"].includes(st.state)
+        ? null
+        : st.pending?.ts ? Math.round((Date.now() - new Date(st.pending.ts).getTime()) / 1000) : null,
     };
   }
 
@@ -150,7 +151,8 @@ export class DashboardServer {
       }
       if (p === "/api/projects" && req.method === "POST") {
         const body = await readBody(req);
-        if (!body.name || !body.task) return sendJson(res, 400, { error: "需要 name 与 task" });
+        const task = String(body.task || "").trim();
+        if (!task) return sendJson(res, 400, { error: "需要 task" });
         let sourceDir = null;
         if (body.source_dir && String(body.source_dir).trim()) {
           const raw = String(body.source_dir).trim();
@@ -163,6 +165,10 @@ export class DashboardServer {
             return sendJson(res, 400, { error: `无法创建项目文件夹: ${e.message}` });
           }
         }
+        // 项目名称不再由新建对话框单独填写：优先使用工作目录名，否则取任务首行。
+        const firstTaskLine = task.split(/\r?\n/, 1)[0].trim();
+        const inferredName = sourceDir ? path.basename(sourceDir) : firstTaskLine.slice(0, 40);
+        const name = String(body.name || inferredName || "新项目").trim().slice(0, 80) || "新项目";
         const opts = {};
         if (body.deepseek_selection && typeof body.deepseek_selection === "object") {
           opts.deepseek_selection = {
@@ -171,8 +177,7 @@ export class DashboardServer {
             reasoningEffort: String(body.deepseek_selection.reasoningEffort || ""),
           };
         }
-        if (body.category != null) opts.category = String(body.category);
-        const id = await this.orchestrator.createProject(body.name, body.task, sourceDir, opts);
+        const id = await this.orchestrator.createProject(name, task, sourceDir, opts);
         return sendJson(res, 201, { id });
       }
       const m2 = p.match(/^\/api\/projects\/([^/]+)\/action$/);
@@ -180,6 +185,7 @@ export class DashboardServer {
         const body = await readBody(req);
         const id = decodeURIComponent(m2[1]);
         if (body.action === "pause") await this.orchestrator.pause(id);
+        else if (body.action === "end") await this.orchestrator.endProject(id);
         else if (body.action === "resume") await this.orchestrator.resume(id);
         else if (body.action === "retry") await this.orchestrator.retry(id);
         else if (body.action === "setdir") {
@@ -190,9 +196,6 @@ export class DashboardServer {
           catch (e) { return sendJson(res, 400, { error: String(e.message) }); }
         } else if (body.action === "archive") {
           try { await this.orchestrator.setProjectArchived(id, body.archived); }
-          catch (e) { return sendJson(res, 400, { error: String(e.message) }); }
-        } else if (body.action === "category") {
-          try { await this.orchestrator.setProjectCategory(id, body.category); }
           catch (e) { return sendJson(res, 400, { error: String(e.message) }); }
         } else if (body.action === "deepseek_model") {
           try { await this.orchestrator.setProjectDeepseekSelection(id, body.selection); }
@@ -237,7 +240,7 @@ export class DashboardServer {
         if (!text && attachments.length === 0) return sendJson(res, 400, { error: "需要消息或附件" });
         const files = attachments.map((a) => `- ${a.name}: ${this.store.resolveWorkspacePath(id, a.relative_path)}`).join("\n");
         const message = files ? `[本地附件]\n${files}\n\n${text || "请读取并分析这些附件。"}` : text;
-        await this.orchestrator.injectMessage(id, message);
+        await this.orchestrator.injectMessage(id, message, attachments);
         return sendJson(res, 200, { ok: true });
       }
       if (req.method === "GET" && p === "/api/deepseek/models") {

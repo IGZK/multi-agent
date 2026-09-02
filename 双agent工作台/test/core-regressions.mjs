@@ -153,6 +153,19 @@ test("GPT 发送途中暂停不会被迟到写入覆盖", async () => {
   } finally { f.cleanup(); }
 });
 
+test("手动结束项目会取消执行并保留项目记录", async () => {
+  const f = fixture();
+  try {
+    const id = f.create();
+    let killed = false;
+    const orch = new Orchestrator(config(), silent, {}, { kill() { killed = true; } }, f.store);
+    const state = await orch.endProject(id);
+    assert.equal(killed, true);
+    assert.equal(state.state, "CANCELED");
+    assert.equal(f.store.readState(id).milestone.text, "用户手动结束");
+  } finally { f.cleanup(); }
+});
+
 test("自动重试成功后不会同时留下失败记录", async () => {
   const f = fixture();
   try {
@@ -185,11 +198,46 @@ test("Dashboard 拒绝外部网页发起的写入请求", async () => {
   assert.match(payload, /拒绝/);
 });
 
+test("新建项目可由工作目录自动命名并按目录暴露", async () => {
+  const f = fixture();
+  let created;
+  const sourceDir = path.join(f.root, "demo-source");
+  const orchestrator = {
+    async createProject(name, task, dir) { created = { name, task, dir }; return "demo-source"; },
+  };
+  const bridge = { async getSystemState() { return {}; } };
+  const runner = { status() { return {}; } };
+  const server = new DashboardServer({ dashboard: { host: "127.0.0.1", port: 0 } }, silent, orchestrator, f.store, bridge, runner);
+  try {
+    await server.start();
+    const base = `http://127.0.0.1:${server.server.address().port}`;
+    const response = await fetch(`${base}/api/projects`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task: "实现一个目录内工具", source_dir: sourceDir }),
+    });
+    assert.equal(response.status, 201);
+    assert.deepEqual(created, { name: "demo-source", task: "实现一个目录内工具", dir: path.resolve(sourceDir) });
+  } finally {
+    if (server.server?.listening) await new Promise((resolve) => server.server.close(resolve));
+    f.cleanup();
+  }
+});
+
+test("项目列表暴露源码目录用于侧栏分组", () => {
+  const f = fixture();
+  try {
+    const id = f.store.createProject("目录项目", "测试", path.join(f.root, "src"));
+    const item = f.store.listProjects().find((p) => p.id === id);
+    assert.equal(item.source_dir, path.resolve(f.root, "src"));
+  } finally { f.cleanup(); }
+});
+
 test("附件 API 落盘并把真实路径注入消息", async () => {
   const f = fixture();
   const id = f.create();
   let injected = "";
-  const orchestrator = { async injectMessage(projectId, text) { assert.equal(projectId, id); injected = text; } };
+  let injectedAttachments = [];
+  const orchestrator = { async injectMessage(projectId, text, attachments) { assert.equal(projectId, id); injected = text; injectedAttachments = attachments; } };
   const bridge = { async getSystemState() { return {}; } };
   const runner = { status() { return {}; } };
   const server = new DashboardServer({ dashboard: { host: "127.0.0.1", port: 0 } }, silent, orchestrator, f.store, bridge, runner);
@@ -209,8 +257,20 @@ test("附件 API 落盘并把真实路径注入消息", async () => {
     assert.equal(message.status, 200);
     assert.match(injected, /资料\.txt:/);
     assert.match(injected, /attachments/);
+    assert.equal(injectedAttachments.length, 1);
+    assert.equal(injectedAttachments[0].name, "资料.txt");
   } finally {
     if (server.server?.listening) await new Promise((resolve) => server.server.close(resolve));
     f.cleanup();
   }
+});
+
+test("已结束项目不再显示等待计时", () => {
+  const f = fixture();
+  try {
+    const id = f.create();
+    f.store.writeState(id, { state: "CANCELED", pending: { text: "项目已由用户手动结束。", ts: new Date(Date.now() - 60000).toISOString() } });
+    const server = new DashboardServer({ dashboard: { host: "127.0.0.1", port: 3700 } }, silent, {}, f.store, {}, {});
+    assert.equal(server.projectDetail(id).pending_elapsed_s, null);
+  } finally { f.cleanup(); }
 });

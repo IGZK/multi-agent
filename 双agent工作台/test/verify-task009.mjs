@@ -31,7 +31,7 @@ let fakeDir = "C:/fake/project/dir/演示路径";
 
 page.on("console", (m) => { if (m.type() === "error") errors.push(m.text()); });
 page.on("pageerror", (e) => errors.push("pageerror: " + e.message));
-page.on("dialog", (d) => d.dismiss()); // 消除 alert 阻塞
+page.on("dialog", (d) => d.message().includes("结束这个项目") ? d.accept() : d.dismiss()); // 消除弹窗阻塞
 
 // 路由拦截
 await page.route("**/api/pickdir", async (route) => {
@@ -59,7 +59,7 @@ await page.route("**/api/projects/*/action", async (route) => {
 await page.route("**/api/projects", async (route) => {
   const req = route.request();
   if (req.method() === "POST") { try { createPayload.push(req.postDataJSON()); } catch (e) {} await route.fulfill({ status: 400, contentType: "application/json", body: JSON.stringify({ error: "reg-test-blocked" }) }); }
-  else await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ projects: [{ id: "demo", name: "演示", state: "PAUSED", updated_at: new Date().toISOString() }], system: { bridge: {}, runner: { active: [], uis: [] }, mode: {} } }) });
+  else await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ projects: [{ id: "demo", name: "演示", state: "PAUSED", source_dir: "C:/demo", updated_at: new Date().toISOString() }], system: { bridge: {}, runner: { active: [], uis: [] }, mode: {} } }) });
 });
 await page.route("**/api/projects/demo", async (route) => route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({
   id: "demo", name: "演示", state: "PAUSED", user_task: "测试", created_at: new Date().toISOString(), updated_at: new Date().toISOString(),
@@ -107,6 +107,10 @@ const setdirAct = actions.find(a => a.action === "setdir");
 ok("修改文件夹触发 setdir", !!setdirAct);
 eq("setdir 使用 pickdir 返回的目录", setdirAct && setdirAct.dir, fakeDir);
 eq("pickdir 请求被调用", pickDirBodies.length, 1);
+actions.length = 0;
+await page.click("#btnComposerDir");
+await page.waitForTimeout(400);
+ok("聊天框左上工作目录入口触发 setdir", actions.some((a) => a.action === "setdir"));
 
 // 新建项目表单的目录选择：#btnPickDir → pickdir → 填入 #projDir
 await page.click("#btnNewProject");
@@ -146,6 +150,11 @@ ok("deepseek_model 带 reasoningEffort=high", dm && dm.selection && dm.selection
 const modelOpts = await page.evaluate(() => document.querySelector("#cModel").options.length);
 ok("模型下拉已填充目录", modelOpts > 1);
 
+actions.length = 0;
+await page.click("#btnEnd");
+await page.waitForTimeout(300);
+ok("结束按钮触发 end 动作", actions.some((a) => a.action === "end"));
+
 // 消息发送（无附件）
 sentMessages.length = 0;
 await page.fill("#composerInput", "回归测试消息");
@@ -167,6 +176,15 @@ await page.setInputFiles("#photoInput", [{ name: "照片.png", mimeType: "image/
 await page.waitForTimeout(900);
 const hasPhoto = await page.evaluate(() => !!document.querySelector(".attach-card .attach-thumb img"));
 ok("照片加入且有缩略图", hasPhoto);
+
+// 拖拽入口已移除，浏览器不再接管或上传拖入文件
+await page.evaluate(() => {
+  const dt = new DataTransfer();
+  dt.items.add(new File(["dragged"], "拖拽.txt", { type: "text/plain" }));
+  document.querySelector("#composerInput").dispatchEvent(new DragEvent("drop", { bubbles: true, dataTransfer: dt }));
+});
+await page.waitForTimeout(200);
+ok("拖拽上传已移除", await page.evaluate(() => !Array.from(document.querySelectorAll(".attach-name")).some((el) => el.textContent === "拖拽.txt")));
 
 // 失败态
 const failInfo = await page.evaluate(() => {
@@ -198,16 +216,16 @@ await page.waitForTimeout(400);
 ok("附件已真实上传", uploadedAttachments.length >= 3 && uploadedAttachments.every((a) => a.data.startsWith("data:")));
 ok("带附件发送服务端 ID", sentMessages[0] && sentMessages[0].attachment_ids.length >= 2);
 
-// 新建项目 payload 构造（拦截为 400，不真正创建）
+// 新建项目 payload 构造（名称与分类由界面移除，拦截为 400，不真正创建）
 await page.click("#btnNewProject");
 createPayload.length = 0;
-await page.fill("#projName", "回归项目");
 await page.fill("#projTask", "测试任务描述");
 await page.click("#btnCreate");
 await page.waitForTimeout(400);
 ok("新建项目请求已构造", createPayload.length === 1);
 const cp = createPayload[0] || {};
-ok("新建 payload 含 name/task", cp.name === "回归项目" && !!cp.task);
+ok("新建界面已移除名称与分类字段", !(await page.locator("#projName").count()) && !(await page.locator("#projCategory").count()));
+ok("新建 payload 仅需任务描述", !cp.name && !cp.category && cp.task === "测试任务描述");
 await page.click("#projList li");
 await page.waitForTimeout(200);
 
@@ -230,10 +248,11 @@ ok("各尺寸无垂直溢出", sizeResults.every(r => !r.overflowY));
 
 // 主题切换
 await page.setViewportSize({ width: 1440, height: 900 });
+const initialTheme = await page.evaluate(() => document.documentElement.getAttribute("data-theme"));
 await page.click("#btnTheme");
 await page.waitForTimeout(200);
 const theme = await page.evaluate(() => document.documentElement.getAttribute("data-theme"));
-eq("主题切换为浅色", theme, "light");
+ok("主题可在深浅色之间切换", initialTheme !== theme);
 
 // 仅统计真实的 JS 异常；忽略测试自身制造的资源加载错误(favicon 404 / 拦截新建请求的 400)
 const jsErrors = errors.filter(e => !e.includes("favicon") && !e.includes("400 (Bad Request)") && !e.includes("status of 400"));

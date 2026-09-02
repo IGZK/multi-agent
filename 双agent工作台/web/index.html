@@ -46,25 +46,22 @@
     <main class="main">
       <div id="emptyHint" class="empty-hint">点击左上角“新建项目”，或从左侧选择一个项目。</div>
       <div id="createView" class="create-view hidden">
-        <div class="create-intro">
-          <h1>开始一个新项目</h1>
-          <p>描述目标后，GPT 负责规划，DeepSeek 负责执行。</p>
-        </div>
         <div class="create-composer">
-          <input id="projName" placeholder="项目名称（如：计算器）" />
-          <textarea id="projTask" rows="4" placeholder="描述你想完成的任务…"></textarea>
-          <div class="dir-pick-row">
-            <input id="projDir" placeholder="项目文件夹（可选，留空使用默认目录）" />
-            <button id="btnPickDir" class="btn small" type="button">📁 选择</button>
+          <textarea id="projTask" rows="5" placeholder="描述你想构建的内容"></textarea>
+          <input id="projDir" type="hidden" />
+          <div class="create-toolbar">
+            <div class="create-toolbar-left">
+              <button id="btnPickDir" class="create-tool-btn" type="button" title="选择工作文件夹">📁</button>
+              <span id="projDirLabel" class="create-dir-label">未选择文件夹（将使用工作台默认目录）</span>
+            </div>
+            <div class="create-toolbar-right">
+              <label class="create-select-label"><span>模型</span><select id="dsModel"><option value="">跟随默认</option></select></label>
+              <label class="create-select-label"><span>推理</span><select id="dsReasoning">
+                <option value="">默认</option><option value="off">off</option><option value="low">low</option><option value="high">high</option><option value="max">max</option>
+              </select></label>
+              <button id="btnCreate" class="create-send-btn" type="button" title="创建并开始">↑</button>
+            </div>
           </div>
-          <div class="create-options">
-            <input id="projCategory" placeholder="分类（可选）" />
-            <label class="ds-model-row"><span class="mini-label">DeepSeek 模型</span><select id="dsModel"><option value="">跟随默认</option></select></label>
-            <label class="ds-model-row"><span class="mini-label">推理等级</span><select id="dsReasoning">
-              <option value="">跟随默认</option><option value="off">off</option><option value="low">low</option><option value="high">high</option><option value="max">max</option>
-            </select></label>
-          </div>
-          <button id="btnCreate" class="btn primary">创建并开始</button>
         </div>
       </div>
       <div id="detail" class="detail hidden">
@@ -80,6 +77,7 @@
               <button class="btn small" id="btnPause">⏸ 暂停</button>
               <button class="btn small" id="btnResume">▶ 继续</button>
               <button class="btn small" id="btnRetry">🔄 重试</button>
+              <button class="btn small danger" id="btnEnd">⏹ 结束项目</button>
             </div>
           </div>
 
@@ -132,11 +130,15 @@
 
         <!-- 底部输入区（Composer）：输入框居中，右侧为操作栏（模型/推理在 TASK-005 加入） -->
         <div class="composer" id="composer">
+          <div class="composer-context">
+            <button class="composer-folder-btn" id="btnComposerDir" type="button" title="选择当前项目的工作文件夹">📁</button>
+            <span class="composer-dir-label" id="composerDirLabel" title="">默认工作目录</span>
+          </div>
           <div class="composer-attachments" id="attachList"></div>
           <div class="composer-main">
             <div class="composer-left">
-              <button class="icon-btn" id="btnAttach" type="button" title="添加文件（可多选）">📎</button>
-              <button class="icon-btn" id="btnAttachPhoto" type="button" title="添加照片（可多选）">📷</button>
+              <button class="icon-btn" id="btnAttach" type="button" title="上传文件到 GPT">＋</button>
+              <button class="icon-btn" id="btnAttachPhoto" type="button" title="添加照片（将发送给 GPT）">📷</button>
               <input type="file" id="fileInput" multiple hidden />
               <input type="file" id="photoInput" accept="image/*" multiple hidden />
             </div>
@@ -163,7 +165,7 @@
               <button class="btn primary send" id="btnComposerSend" type="button" title="发送到当前项目">发送</button>
             </div>
           </div>
-          <div class="composer-hint">Enter 发送 · Shift+Enter 换行 · <span id="composerSaveStatus" class="composer-save-status"></span></div>
+          <div class="composer-hint">附件将发送给 GPT · Enter 发送 · Shift+Enter 换行 · <span id="composerSaveStatus" class="composer-save-status"></span></div>
         </div>
       </div>
     </main>
