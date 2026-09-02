@@ -5,7 +5,7 @@
   "created_at": "2026-09-01T15:42:20.655Z",
   "updated_at": "2026-09-01T16:14:32.837Z",
   "user_task": "学习codex、deepseek harness等的ui设计，将对话输入框挪到右侧底部居中而不是在左上角，将模型及推理强度选择放在对话输入框右侧，项目文件夹的选择放在左侧。同时完善文件、照片等上传功能的ui",
-  "source_dir": "C:\\Users\\Administrator\\Desktop\\˫agent����̨",
+  "source_dir": null,
   "state": "COMPLETED",
   "previous_state": "WAITING_FOR_GPT",
   "error_count": 0,

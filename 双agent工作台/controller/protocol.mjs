@@ -266,10 +266,8 @@ export function parsePlan(text) {
 }
 
 /**
- * 精简计划视图：用于写进任务信封 / Prompt，避免每任务重复携带完整任务描述。
- * 保留 objective/goals/验收标准/约束/执行问题；任务列表只留 id/priority/status/依赖，
- * 不再携带各任务描述（当前任务完整描述在信封 current_task 中，完整计划在
- * project_state.json / project_plan.md 中可读），从而显著降低每任务信封体积。
+ * 执行者计划摘要：只保留项目级目标和约束，不重复携带任务列表。
+ * 当前任务在信封 current_task 中；完整计划按需从 project_plan.md 读取。
  */
 export function slimPlan(plan) {
   if (!plan || typeof plan !== "object") return plan;
@@ -281,12 +279,6 @@ export function slimPlan(plan) {
     acceptance_criteria: Array.isArray(plan.acceptance_criteria) ? plan.acceptance_criteria : [],
     constraints: Array.isArray(plan.constraints) ? plan.constraints : [],
     questions_for_executor: Array.isArray(plan.questions_for_executor) ? plan.questions_for_executor : [],
-    tasks: (plan.tasks || []).map((t) => ({
-      id: t.id,
-      priority: t.priority ?? "medium",
-      status: t.status ?? "pending",
-      dependencies: t.dependencies || [],
-    })),
   };
 }
 

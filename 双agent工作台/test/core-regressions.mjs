@@ -4,10 +4,13 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { ProjectStore } from "../controller/store.mjs";
-import { mergePlan } from "../controller/protocol.mjs";
+import { mergePlan, slimPlan } from "../controller/protocol.mjs";
 import { DeepseekRunner } from "../controller/deepseek_runner.mjs";
-import { Orchestrator } from "../controller/orchestrator.mjs";
+import { Orchestrator, contextSnapshot, tokenUsageDelta } from "../controller/orchestrator.mjs";
 import { DashboardServer } from "../controller/server.mjs";
+import { GptBridge } from "../controller/gpt_bridge.mjs";
+import { buildDeepseekPlanningGuidance, buildExecutorPrompt, buildExecutorTurnPrompt } from "../controller/prompts.mjs";
+import { ensureProjectSkill, verifyProjectSkill } from "../controller/workbench_skill.mjs";
 
 const silent = { info() {}, warn() {}, error() {} };
 
@@ -58,12 +61,274 @@ test("附件真实落盘并可按 ID 取回", () => {
   } finally { f.cleanup(); }
 });
 
+test("旧项目状态惰性补齐 v1.7 字段且不在读取时改写磁盘", () => {
+  const f = fixture();
+  try {
+    const id = f.create();
+    const file = f.store.resolveWorkspacePath(id, "project_state.json");
+    const raw = JSON.parse(fs.readFileSync(file, "utf8"));
+    raw.schema = 1;
+    delete raw.usage;
+    delete raw.session_generations;
+    fs.writeFileSync(file, JSON.stringify(raw), "utf8");
+    const state = f.store.readState(id);
+    assert.equal(state.schema, 2);
+    assert.equal(state.usage.deepseek.totals.outputTokens, 0);
+    assert.deepEqual(state.session_generations, []);
+    assert.equal(JSON.parse(fs.readFileSync(file, "utf8")).schema, 1);
+  } finally { f.cleanup(); }
+});
+
+test("GPT 网页用量只记录字符和明确估算 token", () => {
+  const f = fixture();
+  try {
+    const id = f.create();
+    f.store.recordGptMessage(id, "out", "12345678");
+    f.store.recordGptMessage(id, "in", "1234");
+    const usage = f.store.readState(id).usage.gpt;
+    assert.equal(usage.actual, false);
+    assert.equal(usage.estimate, true);
+    assert.equal(usage.sentCharacters, 8);
+    assert.equal(usage.receivedCharacters, 4);
+    assert.equal(usage.estimatedInputTokens, 2);
+    assert.equal(usage.estimatedOutputTokens, 1);
+  } finally { f.cleanup(); }
+});
+
+test("Harness token 投影按任务求差并计算上下文压力", () => {
+  assert.deepEqual(tokenUsageDelta(
+    { uncachedInputTokens: 10, outputTokens: 2, cacheReadTokens: 3, cacheWriteTokens: 1 },
+    { uncachedInputTokens: 25, outputTokens: 8, cacheReadTokens: 10, cacheWriteTokens: 2 },
+  ), { uncachedInputTokens: 15, outputTokens: 6, cacheReadTokens: 7, cacheWriteTokens: 1 });
+  assert.deepEqual(contextSnapshot({ projectedTokens: 700, contextWindow: 1000 }), {
+    pressureTokens: 700, contextWindow: 1000, percentage: 70,
+  });
+  assert.equal(contextSnapshot(null), null);
+});
+
+test("达到 70% 后只创建一个摘要化新会话", async () => {
+  const f = fixture();
+  try {
+    const id = f.create();
+    const task = { id: "TASK-001", description: "完成实现", dependencies: [] };
+    f.store.writeState(id, { plan: { raw: "tasks:\n- id: TASK-001", parsed: { tasks: [task] } }, current_task: task });
+    let compacted = 0;
+    const runner = {
+      isRunning: () => false,
+      async compactSession() { compacted++; return { sessionId: "session-2", previousSessionId: "session-1", actualModel: { model: "v4", reasoningEffort: "high" } }; },
+    };
+    const cfg = config();
+    cfg.deepseek.contextCompactThreshold = 0.7;
+    const orch = new Orchestrator(cfg, silent, {}, runner, f.store);
+    orch.recordExecutorUsage(id, {
+      sessionId: "session-1", freshSession: true, ms: 10, actualModel: { model: "v4", reasoningEffort: "high" },
+      usageBefore: { tokenUsage: { uncachedInputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 } },
+      usageAfter: {
+        tokenUsage: { uncachedInputTokens: 500, outputTokens: 50, cacheReadTokens: 100, cacheWriteTokens: 0 },
+        contextPressure: { projectedTokens: 700, contextWindow: 1000 },
+      },
+    }, { type: "EXECUTE_PLAN", current_task: task, attempt: 1 }, true);
+    assert.equal(await orch.maybeCompactSession(id), true);
+    assert.equal(await orch.maybeCompactSession(id), false);
+    const state = f.store.readState(id);
+    assert.equal(compacted, 1);
+    assert.equal(state.compaction.count, 1);
+    assert.equal(state.session_generations.length, 2);
+    assert.match(f.store.readFileSafe(id, "executor_context.md"), /已完成任务/);
+  } finally { f.cleanup(); }
+});
+
+test("投影不可用时同会话完成 20 个任务触发后备压缩", async () => {
+  const f = fixture();
+  try {
+    const id = f.create();
+    f.store.writeState(id, { session_generations: [{ generation: 1, session_id: "s1", completed_tasks: 20 }] });
+    let compacted = 0;
+    const runner = { isRunning: () => false, async compactSession() { compacted++; return { sessionId: "s2" }; } };
+    const orch = new Orchestrator(config(), silent, {}, runner, f.store);
+    assert.equal(await orch.maybeCompactSession(id), true);
+    assert.equal(compacted, 1);
+  } finally { f.cleanup(); }
+});
+
+test("执行中手动压缩和切换模型都只排队", async () => {
+  const f = fixture();
+  try {
+    const id = f.create();
+    const task = { id: "TASK-001", description: "当前任务", dependencies: [] };
+    f.store.writeState(id, { state: "WAITING_FOR_EXECUTOR", current_task: task, plan: { parsed: { tasks: [task] } } });
+    let compacted = 0;
+    const runner = { isRunning: () => true, async compactSession() { compacted++; } };
+    const orch = new Orchestrator(config(), silent, {}, runner, f.store);
+    assert.equal((await orch.compactSession(id)).queued, true);
+    await orch.setProjectDeepseekSelection(id, { provider: "deepseek", model: "v4", reasoningEffort: "high" });
+    const state = f.store.readState(id);
+    assert.equal(compacted, 0);
+    assert.equal(state.compaction.pending, true);
+    assert.equal(state.pending_model_replan.status, "waiting_task");
+    assert.equal(state.state, "WAITING_FOR_EXECUTOR");
+  } finally { f.cleanup(); }
+});
+
+test("空闲切换模型立即只重规划未完成任务", async () => {
+  const f = fixture();
+  try {
+    const id = f.create();
+    const done = { id: "TASK-001", description: "已完成" };
+    const pending = { id: "TASK-002", description: "仍待实现", dependencies: ["TASK-001"] };
+    f.store.writeState(id, { state: "PLAN_READY", plan: { parsed: { tasks: [done, pending] } }, completed_tasks: [{ id: done.id }] });
+    let prompt = "";
+    const orch = new Orchestrator(config(), silent, {}, { isRunning: () => false }, f.store);
+    orch.sendToGpt = async (_id, _type, text) => { prompt = text; };
+    await orch.setProjectDeepseekSelection(id, { provider: "deepseek", model: "v4", reasoningEffort: "low" });
+    assert.match(prompt, /TASK-002/);
+    assert.doesNotMatch(prompt, /TASK-001: 已完成/);
+    assert.equal(f.store.readState(id).state, "WAITING_FOR_GPT");
+    assert.equal(f.store.readState(id).pending_model_replan.status, "awaiting_gpt");
+  } finally { f.cleanup(); }
+});
+
+test("暂停项目切换模型不会隐式恢复，继续时才重规划", async () => {
+  const f = fixture();
+  try {
+    const id = f.create();
+    const task = { id: "TASK-001", description: "待处理", dependencies: [] };
+    f.store.writeState(id, { state: "PAUSED", plan: { parsed: { tasks: [task] } } });
+    let sends = 0;
+    const orch = new Orchestrator(config(), silent, {}, { isRunning: () => false }, f.store);
+    orch.sendToGpt = async () => { sends++; };
+    await orch.setProjectDeepseekSelection(id, { provider: "deepseek", model: "v4" });
+    assert.equal(f.store.readState(id).state, "PAUSED");
+    assert.equal(sends, 0);
+    await orch.resume(id);
+    assert.equal(sends, 1);
+    assert.equal(f.store.readState(id).state, "WAITING_FOR_GPT");
+  } finally { f.cleanup(); }
+});
+
+test("GPT 正在回复时切换 DeepSeek 模型不会并发发送", async () => {
+  const f = fixture();
+  try {
+    const id = f.create();
+    const task = { id: "TASK-001", description: "待处理", dependencies: [] };
+    f.store.writeState(id, { state: "WAITING_FOR_GPT", plan: { parsed: { tasks: [task] } } });
+    let sends = 0;
+    const orch = new Orchestrator(config(), silent, {}, { isRunning: () => false }, f.store);
+    orch.gptWaitingProjects.add(id);
+    orch.sendToGpt = async () => { sends++; };
+    await orch.setProjectDeepseekSelection(id, { provider: "deepseek", model: "v4" });
+    assert.equal(sends, 0);
+    assert.equal(f.store.readState(id).pending_model_replan.status, "waiting_gpt");
+  } finally { f.cleanup(); }
+});
+
 test("重规划以新任务列表为准，可删除旧任务", () => {
   const result = mergePlan(
     { tasks: [{ id: "TASK-001" }, { id: "TASK-002" }] },
     { tasks: [{ id: "TASK-002", description: "保留" }] },
   );
   assert.deepEqual(result.tasks.map((task) => task.id), ["TASK-002"]);
+});
+
+test("执行信封不再重复携带完整任务列表", () => {
+  const plan = slimPlan({
+    objective: "交付工具",
+    acceptance_criteria: ["测试通过"],
+    tasks: [{ id: "TASK-001", description: "很长的实现说明", dependencies: [] }],
+  });
+  assert.equal("tasks" in plan, false);
+  assert.equal(plan.objective, "交付工具");
+});
+
+test("DeepSeek 档位会改变 GPT 的任务描述策略", () => {
+  const strong = buildDeepseekPlanningGuidance({ model: "deepseek-v4-pro", reasoningEffort: "high" });
+  const guided = buildDeepseekPlanningGuidance({ model: "deepseek-v4-flash", reasoningEffort: "off" });
+  assert.match(strong, /任务可较粗/);
+  assert.match(guided, /拆成小而自足/);
+  assert.match(guided, /验证命令或检查点/);
+});
+
+test("GPT 规划请求会带上项目当前 DeepSeek 档位", async () => {
+  const f = fixture();
+  try {
+    const id = f.create();
+    f.store.writeState(id, { deepseek_selection: { model: "deepseek-v4-flash", reasoningEffort: "low" } });
+    let sent = "";
+    const bridge = {
+      page: { url: () => "https://chatgpt.com/c/test" },
+      async ensureBrowser() {}, async newConversation() {},
+      async detectState() { return { loggedIn: true, challenge: false }; },
+      async assistantCount() { return 0; },
+      async sendMessage(text) { sent = text; },
+    };
+    const orch = new Orchestrator(config(), silent, bridge, {}, f.store);
+    await orch.sendToGpt(id, "PLAN_REQUEST", "规划这个项目", { intro: true });
+    assert.match(sent, /deepseek-v4-flash/);
+    assert.match(sent, /拆成小而自足/);
+  } finally { f.cleanup(); }
+});
+
+test("DeepSeek 首轮加载 Skill，后续轮次只通知信封更新", () => {
+  const envelope = { workspace_dir: "C:/work/.gpt_workspace", current_task: { id: "TASK-001", description: "不应重复到提示中" } };
+  const first = buildExecutorPrompt(envelope);
+  const next = buildExecutorTurnPrompt(envelope);
+  assert.match(first, /WORKBENCH_MANAGED_DISPATCH_V1/);
+  assert.match(first, /skill 工具加载/);
+  assert.doesNotMatch(first + next, /不应重复到提示中/);
+  assert.doesNotMatch(next, /outbox.*格式/);
+});
+
+test("工作台 Skill 可供给且要求提示标记与合法信封同时成立", () => {
+  const source = fs.mkdtempSync(path.join(os.tmpdir(), "dual-agent-skill-test-"));
+  try {
+    ensureProjectSkill(source);
+    const verified = verifyProjectSkill(source);
+    const skill = fs.readFileSync(path.join(source, ".dsh", "skills", "workbench-executor", "SKILL.md"), "utf8");
+    assert.equal(verified.ok, true);
+    assert.match(skill, /WORKBENCH_MANAGED_DISPATCH_V1/);
+    assert.match(skill, /workbench_dispatch: true/);
+    assert.match(skill, /user-invocable: false/);
+  } finally { fs.rmSync(source, { recursive: true, force: true }); }
+});
+
+test("同一项目复用会话时只打开一次执行窗口", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "dual-agent-window-test-"));
+  const dirs = {
+    projectDir: root,
+    workspaceDir: path.join(root, ".gpt_workspace"),
+    sourceDir: path.join(root, "source"),
+  };
+  fs.mkdirSync(path.join(dirs.workspaceDir, "outbox"), { recursive: true });
+  fs.mkdirSync(path.join(dirs.workspaceDir, "inbox"), { recursive: true });
+  fs.mkdirSync(dirs.sourceDir, { recursive: true });
+  let reused = false;
+  let opened = 0;
+  const outbox = path.join(dirs.workspaceDir, "outbox", "message.json");
+  const server = { url: "http://127.0.0.1:1", child: { pid: 1 }, logFile: path.join(root, "ui.log") };
+  const runner = Object.assign(Object.create(DeepseekRunner.prototype), {
+    cfg: { mode: "real", visible: true, uiOpenWindow: true, executorTimeoutMs: 1000 },
+    logger: silent,
+    running: new Map(),
+    cancelled: new Set(),
+    ui: {
+      profileName: "test",
+      ensureServer: async () => server,
+      getOrCreateSession: async () => ({ sessionId: "session-1", reused }),
+      submitPrompt: async () => fs.writeFileSync(outbox, "{}"),
+      openWindow: () => { opened++; return { opened: true }; },
+      isAlive: async () => true,
+    },
+  });
+  const store = { readState: () => ({}), writeState() {} };
+  const envelope = { type: "EXECUTE_PLAN", current_task: { id: "TASK-001" }, workspace_dir: dirs.workspaceDir };
+  try {
+    await runner.runSessionPool("project", dirs, envelope, store, buildExecutorPrompt(envelope));
+    fs.rmSync(outbox, { force: true });
+    reused = true;
+    envelope.current_task = { id: "TASK-002" };
+    await runner.runSessionPool("project", dirs, envelope, store, buildExecutorPrompt(envelope));
+    assert.equal(opened, 1);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
 test("调度器不会执行依赖未满足的任务", () => {
@@ -111,6 +376,25 @@ test("恢复等待状态时会重建浏览器并打开保存的会话", async ()
     assert.equal(await orch.waitForGpt(id), "完成");
     assert.deepEqual(opened, ["https://chatgpt.com/c/test"]);
   } finally { f.cleanup(); }
+});
+
+test("浏览器仍连接但页面已关闭时会重建页面", async () => {
+  const page = {
+    isClosed: () => false,
+    setDefaultTimeout() {},
+    on() {},
+  };
+  const bridge = Object.assign(Object.create(GptBridge.prototype), {
+    cfg: { debugPort: 9333 },
+    logger: silent,
+    page: null,
+    browser: {
+      isConnected: () => true,
+      contexts: () => [{ pages: () => [], newPage: async () => page }],
+    },
+  });
+  await bridge.ensureBrowser();
+  assert.equal(bridge.page, page);
 });
 
 test("暂停会取消执行且迟到结果不能覆盖 PAUSED", async () => {
@@ -184,6 +468,31 @@ test("自动重试成功后不会同时留下失败记录", async () => {
     const state = f.store.readState(id);
     assert.equal(state.failed_tasks.length, 0);
     assert.deepEqual(state.completed_tasks.map((item) => item.id), [task.id]);
+  } finally { f.cleanup(); }
+});
+
+test("任务重试耗尽后会把失败交给 GPT 决策", async () => {
+  const f = fixture();
+  try {
+    const id = f.create();
+    const task = { id: "TASK-001", description: "最终失败任务", dependencies: [] };
+    f.store.writeState(id, { state: "WAITING_FOR_EXECUTOR", current_task: task, plan: { parsed: { tasks: [task] } } });
+    f.store.writeWorkspaceFile(id, "outbox/message.json", JSON.stringify({ type: "TASK_FAILED", task_id: task.id, summary: "仍然失败" }));
+    let query = "";
+    const orch = new Orchestrator(config(), silent, {}, {}, f.store);
+    orch.sendToGpt = async (_projectId, type, text) => { assert.equal(type, "QUERY"); query = text; };
+    await orch.handleExecutorResult(id, { exitCode: 1, timedOut: false, ms: 1 }, { type: "EXECUTE_PLAN", current_task: task, attempt: 2 });
+    assert.match(query, /最终失败任务/);
+    assert.equal(f.store.readState(id).state, "WAITING_FOR_GPT");
+  } finally { f.cleanup(); }
+});
+
+test("无效的旧源码目录会回退到项目默认 source", () => {
+  const f = fixture();
+  try {
+    const id = f.create();
+    f.store.writeState(id, { source_dir: path.join(f.root, "不存在") });
+    assert.equal(f.store.sourceDir(id), path.join(f.store.projectsRoot, id, "source"));
   } finally { f.cleanup(); }
 });
 
@@ -272,5 +581,22 @@ test("已结束项目不再显示等待计时", () => {
     f.store.writeState(id, { state: "CANCELED", pending: { text: "项目已由用户手动结束。", ts: new Date(Date.now() - 60000).toISOString() } });
     const server = new DashboardServer({ dashboard: { host: "127.0.0.1", port: 3700 } }, silent, {}, f.store, {}, {});
     assert.equal(server.projectDetail(id).pending_elapsed_s, null);
+  } finally { f.cleanup(); }
+});
+
+test("Dashboard 轮询只读取最近 40 条对话和日志末尾 60 行", () => {
+  const f = fixture();
+  try {
+    const id = f.create();
+    for (let i = 1; i <= 45; i++) f.store.recordGptMessage(id, "in", `消息 ${i}`);
+    const logDir = path.join(f.store.workspaceDir(id), "logs");
+    fs.mkdirSync(logDir, { recursive: true });
+    fs.writeFileSync(path.join(logDir, "project-test.log"), Array.from({ length: 80 }, (_, i) => `日志 ${i + 1}`).join("\n"));
+    const server = new DashboardServer({ dashboard: { host: "127.0.0.1", port: 3700 } }, silent, {}, f.store, {}, {});
+    const detail = server.projectDetail(id);
+    assert.equal(detail.conversation.length, 40);
+    assert.equal(detail.conversation[0].text, "消息 6");
+    assert.doesNotMatch(detail.logs_tail, /日志 20(?:\D|$)/);
+    assert.match(detail.logs_tail, /日志 80/);
   } finally { f.cleanup(); }
 });

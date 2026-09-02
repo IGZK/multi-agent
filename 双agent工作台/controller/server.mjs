@@ -40,6 +40,17 @@ function readBody(req, maxBytes = 1024 * 1024) {
   });
 }
 
+function readTextTail(file, maxBytes = 64 * 1024) {
+  // ponytail: 64KB 足够容纳常规 60 行日志；超长单行出现时再改为分块向前读取。
+  const size = fs.statSync(file).size;
+  const length = Math.min(size, maxBytes);
+  const buffer = Buffer.alloc(length);
+  const fd = fs.openSync(file, "r");
+  try { fs.readSync(fd, buffer, 0, length, size - length); }
+  finally { fs.closeSync(fd); }
+  return buffer.toString("utf8").replace(/^\uFFFD/, "");
+}
+
 export class DashboardServer {
   constructor(config, logger, orchestrator, store, bridge, runner) {
     this.cfg = config;
@@ -61,7 +72,7 @@ export class DashboardServer {
       const files = fs.readdirSync(logFile).filter((f) => f.endsWith(".log")).sort();
       const last = files[files.length - 1];
       if (last) {
-        const content = fs.readFileSync(path.join(logFile, last), "utf8");
+        const content = readTextTail(path.join(logFile, last));
         logsTail = content.split(/\r?\n/).slice(-60).join("\n");
       }
     } catch { /* ignore */ }
@@ -91,7 +102,7 @@ export class DashboardServer {
       analysis_text: this.store.readFileSafe(projectId, "project_analysis.md"),
       final_report: this.store.readFileSafe(projectId, "FINAL_REPORT.md"),
       gpt_context: this.store.readFileSafe(projectId, "gpt_context.md"),
-      conversation: this.store.listConversation(projectId).slice(-40),
+      conversation: this.store.listConversation(projectId, 40),
       logs_tail: logsTail,
       source_dir: this.store.sourceDir(projectId),
       workspace_dir: this.store.workspaceDir(projectId),
@@ -99,6 +110,12 @@ export class DashboardServer {
       executor_ui: this.runner?.uiInfo?.(projectId) || null,
       archived: !!st.archived,
       deepseek_selection: st.deepseek_selection || null,
+      usage: st.usage,
+      session_generations: st.session_generations,
+      pending_model_replan: st.pending_model_replan,
+      compaction: st.compaction,
+      checkpoint: st.checkpoint,
+      model_recommendations: st.model_recommendations,
       pending_elapsed_s: ["COMPLETED", "CANCELED", "PAUSED"].includes(st.state)
         ? null
         : st.pending?.ts ? Math.round((Date.now() - new Date(st.pending.ts).getTime()) / 1000) : null,
@@ -188,6 +205,10 @@ export class DashboardServer {
         else if (body.action === "end") await this.orchestrator.endProject(id);
         else if (body.action === "resume") await this.orchestrator.resume(id);
         else if (body.action === "retry") await this.orchestrator.retry(id);
+        else if (body.action === "compact_session") {
+          const result = await this.orchestrator.compactSession(id);
+          return sendJson(res, 200, { ok: true, ...result });
+        }
         else if (body.action === "setdir") {
           try { await this.orchestrator.setSourceDir(id, body.dir); }
           catch (e) { return sendJson(res, 400, { error: String(e.message) }); }

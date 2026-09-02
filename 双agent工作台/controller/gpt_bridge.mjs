@@ -133,15 +133,18 @@ export class GptBridge {
   }
 
   async ensureBrowser() {
-    if (this.browser?.isConnected?.()) return true;
+    if (this.browser?.isConnected?.() && this.page && !this.page.isClosed?.()) return true;
     try {
-      if (!(await this.isDebugPortUp())) await this.launchChrome();
-      this.browser = await chromium.connectOverCDP(`http://127.0.0.1:${this.cfg.debugPort}`);
+      if (!this.browser?.isConnected?.()) {
+        if (!(await this.isDebugPortUp())) await this.launchChrome();
+        this.browser = await chromium.connectOverCDP(`http://127.0.0.1:${this.cfg.debugPort}`);
+      }
       const contexts = this.browser.contexts();
       const ctx = contexts[0] || (await this.browser.newContext());
-      this.page = ctx.pages()[0] || (await ctx.newPage());
-      this.page.setDefaultTimeout(30000);
-      this.page.on("close", () => { this.page = null; });
+      const page = ctx.pages().find((candidate) => !candidate.isClosed()) || (await ctx.newPage());
+      this.page = page;
+      page.setDefaultTimeout(30000);
+      page.on("close", () => { if (this.page === page) this.page = null; });
       this.log("info", "CDP 连接成功");
       return true;
     } catch (e) {

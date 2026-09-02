@@ -15,6 +15,7 @@ import { ROOT_DIR } from "./logger.mjs";
 
 /** Skill 名称（kebab-case，须与 SKILL.md frontmatter 一致）。 */
 export const SKILL_NAME = "workbench-executor";
+export const WORKBENCH_DISPATCH_MARKER = "WORKBENCH_MANAGED_DISPATCH_V1";
 
 /** Skill 源码目录（随工作台源码维护的权威版本）。 */
 export function skillSourceDir() {
@@ -85,7 +86,7 @@ export function parseSkillName(md) {
  * 让执行者先加载本 Skill 再读信封；后续任务由 TASK-005 的精简提示复用。
  */
 export function buildSkillActivationLine() {
-  return `【工作台底层协议】请先通过 skill 工具加载并遵循名为 "${SKILL_NAME}" 的 Skill，再读取并执行任务信封；该 Skill 定义了你的角色、通信协议、outbox 格式与硬性要求。`;
+  return `[${WORKBENCH_DISPATCH_MARKER}] 请先用 skill 工具加载 "${SKILL_NAME}"，再读取任务信封。`;
 }
 
 /**

@@ -200,6 +200,7 @@ export class UiExecutor {
       logFile,
       startedAt: Date.now(),
       sessionId: null, // 项目级复用会话（一个项目一个会话）
+      needsBootstrap: false,
       sessions: new Map(), // sessionId -> {taskId, startedAt}
     };
     this.servers.set(projectId, server);
@@ -231,7 +232,7 @@ export class UiExecutor {
       try {
         const list = await rpc(s.port, "session.list", {}, 15000);
         if ((list.items || []).some((x) => x.sessionId === s.sessionId)) {
-          return { sessionId: s.sessionId, reused: true };
+          return { sessionId: s.sessionId, reused: true, bootstrap: !!s.needsBootstrap };
         }
       } catch { /* 单次查询失败按失效处理 */ }
       s.sessionId = null;
@@ -239,7 +240,45 @@ export class UiExecutor {
     const created = await rpc(s.port, "session.create", { cwd: sourceDir }, 60000);
     if (!created || !created.sessionId) throw new Error("session.create 未返回 sessionId");
     s.sessionId = created.sessionId;
-    return { sessionId: created.sessionId, reused: false };
+    s.needsBootstrap = false;
+    return { sessionId: created.sessionId, reused: false, bootstrap: false };
+  }
+
+  /** 在现有服务内换成空白会话；保留同一窗口，下一次任务重新加载 Skill 与摘要。 */
+  async replaceSession(projectId, sourceDir) {
+    const s = this.servers.get(projectId);
+    if (!s) throw new Error("可见执行服务未就绪");
+    const previousSessionId = s.sessionId || null;
+    const created = await rpc(s.port, "session.create", { cwd: sourceDir }, 60000);
+    if (!created?.sessionId) throw new Error("session.create 未返回 sessionId");
+    s.sessionId = created.sessionId;
+    s.needsBootstrap = true;
+    return { sessionId: created.sessionId, previousSessionId };
+  }
+
+  clearBootstrap(projectId, sessionId) {
+    const s = this.servers.get(projectId);
+    if (s?.sessionId === sessionId) s.needsBootstrap = false;
+  }
+
+  /** 读取 Harness 尾页投影；能力缺失时返回 null，由编排器使用任务数后备阈值。 */
+  async sessionProjection(projectId, sessionId) {
+    const s = this.servers.get(projectId);
+    if (!s) return null;
+    const history = await rpc(s.port, "session.history", { sessionId, maxMessages: 1 }, 30000);
+    const values = history?.projections?.values;
+    if (!values?.tokenUsage && !values?.contextPressure) return null;
+    return {
+      tokenUsage: values.tokenUsage || null,
+      contextPressure: values.contextPressure || null,
+      asOfSeq: history.projections.asOfSeq,
+    };
+  }
+
+  async currentModel(projectId, sessionId) {
+    const s = this.servers.get(projectId);
+    if (!s) return null;
+    return (await rpc(s.port, "session.models", { sessionId }, 30000))?.current || null;
   }
 
   /** 为会话选择模型/推理等级。selection = {provider, model, reasoningEffort?}。 */

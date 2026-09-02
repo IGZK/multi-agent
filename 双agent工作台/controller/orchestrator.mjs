@@ -8,7 +8,30 @@ import {
   parseGptResponse, parsePlan, mergePlan, fallbackParse, slimPlan,
   wrapOrchestratorMsg, wrapDeepseekQuery,
 } from "./protocol.mjs";
-import { GPT_SYSTEM_PROMPT } from "./prompts.mjs";
+import { GPT_SYSTEM_PROMPT, buildDeepseekPlanningGuidance } from "./prompts.mjs";
+
+const TOKEN_KEYS = ["uncachedInputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens"];
+
+export function tokenUsageDelta(before, after) {
+  if (!after) return null;
+  const out = {};
+  for (const key of TOKEN_KEYS) out[key] = Math.max(0, Number(after[key] || 0) - Number(before?.[key] || 0));
+  return out;
+}
+
+export function contextSnapshot(projection) {
+  if (!projection) return null;
+  const pressureTokens = Number(projection.projectedTokens ?? projection.pressureTokens);
+  const contextWindow = Number(projection.contextWindow);
+  const percentage = Number.isFinite(pressureTokens) && Number.isFinite(contextWindow) && contextWindow > 0
+    ? Math.round((pressureTokens / contextWindow) * 1000) / 10
+    : null;
+  return {
+    pressureTokens: Number.isFinite(pressureTokens) ? pressureTokens : null,
+    contextWindow: Number.isFinite(contextWindow) ? contextWindow : null,
+    percentage,
+  };
+}
 
 export class Orchestrator {
   constructor(config, logger, bridge, runner, store) {
@@ -162,6 +185,7 @@ export class Orchestrator {
       case "WAITING_FOR_EXECUTOR": return this.stepWaitingExecutor(projectId, st);
       case "ANALYZING": return this.stepAnalyzing(projectId, st);
       case "WAITING_FOR_GPT": return this.stepWaitingGpt(projectId, st);
+      case "REPLANNING": return sleep(500);
       case "ERROR": return this.stepError(projectId, st);
       default:
         this.log("warn", projectId, `未知状态 ${S}，回到 INIT`);
@@ -482,6 +506,7 @@ export class Orchestrator {
       attempt: attempt || 1,
       project_name: st.project_name,
       user_task: trunc(st.user_task, 1200),
+      executor_context_file: (st.compaction?.count || 0) > 0 ? ".gpt_workspace/executor_context.md" : null,
       timeoutMs: this.cfg.deepseek?.executorTimeoutMs,
     };
   }
@@ -515,13 +540,13 @@ export class Orchestrator {
     const st = this.store.readState(projectId);
     const envelope = envelopeOrNull || this.buildEnvelope(projectId, st, type, requestOrTask, requestOrTask, attempt);
     if (type === "ANALYZE") {
-      this.store.writeState(projectId, { pending: { text: "DeepSeek 正在分析项目…（执行窗口自动打开，可实时查看）", ts: nowIso(), type: "ANALYZE", request: requestOrTask } });
+      this.store.writeState(projectId, { pending: { text: "DeepSeek 正在分析项目…（执行窗口可实时查看）", ts: nowIso(), type: "ANALYZE", request: requestOrTask } });
       this.store.transition(projectId, "ANALYZING");
     } else if (type === "DECIDE") {
-      this.store.writeState(projectId, { pending: { text: "DeepSeek 正在评估并做出决定…（执行窗口自动打开，可实时查看）", ts: nowIso(), type: "DECIDE", request: requestOrTask } });
+      this.store.writeState(projectId, { pending: { text: "DeepSeek 正在评估并做出决定…（执行窗口可实时查看）", ts: nowIso(), type: "DECIDE", request: requestOrTask } });
       this.store.transition(projectId, "DECISION_REQUIRED");
     } else {
-      this.store.writeState(projectId, { pending: { text: `DeepSeek 执行中: ${st.current_task?.id || requestOrTask?.id || "-"}（执行窗口自动打开，可实时查看）`, ts: nowIso(), type: "EXECUTE_PLAN" } });
+      this.store.writeState(projectId, { pending: { text: `DeepSeek 执行中: ${st.current_task?.id || requestOrTask?.id || "-"}（执行窗口可实时查看）`, ts: nowIso(), type: "EXECUTE_PLAN" } });
       this.store.transition(projectId, "WAITING_FOR_EXECUTOR");
     }
 
@@ -542,12 +567,72 @@ export class Orchestrator {
     } else {
       this.updateContextCache(projectId);
     }
+    await this.maybeCompactSession(projectId);
     return outcome;
   }
 
-  async handleExecutorResult(projectId, result, envelope) {
+  recordExecutorUsage(projectId, result, envelope, completed) {
     const st = this.store.readState(projectId);
+    const after = result.usageAfter?.tokenUsage || null;
+    const before = result.usageBefore?.tokenUsage || null;
+    const context = contextSnapshot(result.usageAfter?.contextPressure);
+    const ds = st.usage.deepseek;
+
+    const generations = [...(st.session_generations || [])];
+    let generation = generations.at(-1);
+    if (result.sessionId && generation?.session_id !== result.sessionId) {
+      if (generation && !generation.ended_at) generation = generations[generations.length - 1] = { ...generation, ended_at: nowIso() };
+      generation = {
+        generation: (generations.at(-1)?.generation || 0) + 1,
+        session_id: result.sessionId,
+        started_at: nowIso(),
+        ended_at: null,
+        reason: result.freshSession ? "new_or_recovered" : "observed",
+        model: result.actualModel || null,
+        completed_tasks: 0,
+      };
+      generations.push(generation);
+    }
+    const effectiveBefore = before || (generation && generation.session_id === result.sessionId ? generation.last_token_usage : null);
+    const tokens = tokenUsageDelta(effectiveBefore, after);
+    const totals = { ...ds.totals };
+    if (tokens) for (const key of TOKEN_KEYS) totals[key] = Number(totals[key] || 0) + tokens[key];
+    if (completed && envelope.type === "EXECUTE_PLAN" && generation) {
+      generations[generations.length - 1] = { ...generation, completed_tasks: Number(generation.completed_tasks || 0) + 1 };
+      generation = generations.at(-1);
+    }
+    if (generation && after) {
+      generations[generations.length - 1] = { ...generation, last_token_usage: after };
+      generation = generations.at(-1);
+    }
+
+    const record = {
+      ts: nowIso(),
+      task_id: envelope.current_task?.id || envelope.type,
+      type: envelope.type,
+      attempt: envelope.attempt || 1,
+      generation: generation?.generation || null,
+      session_id: result.sessionId || null,
+      model: result.actualModel || null,
+      duration_ms: result.ms,
+      actual: !!tokens,
+      tokens,
+      context,
+    };
+    const tasks = [...(ds.tasks || []), record].slice(-500);
+    this.store.writeState(projectId, {
+      usage: { ...st.usage, deepseek: { ...ds, totals, tasks, context: context || ds.context || null } },
+      session_generations: generations,
+    });
+    return record;
+  }
+
+  async handleExecutorResult(projectId, result, envelope) {
+    let st = this.store.readState(projectId);
     if (!st) return null;
+    const outbox = this.store.readOutbox(projectId);
+    const usageRecord = this.recordExecutorUsage(projectId, result, envelope, outbox?.type === "TASK_DONE");
+    st = this.store.readState(projectId);
     const runs = [...(st.executor_runs || [])];
     runs.push({
       ts: nowIso(), type: envelope.type,
@@ -555,10 +640,10 @@ export class Orchestrator {
       attempt: envelope.attempt || 1,
       exitCode: result.exitCode, timedOut: !!result.timedOut, ms: result.ms, mock: !!result.mock,
       visible: !!result.visible,
+      model: result.actualModel || null,
+      usage: usageRecord,
     });
     this.store.writeState(projectId, { executor_runs: runs.slice(-100) });
-
-    const outbox = this.store.readOutbox(projectId);
     this.store.clearOutbox(projectId);
 
     if (!outbox) {
@@ -606,24 +691,30 @@ export class Orchestrator {
       });
       this.store.writeState(projectId, { completed_tasks: completed });
       this.log("info", projectId, `任务完成并记录: ${outbox.task_id}（已完成 ${completed.length} 项）`);
+      if (this.store.readState(projectId)?.pending_model_replan?.status === "waiting_task") {
+        return this.beginModelReplan(projectId);
+      }
       return this.store.transition(projectId, "PLAN_READY");
     }
 
     if (outbox.type === "TASK_FAILED") {
       const taskId = outbox.task_id || envelope.current_task?.id;
+      const task = st.plan?.parsed?.tasks?.find((t) => t.id === taskId) || st.current_task;
       const maxRetries = this.cfg.deepseek?.maxRetries ?? 2;
       const currentAttempt = envelope.attempt || 1;
       const attemptNo = currentAttempt + 1;
       if (attemptNo <= maxRetries) {
         this.log("warn", projectId, `任务 ${taskId} 失败（第 ${currentAttempt} 次），自动重试 ${attemptNo}/${maxRetries}`);
         this.store.writeState(projectId, { pending: { text: `任务 ${taskId} 失败，自动重试…`, ts: nowIso() } });
-        const task = st.plan?.parsed?.tasks?.find((t) => t.id === taskId) || st.current_task;
         const envelope2 = this.buildEnvelope(projectId, st, "EXECUTE_PLAN", task, null, attemptNo);
         return this.dispatchExecutor(projectId, "EXECUTE_PLAN", task, envelope2, attemptNo);
       }
       const failed = (st.failed_tasks || []).filter((item) => item.id !== taskId);
       failed.push({ id: taskId, ts: nowIso(), summary: outbox.summary || "", attempt: currentAttempt });
       this.store.writeState(projectId, { failed_tasks: failed });
+      if (this.store.readState(projectId)?.pending_model_replan?.status === "waiting_task") {
+        return this.beginModelReplan(projectId);
+      }
       // 多次失败 → 询问 GPT
       this.log("warn", projectId, `任务 ${taskId} 连续失败 ${maxRetries} 次，询问 GPT`);
       const report = this.store.readFileSafe(projectId, outbox.report_file || "") || "";
@@ -660,6 +751,7 @@ export class Orchestrator {
   // ---------- WAITING_FOR_GPT：处理 GPT 决策 ----------
   async stepWaitingGpt(projectId, st) {
     const text = await this.waitForGpt(projectId);
+    st = this.store.readState(projectId) || st;
     let parsed = parseGptResponse(text);
     if (!parsed.status) {
       const used = (st.protocol_reprompts || 0) + 1;
@@ -675,8 +767,14 @@ export class Orchestrator {
     }
     if (st.protocol_reprompts) this.store.writeState(projectId, { protocol_reprompts: 0 });
 
+    if (st.pending_model_replan?.status === "awaiting_gpt" && !["REPLAN", "READY"].includes(parsed.status)) {
+      await this.sendToGpt(projectId, "REPROMPT", "这是模型切换后的增量重规划。请只输出未完成任务，使用 <STATUS>REPLAN</STATUS> 和 <UPDATED_PLAN>；不要重新加入已完成任务。");
+      return this.store.transition(projectId, "WAITING_FOR_GPT");
+    }
+
     switch (parsed.status) {
       case "CONTINUE": {
+        if (st.pending_model_replan?.status === "waiting_gpt") return this.beginModelReplan(projectId);
         const nextId = parsed.nextTask ? String(parsed.nextTask).trim().toUpperCase() : null;
         const tasks = st.plan?.parsed?.tasks || [];
         const completed = new Set((st.completed_tasks || []).map((t) => t.id));
@@ -716,14 +814,23 @@ export class Orchestrator {
           replan: true,
           decision: parsed.decision,
         });
+        if (this.store.readState(projectId)?.pending_model_replan?.status === "waiting_gpt") {
+          return this.beginModelReplan(projectId);
+        }
+        if (this.store.readState(projectId)?.pending_model_replan?.status === "awaiting_gpt") {
+          await this.finishModelReplan(projectId);
+        }
         this.log("info", projectId, "GPT 重新规划（增量合并），继续执行");
         return this.store.transition(projectId, "PLAN_READY");
       }
       case "NEED_ANALYSIS":
+        if (st.pending_model_replan?.status === "waiting_gpt") return this.beginModelReplan(projectId);
         return this.dispatchExecutor(projectId, "ANALYZE", parsed.request || "分析当前项目并生成 project_analysis.md", null);
       case "DECISION_REQUIRED":
+        if (st.pending_model_replan?.status === "waiting_gpt") return this.beginModelReplan(projectId);
         return this.dispatchExecutor(projectId, "DECIDE", parsed.request || "请评估并做出决定", null);
       case "DONE":
+        if (st.pending_model_replan) this.store.writeState(projectId, { pending_model_replan: null });
         return this.completeProject(projectId, "GPT 最终判定完成");
       default:
         return this.store.transition(projectId, "WAITING_FOR_GPT");
@@ -778,13 +885,17 @@ export class Orchestrator {
         e.code = pageState.challenge ? "GPT_CHALLENGE" : "GPT_LOGIN_REQUIRED";
         throw e;
       }
-      const msg = wrapOrchestratorMsg(type, content);
+      const profile = st.deepseek_selection || this.cfg.deepseek || {};
+      const profiledContent = ["PLAN_REQUEST", "QUERY"].includes(type)
+        ? `${content}\n\n${buildDeepseekPlanningGuidance(profile)}`
+        : content;
+      const msg = wrapOrchestratorMsg(type, profiledContent);
       const baseline = await this.bridge.assistantCount();
       const files = (Array.isArray(opts.attachments) ? opts.attachments : [])
         .map((a) => this.store.resolveWorkspacePath(projectId, a.relative_path));
       await this.bridge.sendMessage(msg, { files });
       this.assertProjectActive(projectId, epoch);
-      this.store.recordGptMessage(projectId, "out", msg, { type });
+      this.store.recordGptMessage(projectId, "out", msg, { type, task_id: st.current_task?.id || null });
       const url = this.bridge.page?.url?.() || null;
       this.store.writeState(projectId, {
         gpt: {
@@ -794,7 +905,7 @@ export class Orchestrator {
           last_reply_text: null,
         },
       });
-      this.log("info", projectId, `已发送消息给 GPT（${type}，${content.length} 字符，baseline=${baseline}）`);
+      this.log("info", projectId, `已发送消息给 GPT（${type}，${profiledContent.length} 字符，baseline=${baseline}）`);
       sent = true;
     } finally {
       this.endGptOp(projectId);
@@ -837,7 +948,7 @@ export class Orchestrator {
       if (cancelled()) {
         const e = new Error("项目已暂停或删除"); e.code = "PROJECT_CANCELLED"; throw e;
       }
-      this.store.recordGptMessage(projectId, "in", reply.text, {});
+      this.store.recordGptMessage(projectId, "in", reply.text, { task_id: st.current_task?.id || null });
       this.store.writeState(projectId, {
         gpt: {
           last_reply_text: reply.text,
@@ -906,6 +1017,113 @@ export class Orchestrator {
     return text.slice(0, max) + `\n\n…（内容过长，已截断至 ${max} 字符）`;
   }
 
+  buildExecutorContext(projectId, st, reason) {
+    const completed = (st.completed_tasks || []).map((t) => `- ${t.id}: ${t.summary || "完成"}`).join("\n") || "- 无";
+    const failed = (st.failed_tasks || []).map((t) => `- ${t.id}: ${t.summary || "失败"}`).join("\n") || "- 无";
+    const decisions = (st.decisions || []).slice(-10).map((d) => `- ${JSON.stringify(d)}`).join("\n") || "- 无";
+    const reports = (st.completed_tasks || []).slice(-3).map((task) => {
+      const content = task.report_file ? this.store.readFileSafe(projectId, task.report_file) : null;
+      return content ? `## ${task.id} 近期报告\n\n${this.truncate(content, 3000)}` : null;
+    }).filter(Boolean).join("\n\n") || "（无可读近期报告）";
+    return `# Executor continuation context\n\n- 项目：${st.project_name}\n- 生成时间：${nowIso()}\n- 原因：${reason}\n- 用户目标：${st.user_task}\n\n## 当前计划\n\n${st.plan?.raw || "（无）"}\n\n## 已完成任务\n\n${completed}\n\n## 失败任务\n\n${failed}\n\n## 近期决策\n\n${decisions}\n\n## 近期执行报告\n\n${reports}\n\n继续时只执行计划中尚未完成的任务，不重复执行已完成任务。\n`;
+  }
+
+  async performSessionCompaction(projectId, reason = "manual") {
+    const st = this.store.readState(projectId);
+    if (!st) throw new Error(`项目不存在: ${projectId}`);
+    if (this.runner.isRunning?.(projectId)) {
+      this.store.writeState(projectId, { compaction: { ...st.compaction, pending: true, in_progress: false, requested_at: nowIso(), reason } });
+      return { queued: true };
+    }
+    this.store.writeState(projectId, { compaction: { ...st.compaction, pending: false, in_progress: true, reason } });
+    const epoch = this.projectEpoch(projectId);
+    const wasPaused = st.state === "PAUSED";
+    const summary = this.buildExecutorContext(projectId, st, reason);
+    this.store.writeWorkspaceFile(projectId, "executor_context.md", summary);
+    const dirs = {
+      projectDir: this.store.projectDir(projectId),
+      workspaceDir: this.store.workspaceDir(projectId),
+      sourceDir: this.store.sourceDir(projectId),
+    };
+    try {
+      const created = await this.runner.compactSession(projectId, dirs, this.store);
+      const fresh = this.store.readState(projectId);
+      if (!fresh || epoch !== this.projectEpoch(projectId) || (!wasPaused && fresh.state === "PAUSED")) {
+        if (fresh) this.store.writeState(projectId, { compaction: { ...fresh.compaction, in_progress: false } });
+        return { queued: false, cancelled: true };
+      }
+      const generations = [...(fresh.session_generations || [])];
+      if (generations.length && !generations.at(-1).ended_at) {
+        generations[generations.length - 1] = { ...generations.at(-1), ended_at: nowIso(), end_reason: reason };
+      }
+      generations.push({
+        generation: (generations.at(-1)?.generation || 0) + 1,
+        session_id: created.sessionId,
+        started_at: nowIso(),
+        ended_at: null,
+        reason,
+        model: created.actualModel || null,
+        completed_tasks: 0,
+      });
+      const count = Number(fresh.compaction?.count || 0) + 1;
+      this.store.writeState(projectId, {
+        session_generations: generations,
+        context_cache: null,
+        usage: { ...fresh.usage, deepseek: { ...fresh.usage.deepseek, context: null } },
+        compaction: { pending: false, in_progress: false, count, last: { ts: nowIso(), reason, session_id: created.sessionId } },
+      });
+      this.log("info", projectId, `执行会话已压缩：generation=${generations.at(-1).generation} reason=${reason}`);
+      return { queued: false, sessionId: created.sessionId };
+    } catch (error) {
+      const fresh = this.store.readState(projectId);
+      if (fresh) this.store.writeState(projectId, { compaction: { ...fresh.compaction, pending: true, in_progress: false, error: error.message } });
+      throw error;
+    }
+  }
+
+  async maybeCompactSession(projectId) {
+    const st = this.store.readState(projectId);
+    if (!st || st.pending_model_replan || st.compaction?.in_progress) return false;
+    const context = st.usage?.deepseek?.context;
+    const threshold = Number(this.cfg.deepseek?.contextCompactThreshold ?? 0.7) * 100;
+    const generation = st.session_generations?.at(-1);
+    const fallback = Number(this.cfg.deepseek?.contextCompactFallbackTasks ?? 20);
+    const reason = st.compaction?.pending
+      ? "manual"
+      : context?.percentage != null && context.percentage >= threshold
+        ? `context_${context.percentage}%`
+        : context?.percentage == null && Number(generation?.completed_tasks || 0) >= fallback
+          ? `fallback_${fallback}_tasks`
+          : null;
+    if (!reason) return false;
+    await this.performSessionCompaction(projectId, reason);
+    return true;
+  }
+
+  async beginModelReplan(projectId) {
+    const st = this.store.readState(projectId);
+    if (!st?.pending_model_replan) return null;
+    const completed = new Set((st.completed_tasks || []).map((t) => t.id));
+    const unfinished = (st.plan?.parsed?.tasks || []).filter((t) => !completed.has(t.id));
+    const list = unfinished.map((t) => `- ${t.id}: ${t.description || ""}（依赖: ${(t.dependencies || []).join(", ") || "无"}）`).join("\n") || "- 无";
+    this.store.writeState(projectId, {
+      state: "REPLANNING",
+      previous_state: st.state,
+      pending_model_replan: { ...st.pending_model_replan, status: "sending_gpt" },
+      pending: { text: "模型已切换，GPT 正在仅重写未完成任务…", ts: nowIso(), retryState: "PLAN_READY" },
+    });
+    const prompt = `DeepSeek 执行模型已切换为 ${st.deepseek_selection?.provider || "默认"}/${st.deepseek_selection?.model || "默认"}${st.deepseek_selection?.reasoningEffort ? `（推理=${st.deepseek_selection.reasoningEffort}）` : ""}。\n\n请仅重写下列未完成任务，使粒度适配新模型；不得重新加入或改写已完成任务。输出 <STATUS>REPLAN</STATUS> 和 <UPDATED_PLAN>，计划只包含未完成任务。\n\n未完成任务：\n${list}`;
+    await this.sendToGpt(projectId, "QUERY", prompt);
+    const fresh = this.store.readState(projectId);
+    this.store.writeState(projectId, { pending_model_replan: { ...fresh.pending_model_replan, status: "awaiting_gpt" } });
+    return this.store.transition(projectId, "WAITING_FOR_GPT", { pending: { text: "等待 GPT 返回模型切换后的增量计划…", ts: nowIso(), retryState: "PLAN_READY" } });
+  }
+
+  async finishModelReplan(projectId) {
+    await this.performSessionCompaction(projectId, "model_change");
+    this.store.writeState(projectId, { pending_model_replan: null });
+  }
+
   completeProject(projectId, reason) {
     const st = this.store.readState(projectId);
     this.log("info", projectId, `项目完成：${reason}`);
@@ -956,8 +1174,34 @@ export class Orchestrator {
       model: String(selection?.model || ""),
       reasoningEffort: String(selection?.reasoningEffort || ""),
     };
-    this.store.writeState(projectId, { deepseek_selection: sel });
+    const changed = JSON.stringify(st.deepseek_selection || {}) !== JSON.stringify(sel);
+    if (!changed) return sel;
+    const canReplan = !!st.plan?.parsed && !["COMPLETED", "CANCELED"].includes(st.state);
+    const busy = this.runner.isRunning?.(projectId)
+      || ["EXECUTING", "WAITING_FOR_EXECUTOR", "ANALYZING", "DECISION_REQUIRED"].includes(st.state);
+    const gptBusy = this.gptIsActive(projectId) || this.gptWaitingProjects.has(projectId)
+      || ["GPT_PLANNING", "WAITING_FOR_GPT", "REPLANNING"].includes(st.state);
+    const paused = st.state === "PAUSED";
+    this.store.writeState(projectId, {
+      deepseek_selection: sel,
+      pending_model_replan: canReplan ? { selection: sel, requested_at: nowIso(), status: paused ? "paused" : busy ? "waiting_task" : gptBusy ? "waiting_gpt" : "ready" } : null,
+    });
+    if (canReplan && !busy && !gptBusy && !paused) await this.beginModelReplan(projectId);
     return sel;
+  }
+
+  async compactSession(projectId) {
+    const st = this.store.readState(projectId);
+    if (!st) throw new Error(`项目不存在: ${projectId}`);
+    if (["COMPLETED", "CANCELED"].includes(st.state)) throw new Error("已结束项目无需压缩会话");
+    if (this.runner.isRunning?.(projectId)
+      || ["EXECUTING", "WAITING_FOR_EXECUTOR", "ANALYZING", "DECISION_REQUIRED"].includes(st.state)) {
+      this.store.writeState(projectId, {
+        compaction: { ...st.compaction, pending: true, requested_at: nowIso(), reason: "manual" },
+      });
+      return { queued: true };
+    }
+    return this.performSessionCompaction(projectId, "manual");
   }
 
   /** 删除项目：停止循环 + 释放执行者 + 删除目录 */
@@ -1029,6 +1273,10 @@ export class Orchestrator {
   async resume(projectId) {
     const st = this.store.readState(projectId);
     if (!st || st.state !== "PAUSED") return st;
+    if (st.pending_model_replan?.status === "paused") {
+      this.store.writeState(projectId, { pending_model_replan: { ...st.pending_model_replan, status: "ready" } });
+      return this.beginModelReplan(projectId);
+    }
     const retry = st.pending?.retryState || st.previous_state || "INIT";
     // 恢复执行者状态：重新分派
     const retry2 = ["EXECUTING", "WAITING_FOR_EXECUTOR", "ANALYZING", "DECISION_REQUIRED"].includes(retry)

@@ -196,3 +196,17 @@
 [2026-09-02T12:45:53.479Z] [INFO] [main] 项目目录: C:\Users\Administrator\Desktop\双agent\双agent工作台\projects
 [2026-09-02T12:45:53.483Z] [INFO] [dashboard] Dashboard: http://127.0.0.1:3700
 [2026-09-02T12:45:53.492Z] [INFO] [orch:-] 扫描到 3 个项目
+[2026-09-02T13:15:18.300Z] [INFO] [main] ============================================
+[2026-09-02T13:15:18.300Z] [INFO] [main] 双 Agent 协作工作台启动
+[2026-09-02T13:15:18.300Z] [INFO] [main] GPT Bridge 模式: real（模型目标: GPT-5.6 Sol）
+[2026-09-02T13:15:18.301Z] [INFO] [main] DeepSeek Runner 模式: real（headless profile，执行过程在可见窗口实时展示）
+[2026-09-02T13:15:18.301Z] [INFO] [main] 项目目录: C:\Users\Administrator\Desktop\双agent\双agent工作台\projects
+[2026-09-02T13:15:18.306Z] [INFO] [dashboard] Dashboard: http://127.0.0.1:3700
+[2026-09-02T13:15:18.315Z] [INFO] [orch:-] 扫描到 3 个项目
+[2026-09-02T16:22:50.115Z] [INFO] [main] ============================================
+[2026-09-02T16:22:50.115Z] [INFO] [main] 双 Agent 协作工作台启动
+[2026-09-02T16:22:50.116Z] [INFO] [main] GPT Bridge 模式: real（模型目标: GPT-5.6 Sol）
+[2026-09-02T16:22:50.116Z] [INFO] [main] DeepSeek Runner 模式: real（headless profile，执行过程在可见窗口实时展示）
+[2026-09-02T16:22:50.116Z] [INFO] [main] 项目目录: C:\Users\Administrator\Desktop\双agent\双agent工作台\projects
+[2026-09-02T16:22:50.122Z] [INFO] [dashboard] Dashboard: http://127.0.0.1:3700
+[2026-09-02T16:22:50.131Z] [INFO] [orch:-] 扫描到 3 个项目

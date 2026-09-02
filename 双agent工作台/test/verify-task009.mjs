@@ -65,6 +65,8 @@ await page.route("**/api/projects/demo", async (route) => route.fulfill({ status
   id: "demo", name: "演示", state: "PAUSED", user_task: "测试", created_at: new Date().toISOString(), updated_at: new Date().toISOString(),
   completed_tasks: [], failed_tasks: [], tasks: [], decisions: [], replans: [], analysis_reports: [], executor_runs: [], conversation: [],
   gpt: {}, pending: null, source_dir: "C:/demo", workspace_dir: "C:/demo/.gpt_workspace", gpt_live: null, executor_ui: null,
+  usage: { deepseek: { totals: { uncachedInputTokens: 12, outputTokens: 3, cacheReadTokens: 4, cacheWriteTokens: 1 }, tasks: [], context: { percentage: 35, pressureTokens: 350, contextWindow: 1000 } }, gpt: { sentCharacters: 40, receivedCharacters: 20, estimatedInputTokens: 10, estimatedOutputTokens: 5 } },
+  compaction: { pending: false, count: 0 },
 }) }));
 await page.route("**/api/deepseek/models", async (route) => route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ groups: [{ id: "deepseek", name: "DeepSeek", models: [{ id: "chat", name: "Chat" }] }], reasoningEfforts: ["off", "low", "high", "max"] }) }));
 
@@ -149,6 +151,15 @@ ok("切换推理触发 deepseek_model", !!dm);
 ok("deepseek_model 带 reasoningEffort=high", dm && dm.selection && dm.selection.reasoningEffort === "high");
 const modelOpts = await page.evaluate(() => document.querySelector("#cModel").options.length);
 ok("模型下拉已填充目录", modelOpts > 1);
+
+actions.length = 0;
+await page.click("#btnCompact");
+await page.waitForTimeout(300);
+ok("压缩会话按钮触发 compact_session", actions.some((a) => a.action === "compact_session"));
+const usageText = await page.textContent("#oUsage");
+ok("Dashboard 明确区分真实与估算用量", usageText.includes("Harness 真实投影") && usageText.includes("估算"));
+const taskHeaders = await page.locator("#taskTable th").allTextContents();
+ok("任务表展示模型耗时重试 Token 与上下文", ["模型 / 推理", "耗时", "执行", "Token", "上下文"].every((h) => taskHeaders.includes(h)));
 
 actions.length = 0;
 await page.click("#btnEnd");

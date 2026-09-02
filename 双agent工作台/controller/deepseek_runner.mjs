@@ -91,6 +91,7 @@ export class DeepseekRunner {
 
     // 1. 写任务信封
     envelope.envelope_version = 2;
+    envelope.workbench_dispatch = true;
     envelope.project_id = projectId;
     envelope.source_dir = sourceDir;
     envelope.workspace_dir = workspaceDir;
@@ -153,7 +154,7 @@ export class DeepseekRunner {
     let sessionId = got.sessionId;
     let sessionReused = got.reused;
     // 会话是否为"新建立"：新会话→编排器重置上下文缓存，下个任务发全量；复用→下个任务发增量
-    let freshSession = !sessionReused;
+    let freshSession = !sessionReused || !!got.bootstrap;
 
     // c. 应用用户选择的模型/推理等级（每次任务都同步，保证"保存模型"即时生效）
     const applyModel = async () => {
@@ -168,23 +169,32 @@ export class DeepseekRunner {
       }
     };
     await applyModel();
+    let actualModel = await this.ui.currentModel?.(projectId, sessionId).catch(() => null)
+      || this.resolveSelection(store, projectId);
+    let usageBefore = await this.ui.sessionProjection?.(projectId, sessionId).catch(() => null) || null;
 
     this.running.set(projectId, { pid: server.child?.pid, startedAt, sessionId, visible: true, serviceUrl: server.url });
     this.log("info", `执行会话${sessionReused ? "已复用" : "已创建"}: ${sessionId}（type=${envelope.type} task=${taskId}）`);
 
-    // d. 提交任务：新会话 = 完整提示；复用会话 = 精简任务提示（省 token）；恢复/重建 = 完整提示
+    // d. 提交任务：新会话只加载一次 Skill；复用会话只通知信封已更新。
     const submit = async (promptText) => {
       await this.ui.submitPrompt(projectId, sessionId, promptText, taskId);
     };
+    const bootstrapPrompt = got.bootstrap
+      ? `${prompt}\n\n这是压缩后的新会话。请读取 ${envelope.executor_context_file || ".gpt_workspace/executor_context.md"} 恢复项目上下文；不要查找或要求旧会话历史。`
+      : prompt;
+    const turnPrompt = sessionReused && !got.bootstrap ? buildExecutorTurnPrompt(envelope) : bootstrapPrompt;
+    fs.writeFileSync(path.join(workspaceDir, "inbox", "task_prompt.txt"), turnPrompt, "utf8");
     const submitTurn = () => submit(buildExecutorTurnPrompt(envelope));
-    const submitFull = () => submit(prompt);
+    const submitFull = () => submit(bootstrapPrompt);
     try {
-      if (sessionReused) await submitTurn(); else await submitFull();
+      if (sessionReused && !got.bootstrap) await submitTurn(); else await submitFull();
+      this.ui.clearBootstrap?.(projectId, sessionId);
     } catch (e) {
       this.running.delete(projectId);
       throw new RunnerError("RUNNER_UI_PROMPT", `提交任务失败: ${e.message}`);
     }
-    this.log("info", `任务已提交: type=${envelope.type} task=${taskId}（${sessionReused ? "复用会话，精简提示" : "新会话，完整提示"}）`);
+    this.log("info", `任务已提交: type=${envelope.type} task=${taskId}（${sessionReused && !got.bootstrap ? "复用会话，精简提示" : "新会话，摘要化提示"}）`);
     projectLog(projectDir, `[dispatch] pool type=${envelope.type} task=${taskId} attempt=${envelope.attempt || 1} session=${sessionId} ui=${server.url}`);
 
     // 记录项目级会话状态（Dashboard / 恢复用）
@@ -193,8 +203,8 @@ export class DeepseekRunner {
       taskId, type: envelope.type, reused: sessionReused, createdAt: nowIso(),
     });
 
-    // 打开用户可见窗口（visible 且允许弹窗时；首个/每次任务打开同一服务 URL）
-    if (this.visibleEnabled && this.cfg.uiOpenWindow !== false) {
+    // 只在项目会话首次建立时打开窗口；后续 Task 复用现有窗口。
+    if (!sessionReused && this.visibleEnabled && this.cfg.uiOpenWindow !== false) {
       const opened = this.ui.openWindow(projectId)?.opened === true;
       this.log("info", `执行窗口${opened ? "已打开" : "打开失败"}: ${server.url}（任务 ${taskId}）`);
     }
@@ -206,8 +216,9 @@ export class DeepseekRunner {
     let crashBuffer = false;
     let recoveries = 0;
 
-    const buildResult = (extra = {}) => {
-      const result = { exitCode: 0, timedOut: false, visible: true, freshSession, sessionId, uiUrl: server.url, ...extra };
+    const buildResult = async (extra = {}) => {
+      const usageAfter = await this.ui.sessionProjection?.(projectId, sessionId).catch(() => null) || null;
+      const result = { exitCode: 0, timedOut: false, visible: true, freshSession, sessionId, uiUrl: server.url, usageBefore, usageAfter, actualModel, ...extra };
       result.logFile = server.logFile;
       result.ms = Date.now() - startedAt;
       return result;
@@ -216,12 +227,12 @@ export class DeepseekRunner {
     while (Date.now() - t0 < timeoutMs) {
       if (this.cancelled.has(projectId)) {
         this.running.delete(projectId);
-        return buildResult({ cancelled: true, exitCode: null });
+        return await buildResult({ cancelled: true, exitCode: null });
       }
       if (fs.existsSync(outboxFile)) {
         projectLog(projectDir, `[settle] outbox written task=${taskId} ms=${Date.now() - startedAt}`);
         this.running.delete(projectId);
-        return buildResult();
+        return await buildResult();
       }
 
       // 服务进程崩溃检测（两次确认，避免误判）
@@ -236,7 +247,7 @@ export class DeepseekRunner {
           this.ui.disposeServer(projectId);
           server = await this.ui.ensureServer(projectId, logDir);
           if (!server) {
-            const result = buildResult({ uiCrashed: true, recovered: recoveries });
+            const result = await buildResult({ uiCrashed: true, recovered: recoveries });
             projectLog(projectDir, `[settle] ui crashed (recovery boot fail) task=${taskId} ms=${result.ms}`);
             this.running.delete(projectId);
             return result;
@@ -246,6 +257,9 @@ export class DeepseekRunner {
             sessionId = got2.sessionId;
             freshSession = true; // 恢复重建的新会话：编排器应重置上下文缓存，下个任务发全量
             await applyModel();
+            actualModel = await this.ui.currentModel?.(projectId, sessionId).catch(() => null)
+              || this.resolveSelection(store, projectId);
+            usageBefore = await this.ui.sessionProjection?.(projectId, sessionId).catch(() => null) || null;
             await submitFull();
             this.running.set(projectId, { pid: server.child?.pid, startedAt, sessionId, visible: true, serviceUrl: server.url, recoveries });
             this.recordProjectSession(store, projectId, {
@@ -254,14 +268,14 @@ export class DeepseekRunner {
             });
             this.log("info", `执行服务已自动恢复并重新提交: session=${sessionId}`);
           } catch (e2) {
-            const result = buildResult({ uiCrashed: true, recovered: recoveries });
+            const result = await buildResult({ uiCrashed: true, recovered: recoveries });
             projectLog(projectDir, `[settle] ui crashed (recovery failed: ${e2.message}) task=${taskId} ms=${result.ms}`);
             this.running.delete(projectId);
             return result;
           }
           continue;
         }
-        const result = buildResult({ uiCrashed: true, recovered: recoveries });
+        const result = await buildResult({ uiCrashed: true, recovered: recoveries });
         projectLog(projectDir, `[settle] ui crashed (no recovery left) task=${taskId} ms=${result.ms}`);
         this.running.delete(projectId);
         return result;
@@ -275,7 +289,7 @@ export class DeepseekRunner {
           if (st && !st.running) {
             if (!idleSince) idleSince = Date.now();
             else if (Date.now() - idleSince > 15000) {
-              const result = buildResult({ idleNoOutbox: true });
+              const result = await buildResult({ idleNoOutbox: true });
               projectLog(projectDir, `[settle] idle without outbox task=${taskId} ms=${result.ms}`);
               this.running.delete(projectId);
               return result;
@@ -291,9 +305,9 @@ export class DeepseekRunner {
     // f. 超时：取消会话并关闭服务
     this.log("warn", `执行超时（${Math.round(timeoutMs / 1000)}s），取消会话 ${sessionId}`);
     await this.ui.cancelSession(projectId, sessionId).catch(() => {});
+    const result = await buildResult({ timedOut: true });
     this.ui.disposeServer(projectId);
     this.running.delete(projectId);
-    const result = buildResult({ timedOut: true });
     result.exitCode = null;
     projectLog(projectDir, `[settle] timeout task=${taskId} ms=${result.ms}`);
     return result;
@@ -306,7 +320,7 @@ export class DeepseekRunner {
       store.writeState(projectId, {
         session: { ...data, ts: nowIso() },
         pending: {
-          text: `DeepSeek 执行中: ${data.taskId || "-"}${this.visibleEnabled ? "（执行窗口已打开，可实时查看）" : "（后台执行中）"}`,
+          text: `DeepSeek 执行中: ${data.taskId || "-"}${this.visibleEnabled ? "（执行窗口可实时查看）" : "（后台执行中）"}`,
           ts: nowIso(),
           type: data.type || "EXECUTE_PLAN",
           sessionId: data.sessionId,
@@ -315,6 +329,21 @@ export class DeepseekRunner {
       });
     } catch { /* ignore */ }
   }
+
+  /** 创建摘要化的新 Harness 会话；保留服务和窗口，只替换会话 ID。 */
+  async compactSession(projectId, dirs, store) {
+    if (this.cfg.mode === "mock") return { mock: true, sessionId: `mock-${Date.now()}`, previousSessionId: null };
+    const logDir = path.join(dirs.workspaceDir, "logs");
+    const server = await this.ui.ensureServer(projectId, logDir);
+    if (!server) throw new RunnerError("RUNNER_UI_BOOT", "压缩时无法启动执行服务");
+    const replaced = await this.ui.replaceSession(projectId, dirs.sourceDir);
+    const selection = this.resolveSelection(store, projectId);
+    if (selection) await this.ui.selectModel(projectId, replaced.sessionId, selection);
+    const actualModel = await this.ui.currentModel?.(projectId, replaced.sessionId).catch(() => null) || selection;
+    return { ...replaced, actualModel, serviceUrl: server.url };
+  }
+
+  isRunning(projectId) { return this.running.has(projectId); }
 
   // ---------- headless 模式（原有逻辑） ----------
 

@@ -52,7 +52,7 @@ export function newProjectId(name) {
 
 export function initialProjectState(projectId, name, task) {
   return {
-    schema: 1,
+    schema: 2,
     project_id: projectId,
     project_name: name,
     created_at: new Date().toISOString(),
@@ -89,8 +89,54 @@ export function initialProjectState(projectId, name, task) {
     gpt_messages: [],
     executor_runs: [],
     analysis_reports: [],
+    usage: defaultUsage(),
+    session_generations: [],
+    pending_model_replan: null,
+    compaction: { pending: false, in_progress: false, count: 0, last: null },
+    checkpoint: null,
+    model_recommendations: [],
     pending: null, // 编排器内部挂起动作说明（人类可读）
     milestone: null,
+  };
+}
+
+export function defaultUsage() {
+  return {
+    deepseek: {
+      actual: true,
+      totals: { uncachedInputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 },
+      tasks: [],
+      context: null,
+    },
+    gpt: {
+      actual: false,
+      estimate: true,
+      sentCharacters: 0,
+      receivedCharacters: 0,
+      estimatedInputTokens: 0,
+      estimatedOutputTokens: 0,
+    },
+  };
+}
+
+/** 旧项目惰性补默认值：读取即可用，只有后续真实写入时才升级磁盘 schema。 */
+export function normalizeProjectState(state) {
+  if (!state) return null;
+  const defaults = defaultUsage();
+  return {
+    ...state,
+    schema: 2,
+    usage: {
+      ...defaults,
+      ...(state.usage || {}),
+      deepseek: { ...defaults.deepseek, ...(state.usage?.deepseek || {}) },
+      gpt: { ...defaults.gpt, ...(state.usage?.gpt || {}) },
+    },
+    session_generations: state.session_generations || [],
+    pending_model_replan: state.pending_model_replan || null,
+    compaction: { pending: false, in_progress: false, count: 0, last: null, ...(state.compaction || {}) },
+    checkpoint: state.checkpoint || null,
+    model_recommendations: state.model_recommendations || [],
   };
 }
 
@@ -134,7 +180,12 @@ export class ProjectStore {
     const st = this.readState(projectId);
     if (st?.source_dir) {
       const raw = String(st.source_dir);
-      if (path.isAbsolute(raw)) return path.resolve(raw);
+      if (path.isAbsolute(raw)) {
+        const resolved = path.resolve(raw);
+        try {
+          if (fs.statSync(resolved).isDirectory()) return resolved;
+        } catch { /* 无效旧路径回退到项目默认 source */ }
+      }
     }
     return path.join(this.projectsRoot, projectId, "source");
   }
@@ -211,7 +262,7 @@ export class ProjectStore {
   readState(projectId) {
     try {
       const file = path.join(this.workspaceDir(projectId), "project_state.json");
-      return JSON.parse(fs.readFileSync(file, "utf8"));
+      return normalizeProjectState(JSON.parse(fs.readFileSync(file, "utf8")));
     } catch {
       return null;
     }
@@ -260,19 +311,37 @@ export class ProjectStore {
     fs.mkdirSync(folder, { recursive: true });
     const n = this.countFiles(folder) + 1;
     const file = path.join(folder, `${String(n).padStart(4, "0")}_${dir}.json`);
+    const chars = String(text || "").length;
+    const estimatedTokens = Math.ceil(chars / 4);
+    const usage = {
+      actual: false,
+      estimate: true,
+      characters: chars,
+      estimatedTokens,
+      direction: dir === "out" ? "input" : "output",
+    };
     const rec = {
       dir, // "in" = GPT → 系统；"out" = 系统 → GPT
       ts: new Date().toISOString(),
       text,
+      usage,
       ...meta,
     };
     fs.writeFileSync(file, JSON.stringify(rec, null, 2), "utf8");
     const state = this.readState(projectId);
     if (state) {
       const msgs = [...(state.gpt_messages || [])];
-      msgs.push({ dir, ts: rec.ts, length: text.length, file: path.basename(file), ...meta });
+      msgs.push({ dir, ts: rec.ts, length: chars, file: path.basename(file), usage, ...meta });
       if (msgs.length > 200) msgs.splice(0, msgs.length - 200);
-      this.writeState(projectId, { gpt_messages: msgs });
+      const gptUsage = { ...(state.usage?.gpt || defaultUsage().gpt) };
+      if (dir === "out") {
+        gptUsage.sentCharacters += chars;
+        gptUsage.estimatedInputTokens += estimatedTokens;
+      } else {
+        gptUsage.receivedCharacters += chars;
+        gptUsage.estimatedOutputTokens += estimatedTokens;
+      }
+      this.writeState(projectId, { gpt_messages: msgs, usage: { ...state.usage, gpt: gptUsage } });
     }
     return rec;
   }
@@ -281,12 +350,13 @@ export class ProjectStore {
     try { return fs.readdirSync(dir).filter((f) => f.endsWith(".json")).length; } catch { return 0; }
   }
 
-  listConversation(projectId) {
+  listConversation(projectId, limit = Infinity) {
     const folder = path.join(this.workspaceDir(projectId), "conversation", "gpt");
     try {
       return fs.readdirSync(folder)
         .filter((f) => f.endsWith(".json"))
         .sort()
+        .slice(-limit)
         .map((f) => JSON.parse(fs.readFileSync(path.join(folder, f), "utf8")));
     } catch {
       return [];

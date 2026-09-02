@@ -36,7 +36,12 @@ npm install
 
 - 多项目断点恢复：状态写入每个项目的 `.gpt_workspace/project_state.json`。
 - 会话隔离：每个项目有独立 GPT 会话；共享的浏览器页面按完整“发送—等待回复”周期串行使用。
-- 执行会话复用：同一项目复用 DeepSeek Harness 会话，失效时自动重建。
+- 执行会话复用：同一项目复用一个 DeepSeek Harness 会话，只在首个任务打开执行窗口；失效时自动重建。
+- 精简派发：执行者角色、通信协议和结果格式由项目内 `workbench-executor` Skill 承担；后续任务只通知执行者重新读取当前信封，不重复发送整份计划和格式说明。
+- 档位自适应规划：GPT 会收到项目选择的 DeepSeek 模型与推理等级；Pro + High/Max 使用较粗任务，Flash + Off/Low 使用包含步骤与验证的小任务。
+- 成本可观测：每项 DeepSeek 任务前后读取 Harness 的真实 token 与上下文投影；GPT 网页端只记录字符数和明确标记的 token 估算值。Dashboard 展示逐任务模型、推理等级、耗时、重试、token 与上下文占用。
+- 上下文控制：上下文达到窗口 70% 时自动生成 `executor_context.md` 并换用摘要化新会话；投影不可用时以同会话完成 20 项任务为后备阈值，也可点击“压缩会话”手动触发。
+- 安全切换模型：运行中切换不会打断当前任务；任务结束后 GPT 只重写未完成任务，再以新模型创建摘要化会话。空闲时立即增量重规划。
 - 暂停、结束与删除：暂停可恢复；手动结束会进入 `CANCELED` 并保留记录；删除会移除工作区。迟到结果不会覆盖终止状态。
 - GPT 附件：在 GPT 对话框点击左下角“＋”或相机按钮；文件先保存到项目 `.gpt_workspace/attachments/`，发送时再通过 ChatGPT 浏览器 composer 上传给 GPT。
 - 计划依赖：只有依赖已完成的任务才会执行；循环或缺失依赖会交回 GPT 重规划。
@@ -56,6 +61,7 @@ npm install
 │       ├── project_state.json  可恢复状态
 │       ├── project_plan.md     当前计划
 │       ├── project_analysis.md 项目分析
+│       ├── executor_context.md 压缩后供新执行会话恢复的摘要
 │       ├── attachments/        上传附件
 │       ├── conversation/gpt/   GPT 消息记录
 │       ├── executor_reports/  执行报告
@@ -66,6 +72,8 @@ npm install
 ```
 
 指定外部源码目录时，`.gpt_workspace/` 仍保存在工作台的项目目录内；DeepSeek 只把源码目录作为工作目录。
+
+工作台会把 `workbench-executor` 安装到源码目录的 `.dsh/skills/`，但只有工作台派发提示和信封同时带有专属标记时才生效；用户直接调用 DeepSeek 时不会进入工作台协议。
 
 ## 常用配置
 
@@ -82,6 +90,8 @@ npm install
 | `deepseek.modelProvider` / `model` | 默认 DeepSeek 模型 |
 | `deepseek.reasoningEffort` | 默认推理等级 |
 | `deepseek.executorTimeoutMs` | 单次执行超时 |
+| `deepseek.contextCompactThreshold` | 自动压缩阈值，默认 `0.7` |
+| `deepseek.contextCompactFallbackTasks` | 无上下文投影时的同会话完成任务阈值，默认 `20` |
 
 项目级模型选择优先于全局默认值。
 
@@ -115,4 +125,4 @@ node controller\visible_probe.mjs
 
 ## 维护约定
 
-项目变更索引见 [CHANGELOG.md](CHANGELOG.md)，各次更新的独立记录保存在 [`changelog/`](changelog/) 中，文件名统一为 `YYYY-MM-DD-vX.Y.Z.md`。任何接手本项目的 Agent 或开发者，只要修改代码、配置、界面或文档，都必须新建日志文件并更新索引；详细规则见 [AGENTS.md](AGENTS.md)。
+项目完整分阶段路线图见 [docs/双-Agent-工作台完整演进路线图.md](docs/双-Agent-工作台完整演进路线图.md)。项目变更索引见 [CHANGELOG.md](CHANGELOG.md)，各次更新的独立记录保存在 [`changelog/`](changelog/) 中，文件名统一为 `YYYY-MM-DD-vX.Y.Z.md`。任何接手本项目的 Agent 或开发者，只要修改代码、配置、界面或文档，都必须新建日志文件并更新索引；详细规则见 [AGENTS.md](AGENTS.md)。

@@ -32,6 +32,8 @@
     "uiBootTimeoutMs": 90000,
     "uiRecoveryRetries": 1,
     "uiChromePath": "",
+    "contextCompactThreshold": 0.7,
+    "contextCompactFallbackTasks": 20,
     "modelProvider": "",
     "model": "",
     "reasoningEffort": ""

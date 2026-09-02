@@ -66,6 +66,17 @@ function splitModelValue(v) {
   return { provider: v.slice(0, i), model: v.slice(i + 1) };
 }
 
+function tokenTotal(tokens) {
+  if (!tokens) return null;
+  return ["uncachedInputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens"]
+    .reduce((sum, key) => sum + Number(tokens[key] || 0), 0);
+}
+
+function fmtTokens(value) {
+  const n = Number(value || 0);
+  return n >= 1000000 ? `${(n / 1000000).toFixed(1)}M` : n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n);
+}
+
 // 拉取 DeepSeek 可用模型目录并填充所有下拉框（一次探测，多次复用）
 async function loadModelCatalog(force = false) {
   if (modelCatalog && !force) return modelCatalog;
@@ -271,6 +282,11 @@ async function refreshDetail() {
       ｜ 模型：${escapeHtml(d.gpt?.model_selected || "默认")}`;
     $("#dMeta").innerHTML += `<br>GPT 上下文文件: <code>${escapeHtml(d.workspace_dir || "")}</code> ｜ 源码目录: <code>${escapeHtml(d.source_dir || "")}</code>`;
     $("#dMeta").innerHTML += `<br>${d.archived ? "已归档 ｜ " : ""}DeepSeek 模型：${d.deepseek_selection?.model ? escapeHtml(`${d.deepseek_selection.provider || "deepseek-official"}/${d.deepseek_selection.model}${d.deepseek_selection.reasoningEffort ? " · 推理=" + d.deepseek_selection.reasoningEffort : ""}`) : "跟随默认"}`;
+    const dst = d.usage?.deepseek?.totals || {};
+    const ctx = d.usage?.deepseek?.context;
+    const gu = d.usage?.gpt || {};
+    $("#dMeta").innerHTML += `<br>DeepSeek Token（真实）：输入 ${fmtTokens(dst.uncachedInputTokens)} · 输出 ${fmtTokens(dst.outputTokens)} · 缓存读 ${fmtTokens(dst.cacheReadTokens)} · 缓存写 ${fmtTokens(dst.cacheWriteTokens)}${ctx?.percentage != null ? ` ｜ 上下文 ${ctx.percentage}%` : " ｜ 上下文投影不可用"} ｜ GPT Token（估算）：输入 ${fmtTokens(gu.estimatedInputTokens)} · 输出 ${fmtTokens(gu.estimatedOutputTokens)}`;
+    if (d.compaction?.pending) $("#dMeta").innerHTML += "<br>会话压缩：已排队，将在当前任务结束后执行";
     // 项目文件夹：空路径显示占位，长路径 title 全文
     const dirHint = $("#dirHint");
     if (dirHint) {
@@ -313,7 +329,7 @@ async function refreshDetail() {
       $("#dExecUi").innerHTML = `
         <span class="pulse"></span>
         <div class="l-text">🖥 DeepSeek 执行窗口${running ? "（执行中，实时可见）" : "（最近执行可回顾）"}</div>
-        <div class="l-sub"><a href="${escapeHtml(eui.url)}" target="_blank" rel="noopener">${escapeHtml(eui.url)}</a>${sessions ? ` · 会话任务: ${sessions}` : ""} · 任务开始执行前已自动打开新窗口，可直接观看执行全过程</div>`;
+        <div class="l-sub"><a href="${escapeHtml(eui.url)}" target="_blank" rel="noopener">${escapeHtml(eui.url)}</a>${sessions ? ` · 会话任务: ${sessions}` : ""} · 首个任务会自动打开，后续任务复用同一窗口</div>`;
     } else {
       $("#dExecUi").classList.add("hidden");
     }
@@ -366,6 +382,7 @@ async function refreshDetail() {
       `[${(r.ts || "").replace("T", " ").slice(0, 19)}] ${r.type} ${r.task_id || ""} attempt=${r.attempt} exit=${r.exitCode}${r.timedOut ? "（超时）" : ""}${r.visible ? "（可见窗口）" : ""} ${r.ms ? Math.round(r.ms / 1000) + "s" : ""}`
     ).join("\n");
     $("#oRuns").textContent = runs || "（尚无执行记录）";
+    $("#oUsage").textContent = `DeepSeek（Harness 真实投影）\n输入 ${dst.uncachedInputTokens || 0} ｜ 输出 ${dst.outputTokens || 0} ｜ 缓存读 ${dst.cacheReadTokens || 0} ｜ 缓存写 ${dst.cacheWriteTokens || 0}\n上下文 ${ctx?.percentage != null ? `${ctx.percentage}%（${ctx.pressureTokens}/${ctx.contextWindow}）` : "投影不可用"} ｜ 压缩 ${d.compaction?.count || 0} 次\n\nGPT（网页字符折算，估算）\n发送 ${gu.sentCharacters || 0} 字 / 约 ${gu.estimatedInputTokens || 0} token ｜ 接收 ${gu.receivedCharacters || 0} 字 / 约 ${gu.estimatedOutputTokens || 0} token`;
 
     renderTasks(d);
     $("#planView").textContent = d.plan_text || "（暂无规划）";
@@ -384,6 +401,7 @@ function renderTasks(d) {
     completed: (d.completed_tasks || []).map((t) => t.id),
     failed: (d.failed_tasks || []).map((t) => t.id),
     current: d.current_task?.id || null,
+    metrics: (d.usage?.deepseek?.tasks || []).map((m) => [m.task_id, m.attempt, m.duration_ms, m.model, m.tokens, m.context]),
   });
   if (sig === lastTasksSig) return;
   lastTasksSig = sig;
@@ -391,14 +409,21 @@ function renderTasks(d) {
   tbody.innerHTML = "";
   const completed = new Set((d.completed_tasks || []).map((t) => t.id));
   const failed = new Set((d.failed_tasks || []).map((t) => t.id));
+  const metrics = d.usage?.deepseek?.tasks || [];
   for (const t of d.tasks || []) {
     let status = "pending";
     let cls = "pending";
     if (completed.has(t.id)) { status = "completed"; cls = "completed"; }
     else if (failed.has(t.id)) { status = "failed"; cls = "failed"; }
     else if (d.current_task && d.current_task.id === t.id) { status = "running"; cls = "running"; }
+    const taskMetrics = metrics.filter((m) => m.task_id === t.id);
+    const last = taskMetrics.at(-1);
+    const model = last?.model;
+    const modelText = model ? `${model.model || "默认"}${model.reasoningEffort ? ` / ${model.reasoningEffort}` : ""}` : "-";
+    const duration = taskMetrics.reduce((sum, m) => sum + Number(m.duration_ms || 0), 0);
+    const tokens = taskMetrics.reduce((sum, m) => sum + Number(tokenTotal(m.tokens) || 0), 0);
     const tr = document.createElement("tr");
-    tr.innerHTML = `<td><b>${escapeHtml(t.id)}</b></td><td>${escapeHtml(t.description || "")}</td><td>${escapeHtml(t.priority || "")}</td><td>${escapeHtml((t.dependencies || []).join(", "))}</td><td><span class="task-status ${cls}">${status === "running" ? "▶ 执行中" : status === "completed" ? "✔ 完成" : status === "failed" ? "✖ 失败" : "… 待办"}</span></td>`;
+    tr.innerHTML = `<td><b>${escapeHtml(t.id)}</b></td><td>${escapeHtml(t.description || "")}</td><td>${escapeHtml(modelText)}</td><td>${duration ? fmtDuration(Math.round(duration / 1000)) : "-"}</td><td>${taskMetrics.length ? `${taskMetrics.length} 次${taskMetrics.length > 1 ? `（重试 ${taskMetrics.length - 1}）` : ""}` : "-"}</td><td>${taskMetrics.some((m) => m.actual) ? fmtTokens(tokens) : "不可用"}</td><td>${last?.context?.percentage != null ? `${last.context.percentage}%` : "-"}</td><td><span class="task-status ${cls}">${status === "running" ? "▶ 执行中" : status === "completed" ? "✔ 完成" : status === "failed" ? "✖ 失败" : "… 待办"}</span></td>`;
     tbody.appendChild(tr);
   }
 }
@@ -515,6 +540,7 @@ async function action(name) {
 $("#btnPause").onclick = () => action("pause");
 $("#btnResume").onclick = () => action("resume");
 $("#btnRetry").onclick = () => action("retry");
+$("#btnCompact").onclick = () => action("compact_session");
 $("#btnEnd").onclick = () => {
   if (confirm("确定结束这个项目？\n正在运行的任务会被终止，项目记录会保留，但结束后不能继续。")) action("end");
 };
@@ -559,7 +585,7 @@ $("#btnWindow").onclick = async () => {
   } catch (e) { alert(`窗口操作失败: ${e.message}`); }
 };
 
-// 打开本项目的 DeepSeek 执行窗口（任务开始执行前会自动打开，此处用于手动重开/查看）
+// 打开本项目的 DeepSeek 执行窗口（首个任务自动打开，此处用于手动重开/查看）
 $("#btnExecWindow").onclick = async () => {
   if (!currentProjectId) return;
   try {
@@ -572,7 +598,7 @@ $("#btnExecWindow").onclick = async () => {
     if (res && res.url) {
       if (!res.opened) window.open(res.url, "_blank");
     } else {
-      alert("当前没有运行中的执行窗口。\n执行窗口只在 DeepSeek 执行任务时存在（每个任务开始前会自动打开）。");
+      alert("当前没有运行中的执行窗口。\n执行窗口会在本项目首个 DeepSeek 任务开始时自动打开。");
     }
   } catch (e) {
     alert(`打开执行窗口失败: ${e.message}`);
