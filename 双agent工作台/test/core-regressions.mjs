@@ -4,13 +4,14 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { ProjectStore } from "../controller/store.mjs";
-import { mergePlan, slimPlan } from "../controller/protocol.mjs";
+import { mergePlan, slimPlan, validateExecutorOutbox } from "../controller/protocol.mjs";
 import { DeepseekRunner } from "../controller/deepseek_runner.mjs";
+import { ExecutorRouter } from "../controller/executor_router.mjs";
 import { Orchestrator, contextSnapshot, tokenUsageDelta } from "../controller/orchestrator.mjs";
 import { DashboardServer } from "../controller/server.mjs";
 import { GptBridge } from "../controller/gpt_bridge.mjs";
 import { buildDeepseekPlanningGuidance, buildExecutorPrompt, buildExecutorTurnPrompt } from "../controller/prompts.mjs";
-import { ensureProjectSkill, verifyProjectSkill } from "../controller/workbench_skill.mjs";
+import { ensureProfileSkill } from "../controller/workbench_skill.mjs";
 
 const silent = { info() {}, warn() {}, error() {} };
 
@@ -31,6 +32,20 @@ function config() {
     orchestrator: { stepIntervalMs: 1 },
     gpt: { replyTimeoutMs: 100 },
     deepseek: { mode: "mock", maxRetries: 2 },
+  };
+}
+
+function executorEnvelope(projectId, task, attempt = 1, dispatchId = `dispatch-${attempt}`) {
+  return {
+    envelope_version: 3, schema_version: 3, type: "EXECUTE_PLAN", project_id: projectId,
+    task_id: task.id, dispatch_id: dispatchId, created_at: new Date().toISOString(), current_task: task, attempt,
+  };
+}
+
+function executorResult(envelope, type, summary = "完成") {
+  return {
+    schema_version: 3, type, project_id: envelope.project_id, task_id: envelope.task_id,
+    dispatch_id: envelope.dispatch_id, created_at: new Date().toISOString(), summary,
   };
 }
 
@@ -61,7 +76,7 @@ test("附件真实落盘并可按 ID 取回", () => {
   } finally { f.cleanup(); }
 });
 
-test("旧项目状态惰性补齐 v1.7 字段且不在读取时改写磁盘", () => {
+test("旧项目状态惰性补齐 v2.0 字段且不在读取时改写磁盘", () => {
   const f = fixture();
   try {
     const id = f.create();
@@ -72,7 +87,7 @@ test("旧项目状态惰性补齐 v1.7 字段且不在读取时改写磁盘", ()
     delete raw.session_generations;
     fs.writeFileSync(file, JSON.stringify(raw), "utf8");
     const state = f.store.readState(id);
-    assert.equal(state.schema, 2);
+    assert.equal(state.schema, 3);
     assert.equal(state.usage.deepseek.totals.outputTokens, 0);
     assert.deepEqual(state.session_generations, []);
     assert.equal(JSON.parse(fs.readFileSync(file, "utf8")).schema, 1);
@@ -278,17 +293,39 @@ test("DeepSeek 首轮加载 Skill，后续轮次只通知信封更新", () => {
   assert.doesNotMatch(next, /outbox.*格式/);
 });
 
-test("工作台 Skill 可供给且要求提示标记与合法信封同时成立", () => {
-  const source = fs.mkdtempSync(path.join(os.tmpdir(), "dual-agent-skill-test-"));
+test("工作台 Skill 只安装到独立 Harness Profile", () => {
+  const profile = fs.mkdtempSync(path.join(os.tmpdir(), "dual-agent-skill-test-"));
   try {
-    ensureProjectSkill(source);
-    const verified = verifyProjectSkill(source);
-    const skill = fs.readFileSync(path.join(source, ".dsh", "skills", "workbench-executor", "SKILL.md"), "utf8");
-    assert.equal(verified.ok, true);
+    const skillDir = ensureProfileSkill(profile).dir;
+    const skill = fs.readFileSync(path.join(skillDir, "SKILL.md"), "utf8");
     assert.match(skill, /WORKBENCH_MANAGED_DISPATCH_V1/);
     assert.match(skill, /workbench_dispatch: true/);
     assert.match(skill, /user-invocable: false/);
-  } finally { fs.rmSync(source, { recursive: true, force: true }); }
+    assert.equal(fs.existsSync(path.join(profile, ".dsh", "skills")), false);
+  } finally { fs.rmSync(profile, { recursive: true, force: true }); }
+});
+
+test("DeepSeek 与命令行执行器共用 v3 结果协议", async () => {
+  const f = fixture();
+  try {
+    const id = f.create();
+    const helper = path.join(f.root, "cli-executor.mjs");
+    fs.writeFileSync(helper, `import fs from "node:fs"; import path from "node:path"; const envelope=JSON.parse(fs.readFileSync(process.env.WORKBENCH_TASK_FILE,"utf8")); const out=path.join(path.dirname(path.dirname(process.env.WORKBENCH_TASK_FILE)),"outbox","message.json"); const tmp=out+".tmp"; fs.writeFileSync(tmp,JSON.stringify({schema_version:3,type:"TASK_DONE",project_id:envelope.project_id,task_id:envelope.task_id,dispatch_id:envelope.dispatch_id,created_at:new Date().toISOString()})); fs.renameSync(tmp,out);`, "utf8");
+    const cfg = { deepseek: { mode: "mock" }, executors: { cli: { command: `${JSON.stringify(process.execPath)} ${JSON.stringify(helper)}`, timeoutMs: 5000 } } };
+    const router = new ExecutorRouter(cfg, silent, f.store);
+    const dirs = { projectDir: f.store.projectDir(id), workspaceDir: f.store.workspaceDir(id), sourceDir: f.store.sourceDir(id) };
+    const task = { id: "TASK-001", description: "协议验证" };
+    const deepseekEnvelope = executorEnvelope(id, task, 1, "deepseek-dispatch");
+    await router.run(id, dirs, deepseekEnvelope, f.store);
+    assert.equal(validateExecutorOutbox(f.store.readOutbox(id), deepseekEnvelope).ok, true);
+    f.store.clearOutbox(id);
+    f.store.writeState(id, { executor: { type: "cli", capabilities: router.capabilities("cli") } });
+    const cliEnvelope = executorEnvelope(id, task, 1, "cli-dispatch");
+    const cliResult = await router.run(id, dirs, cliEnvelope, f.store);
+    assert.equal(cliResult.exitCode, 0);
+    assert.equal(validateExecutorOutbox(f.store.readOutbox(id), cliEnvelope).ok, true);
+    assert.equal(router.capabilities("cli").sessionResume, false);
+  } finally { f.cleanup(); }
 });
 
 test("同一项目复用会话时只打开一次执行窗口", async () => {
@@ -454,17 +491,19 @@ test("自动重试成功后不会同时留下失败记录", async () => {
   const f = fixture();
   try {
     const id = f.create();
-    const task = { id: "TASK-001", description: "可重试", dependencies: [] };
+    const task = { id: "TASK-001", description: "可重试", dependencies: [], max_attempts: 2 };
     f.store.writeState(id, { state: "WAITING_FOR_EXECUTOR", current_task: task, plan: { parsed: { tasks: [task] } } });
     const runner = {
       async run(projectId, dirs, envelope, store) {
-        store.writeWorkspaceFile(projectId, "outbox/message.json", JSON.stringify({ type: "TASK_DONE", task_id: task.id, summary: "重试成功" }));
+        store.writeOutboxAtomic(projectId, executorResult(envelope, "TASK_DONE", "重试成功"));
         return { exitCode: 0, timedOut: false, ms: 1 };
       },
     };
     const orch = new Orchestrator(config(), silent, {}, runner, f.store);
-    f.store.writeWorkspaceFile(id, "outbox/message.json", JSON.stringify({ type: "TASK_FAILED", task_id: task.id, summary: "首次失败" }));
-    await orch.handleExecutorResult(id, { exitCode: 1, timedOut: false, ms: 1 }, { type: "EXECUTE_PLAN", current_task: task, attempt: 1 });
+    const envelope = executorEnvelope(id, task);
+    f.store.createCheckpoint(id, task.id, envelope.dispatch_id);
+    f.store.writeOutboxAtomic(id, executorResult(envelope, "TASK_FAILED", "首次失败"));
+    await orch.handleExecutorResult(id, { exitCode: 1, timedOut: false, ms: 1 }, envelope);
     const state = f.store.readState(id);
     assert.equal(state.failed_tasks.length, 0);
     assert.deepEqual(state.completed_tasks.map((item) => item.id), [task.id]);
@@ -475,15 +514,99 @@ test("任务重试耗尽后会把失败交给 GPT 决策", async () => {
   const f = fixture();
   try {
     const id = f.create();
-    const task = { id: "TASK-001", description: "最终失败任务", dependencies: [] };
+    const task = { id: "TASK-001", description: "最终失败任务", dependencies: [], max_attempts: 2 };
     f.store.writeState(id, { state: "WAITING_FOR_EXECUTOR", current_task: task, plan: { parsed: { tasks: [task] } } });
-    f.store.writeWorkspaceFile(id, "outbox/message.json", JSON.stringify({ type: "TASK_FAILED", task_id: task.id, summary: "仍然失败" }));
     let query = "";
     const orch = new Orchestrator(config(), silent, {}, {}, f.store);
     orch.sendToGpt = async (_projectId, type, text) => { assert.equal(type, "QUERY"); query = text; };
-    await orch.handleExecutorResult(id, { exitCode: 1, timedOut: false, ms: 1 }, { type: "EXECUTE_PLAN", current_task: task, attempt: 2 });
+    const envelope = executorEnvelope(id, task, 2);
+    f.store.createCheckpoint(id, task.id, envelope.dispatch_id);
+    f.store.writeOutboxAtomic(id, executorResult(envelope, "TASK_FAILED", "仍然失败"));
+    await orch.handleExecutorResult(id, { exitCode: 1, timedOut: false, ms: 1 }, envelope);
     assert.match(query, /最终失败任务/);
     assert.equal(f.store.readState(id).state, "WAITING_FOR_GPT");
+  } finally { f.cleanup(); }
+});
+
+test("v3 结果拒绝错误派发和重复派发", () => {
+  const envelope = executorEnvelope("project", { id: "TASK-001" });
+  const good = executorResult(envelope, "TASK_DONE");
+  assert.equal(validateExecutorOutbox(good, envelope).ok, true);
+  assert.equal(validateExecutorOutbox({ ...good, dispatch_id: "other" }, envelope).code, "OUTBOX_DISPATCH");
+  assert.equal(validateExecutorOutbox(good, envelope, [good.dispatch_id]).code, "OUTBOX_DUPLICATE");
+});
+
+test("半写 outbox 不会被视为完整结果", () => {
+  const f = fixture();
+  try {
+    const id = f.create();
+    f.store.writeWorkspaceFile(id, "outbox/message.json", '{"schema_version":3');
+    const status = f.store.readOutboxStatus(id);
+    assert.equal(status.exists, true);
+    assert.equal(status.complete, false);
+    assert.equal(status.data, null);
+  } finally { f.cleanup(); }
+});
+
+test("任务检查点恢复源码并保留依赖目录", () => {
+  const f = fixture();
+  try {
+    const id = f.create();
+    const source = f.store.sourceDir(id);
+    fs.writeFileSync(path.join(source, "app.txt"), "before", "utf8");
+    fs.mkdirSync(path.join(source, "node_modules"), { recursive: true });
+    fs.writeFileSync(path.join(source, "node_modules", "keep.txt"), "keep", "utf8");
+    f.store.createCheckpoint(id, "TASK-001", "dispatch-1");
+    fs.writeFileSync(path.join(source, "app.txt"), "after", "utf8");
+    fs.writeFileSync(path.join(source, "extra.txt"), "remove", "utf8");
+    f.store.restoreCheckpoint(id);
+    assert.equal(fs.readFileSync(path.join(source, "app.txt"), "utf8"), "before");
+    assert.equal(fs.existsSync(path.join(source, "extra.txt")), false);
+    assert.equal(fs.readFileSync(path.join(source, "node_modules", "keep.txt"), "utf8"), "keep");
+  } finally { f.cleanup(); }
+});
+
+test("检查点恢复失败会进入 ERROR 且停止重试", async () => {
+  const f = fixture();
+  try {
+    const id = f.create();
+    const task = { id: "TASK-001", description: "恢复失败", dependencies: [], max_attempts: 2 };
+    const envelope = executorEnvelope(id, task);
+    const checkpoint = f.store.createCheckpoint(id, task.id, envelope.dispatch_id);
+    fs.rmSync(f.store.resolveWorkspacePath(id, `${checkpoint.relative_path}/source`), { recursive: true, force: true });
+    f.store.writeState(id, { current_task: task, plan: { parsed: { tasks: [task] } } });
+    const orch = new Orchestrator(config(), silent, {}, {}, f.store);
+    await orch.retryTaskAfterFailure(id, envelope, "执行器崩溃");
+    assert.equal(f.store.readState(id).state, "ERROR");
+    assert.match(f.store.readState(id).last_error, /CHECKPOINT_RESTORE/);
+  } finally { f.cleanup(); }
+});
+
+test("验证失败按普通失败回滚并重试", async () => {
+  const f = fixture();
+  try {
+    const id = f.create();
+    const task = { id: "TASK-001", description: "需要验证", kind: "test", dependencies: [], validation: 'node -e "process.exit(1)"', max_attempts: 2 };
+    f.store.writeState(id, { state: "WAITING_FOR_EXECUTOR", current_task: task, plan: { parsed: { tasks: [task] } } });
+    let retries = 0;
+    const runner = {
+      async run(projectId, dirs, nextEnvelope, store) {
+        retries++;
+        store.writeOutboxAtomic(projectId, executorResult(nextEnvelope, "TASK_DONE"));
+        return { exitCode: 0, timedOut: false, ms: 1 };
+      },
+    };
+    const orch = new Orchestrator(config(), silent, {}, runner, f.store);
+    orch.sendToGpt = async () => {};
+    const envelope = executorEnvelope(id, task);
+    f.store.createCheckpoint(id, task.id, envelope.dispatch_id);
+    f.store.writeOutboxAtomic(id, executorResult(envelope, "TASK_DONE"));
+    await orch.handleExecutorResult(id, { exitCode: 0, timedOut: false, ms: 1 }, envelope);
+    const state = f.store.readState(id);
+    assert.equal(retries, 1);
+    assert.equal(state.state, "WAITING_FOR_GPT");
+    assert.equal(state.failed_tasks.at(-1).code, "VALIDATION_FAILED");
+    assert.equal(state.validation_results[task.id].ok, false);
   } finally { f.cleanup(); }
 });
 

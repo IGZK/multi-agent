@@ -5,7 +5,7 @@
 //   config.deepseek.visible 仅决定是否弹出浏览器窗口。首个 Task 启动服务+会话，
 //   后续 Task 复用同一会话（不重建窗口、不重复注入完整提示）。headless 仅作会话池
 //   无法启动时的兜底（每次任务 = 一个全新 dsh --profile headless 进程，独立上下文，无复用）。
-//   含服务崩溃/会话失效的自动恢复与项目级会话状态记录。
+//   服务崩溃交回编排器回滚后重试，并记录可供工作台重启接管的项目级会话状态。
 //
 // 两种模式共用文件信封协议：
 //   编排器 → inbox/task.json + inbox/task_prompt.txt（完整提示词）
@@ -13,10 +13,10 @@
 // stdout/stderr 重定向到项目日志文件（避免管道，Windows 沙箱友好）。
 import fs from "node:fs";
 import path from "node:path";
+import crypto from "node:crypto";
 import { spawn, execFile } from "node:child_process";
 import { sleep, projectLog, nowIso } from "./logger.mjs";
 import { buildExecutorPrompt, buildExecutorTurnPrompt } from "./prompts.mjs";
-import { ensureProjectSkill } from "./workbench_skill.mjs";
 import { UiExecutor } from "./dsh_ui.mjs";
 
 export class RunnerError extends Error {
@@ -80,23 +80,22 @@ export class DeepseekRunner {
     const { workspaceDir, sourceDir } = dirs;
     fs.mkdirSync(sourceDir, { recursive: true });
 
-    // 0. 供给工作台专用底层 Skill 到项目源码目录的 .dsh/skills（幂等）
-    try {
-      const r = ensureProjectSkill(sourceDir);
-      if (r.installed) this.log("info", `工作台 Skill 已供给: ${r.dir}`);
-      else this.log("info", `工作台 Skill 已就绪（${r.dir || r.reason || "已存在"}）`);
-    } catch (e) {
-      this.log("warn", `工作台 Skill 供给失败（继续调度）: ${e.message}`);
-    }
-
-    // 1. 写任务信封
-    envelope.envelope_version = 2;
+    // 0. 专用 Skill 只供给到工作台 Harness Profile，不写入用户源码目录。
+    // 1. 原子写入 v3 任务信封
+    envelope.envelope_version = 3;
+    envelope.schema_version = 3;
+    envelope.dispatch_id ||= crypto.randomUUID();
     envelope.workbench_dispatch = true;
     envelope.project_id = projectId;
     envelope.source_dir = sourceDir;
     envelope.workspace_dir = workspaceDir;
-    envelope.dispatched_at = new Date().toISOString();
-    fs.writeFileSync(path.join(workspaceDir, "inbox", "task.json"), JSON.stringify(envelope, null, 2), "utf8");
+    envelope.task_id ||= envelope.current_task?.id || envelope.type;
+    envelope.created_at ||= new Date().toISOString();
+    envelope.dispatched_at = envelope.created_at;
+    const inboxFile = path.join(workspaceDir, "inbox", "task.json");
+    const inboxTmp = inboxFile + `.tmp-${process.pid}-${Date.now()}`;
+    fs.writeFileSync(inboxTmp, JSON.stringify(envelope, null, 2), "utf8");
+    fs.renameSync(inboxTmp, inboxFile);
     const prompt = this.buildPrompt(envelope);
     fs.writeFileSync(path.join(workspaceDir, "inbox", "task_prompt.txt"), prompt, "utf8");
 
@@ -140,7 +139,6 @@ export class DeepseekRunner {
     const taskId = envelope.current_task?.id || envelope.type;
     const timeoutMs = envelope.timeoutMs || this.cfg.executorTimeoutMs || 2700000;
     const outboxFile = path.join(workspaceDir, "outbox", "message.json");
-    const maxRecoveries = this.cfg.uiRecoveryRetries ?? 1;
     fs.mkdirSync(logDir, { recursive: true });
 
     // a. 确保项目可见执行服务（失败→抛错回退 headless，任务尚未开始，安全）
@@ -173,7 +171,7 @@ export class DeepseekRunner {
       || this.resolveSelection(store, projectId);
     let usageBefore = await this.ui.sessionProjection?.(projectId, sessionId).catch(() => null) || null;
 
-    this.running.set(projectId, { pid: server.child?.pid, startedAt, sessionId, visible: true, serviceUrl: server.url });
+    this.running.set(projectId, { pid: server.child?.pid, startedAt, sessionId, visible: this.visibleEnabled, serviceUrl: server.url });
     this.log("info", `执行会话${sessionReused ? "已复用" : "已创建"}: ${sessionId}（type=${envelope.type} task=${taskId}）`);
 
     // d. 提交任务：新会话只加载一次 Skill；复用会话只通知信封已更新。
@@ -200,7 +198,9 @@ export class DeepseekRunner {
     // 记录项目级会话状态（Dashboard / 恢复用）
     this.recordProjectSession(store, projectId, {
       sessionId, servicePid: server.child?.pid, serviceUrl: server.url,
-      taskId, type: envelope.type, reused: sessionReused, createdAt: nowIso(),
+      taskId, type: envelope.type, reused: sessionReused, createdAt: nowIso(), cwd: sourceDir,
+      dispatchId: envelope.dispatch_id, generation: store?.readState?.(projectId)?.session_generations?.at(-1)?.generation || 1,
+      logFile: server.logFile,
     });
 
     // 只在项目会话首次建立时打开窗口；后续 Task 复用现有窗口。
@@ -209,16 +209,15 @@ export class DeepseekRunner {
       this.log("info", `执行窗口${opened ? "已打开" : "打开失败"}: ${server.url}（任务 ${taskId}）`);
     }
 
-    // e. 轮询 outbox + 会话状态 + 崩溃检测（含自动恢复）
+    // e. 轮询 outbox + 会话状态 + 崩溃检测。崩溃后由编排器先回滚检查点再重试。
     const t0 = Date.now();
     let lastSessionCheck = 0;
     let idleSince = 0;
     let crashBuffer = false;
-    let recoveries = 0;
 
     const buildResult = async (extra = {}) => {
       const usageAfter = await this.ui.sessionProjection?.(projectId, sessionId).catch(() => null) || null;
-      const result = { exitCode: 0, timedOut: false, visible: true, freshSession, sessionId, uiUrl: server.url, usageBefore, usageAfter, actualModel, ...extra };
+      const result = { exitCode: 0, timedOut: false, visible: this.visibleEnabled, freshSession, sessionId, uiUrl: server.url, usageBefore, usageAfter, actualModel, ...extra };
       result.logFile = server.logFile;
       result.ms = Date.now() - startedAt;
       return result;
@@ -229,7 +228,8 @@ export class DeepseekRunner {
         this.running.delete(projectId);
         return await buildResult({ cancelled: true, exitCode: null });
       }
-      if (fs.existsSync(outboxFile)) {
+      const outboxReady = store?.readOutboxStatus ? store.readOutboxStatus(projectId).complete : fs.existsSync(outboxFile);
+      if (outboxReady) {
         projectLog(projectDir, `[settle] outbox written task=${taskId} ms=${Date.now() - startedAt}`);
         this.running.delete(projectId);
         return await buildResult();
@@ -239,44 +239,8 @@ export class DeepseekRunner {
       const alive = await this.ui.isAlive(server).catch(() => false);
       if (!alive) {
         if (!crashBuffer) { crashBuffer = true; await sleep(5000); continue; }
-        crashBuffer = false;
-        if (recoveries < maxRecoveries && !this.cancelled.has(projectId)) {
-          recoveries++;
-          this.log("warn", `执行服务崩溃，自动恢复 ${recoveries}/${maxRecoveries}（task=${taskId}）`);
-          // 清理失效服务并重建：新服务 + 新会话 + 重新提交完整提示（新会话无历史，需完整上下文）
-          this.ui.disposeServer(projectId);
-          server = await this.ui.ensureServer(projectId, logDir);
-          if (!server) {
-            const result = await buildResult({ uiCrashed: true, recovered: recoveries });
-            projectLog(projectDir, `[settle] ui crashed (recovery boot fail) task=${taskId} ms=${result.ms}`);
-            this.running.delete(projectId);
-            return result;
-          }
-          try {
-            const got2 = await this.ui.getOrCreateSession(projectId, sourceDir);
-            sessionId = got2.sessionId;
-            freshSession = true; // 恢复重建的新会话：编排器应重置上下文缓存，下个任务发全量
-            await applyModel();
-            actualModel = await this.ui.currentModel?.(projectId, sessionId).catch(() => null)
-              || this.resolveSelection(store, projectId);
-            usageBefore = await this.ui.sessionProjection?.(projectId, sessionId).catch(() => null) || null;
-            await submitFull();
-            this.running.set(projectId, { pid: server.child?.pid, startedAt, sessionId, visible: true, serviceUrl: server.url, recoveries });
-            this.recordProjectSession(store, projectId, {
-              sessionId, servicePid: server.child?.pid, serviceUrl: server.url,
-              taskId, type: envelope.type, reused: false, createdAt: nowIso(), recoveredAt: nowIso(), recoveries,
-            });
-            this.log("info", `执行服务已自动恢复并重新提交: session=${sessionId}`);
-          } catch (e2) {
-            const result = await buildResult({ uiCrashed: true, recovered: recoveries });
-            projectLog(projectDir, `[settle] ui crashed (recovery failed: ${e2.message}) task=${taskId} ms=${result.ms}`);
-            this.running.delete(projectId);
-            return result;
-          }
-          continue;
-        }
-        const result = await buildResult({ uiCrashed: true, recovered: recoveries });
-        projectLog(projectDir, `[settle] ui crashed (no recovery left) task=${taskId} ms=${result.ms}`);
+        const result = await buildResult({ uiCrashed: true });
+        projectLog(projectDir, `[settle] ui crashed; checkpoint rollback required task=${taskId} ms=${result.ms}`);
         this.running.delete(projectId);
         return result;
       }
@@ -318,7 +282,19 @@ export class DeepseekRunner {
     if (!store?.writeState) return;
     try {
       store.writeState(projectId, {
-        session: { ...data, ts: nowIso() },
+        session: {
+          service_url: data.serviceUrl,
+          service_pid: data.servicePid || null,
+          session_id: data.sessionId,
+          cwd: data.cwd || null,
+          generation: data.generation || null,
+          task_id: data.taskId || null,
+          dispatch_id: data.dispatchId || null,
+          type: data.type || "EXECUTE_PLAN",
+          started_at: data.createdAt || nowIso(),
+          log_file: data.logFile || null,
+          ts: nowIso(),
+        },
         pending: {
           text: `DeepSeek 执行中: ${data.taskId || "-"}${this.visibleEnabled ? "（执行窗口可实时查看）" : "（后台执行中）"}`,
           ts: nowIso(),
@@ -328,6 +304,49 @@ export class DeepseekRunner {
         },
       });
     } catch { /* ignore */ }
+  }
+
+  /** 重启恢复：接管已保存服务与会话，只等待原 dispatch 的结果。 */
+  async resume(projectId, dirs, envelope, store) {
+    if (this.cfg.mode !== "real" || this.cfg.useSessionPool === false) return null;
+    const saved = store?.readState?.(projectId)?.session;
+    const adopted = await this.ui.adoptSession(projectId, saved, dirs.sourceDir).catch(() => null);
+    if (!adopted) return null;
+    const startedAt = Date.now();
+    const timeoutMs = envelope.timeoutMs || this.cfg.executorTimeoutMs || 2700000;
+    this.running.set(projectId, { pid: saved.service_pid, startedAt, sessionId: adopted.sessionId, visible: this.visibleEnabled, serviceUrl: adopted.server.url, resumed: true });
+    this.log("info", `已接管执行会话: ${adopted.sessionId}（dispatch=${envelope.dispatch_id}）`);
+    let idleSince = adopted.running ? 0 : Date.now();
+    while (Date.now() - startedAt < timeoutMs) {
+      if (this.cancelled.has(projectId)) {
+        this.running.delete(projectId);
+        return { cancelled: true, exitCode: null, timedOut: false, ms: Date.now() - startedAt, resumed: true };
+      }
+      const outbox = store.readOutboxStatus(projectId);
+      if (outbox.complete) {
+        this.running.delete(projectId);
+        return { exitCode: 0, timedOut: false, ms: Date.now() - startedAt, visible: this.visibleEnabled, resumed: true, sessionId: adopted.sessionId, uiUrl: adopted.server.url };
+      }
+      if (!(await this.ui.isAlive(adopted.server).catch(() => false))) {
+        this.running.delete(projectId);
+        return { exitCode: null, timedOut: false, ms: Date.now() - startedAt, resumed: true, resumeFailed: true, uiCrashed: true };
+      }
+      const session = await this.ui.sessionState(projectId, adopted.sessionId).catch(() => null);
+      if (!session) {
+        this.running.delete(projectId);
+        return { exitCode: null, timedOut: false, ms: Date.now() - startedAt, resumed: true, resumeFailed: true };
+      }
+      if (session.running) idleSince = 0;
+      else if (!idleSince) idleSince = Date.now();
+      else if (Date.now() - idleSince > 15000) {
+        this.running.delete(projectId);
+        return { exitCode: 0, timedOut: false, ms: Date.now() - startedAt, visible: this.visibleEnabled, resumed: true, sessionId: adopted.sessionId, idleNoOutbox: true, invalidOutbox: outbox.exists };
+      }
+      await sleep(2000);
+    }
+    await this.ui.cancelSession(projectId, adopted.sessionId).catch(() => {});
+    this.running.delete(projectId);
+    return { exitCode: null, timedOut: true, ms: Date.now() - startedAt, visible: this.visibleEnabled, resumed: true, sessionId: adopted.sessionId };
   }
 
   /** 创建摘要化的新 Harness 会话；保留服务和窗口，只替换会话 ID。 */
@@ -362,6 +381,7 @@ export class DeepseekRunner {
       child = spawn(this.cfg.nodeBin || "node", args, {
         cwd: sourceDir,
         stdio: ["ignore", fd, fd], // 输出直接进文件，避免管道
+        env: { ...process.env, DSH_BUNDLED_SKILL_DIR: path.join(this.ui.ensureProfile().dir, "skills") },
         windowsHide: true,
       });
     } catch (e) {
@@ -399,22 +419,28 @@ export class DeepseekRunner {
     await sleep(150);
     if (this.cancelled.has(projectId)) return { exitCode: null, timedOut: false, logFile: null, ms: 150, mock: true, cancelled: true };
     const ts = new Date().toISOString().replace(/[:.]/g, "-");
-    const taskId = envelope.current_task?.id || "TASK-X";
+    const taskId = envelope.task_id || envelope.current_task?.id || envelope.type;
     let outbox;
     if (envelope.type === "ANALYZE") {
       const analysis = `# 项目分析（mock 执行者）\n\n- 生成时间：${ts}\n- 项目目录：${sourceDir}\n- 说明：这是编排器闭环演练的模拟分析。\n`;
       fs.writeFileSync(path.join(workspaceDir, "project_analysis.md"), analysis, "utf8");
       fs.writeFileSync(path.join(workspaceDir, "analysis", `project_analysis-${ts}.md`), analysis, "utf8");
-      outbox = { type: "TASK_DONE", task_id: "ANALYZE", report_file: ".gpt_workspace/project_analysis.md", summary: "模拟分析完成" };
+      outbox = { schema_version: 3, type: "TASK_DONE", project_id: projectId, dispatch_id: envelope.dispatch_id, task_id: "ANALYZE", created_at: nowIso(), report_file: ".gpt_workspace/project_analysis.md", summary: "模拟分析完成" };
     } else {
       const report = `# ${taskId} 执行报告（mock 执行者）\n\n- 时间：${ts}\n- 任务：${envelope.current_task?.description || ""}\n- 结果：模拟执行成功。\n`;
       fs.mkdirSync(path.join(workspaceDir, "executor_reports"), { recursive: true });
       fs.writeFileSync(path.join(workspaceDir, "executor_reports", `${taskId}.md`), report, "utf8");
       const artifact = path.join(sourceDir, `${taskId}.mock-artifact.txt`);
       fs.writeFileSync(artifact, `mock artifact for ${taskId} @ ${ts}\n`, "utf8");
-      outbox = { type: "TASK_DONE", task_id: taskId, report_file: `.gpt_workspace/executor_reports/${taskId}.md`, summary: "模拟执行成功" };
+      outbox = { schema_version: 3, type: "TASK_DONE", project_id: projectId, dispatch_id: envelope.dispatch_id, task_id: taskId, created_at: nowIso(), report_file: `.gpt_workspace/executor_reports/${taskId}.md`, summary: "模拟执行成功" };
     }
-    fs.writeFileSync(path.join(workspaceDir, "outbox", "message.json"), JSON.stringify(outbox, null, 2), "utf8");
+    if (store?.writeOutboxAtomic) store.writeOutboxAtomic(projectId, outbox);
+    else {
+      const file = path.join(workspaceDir, "outbox", "message.json");
+      const tmp = file + `.tmp-${process.pid}-${Date.now()}`;
+      fs.writeFileSync(tmp, JSON.stringify(outbox, null, 2), "utf8");
+      fs.renameSync(tmp, file);
+    }
     return { exitCode: 0, timedOut: false, logFile: null, ms: 150, mock: true };
   }
 
@@ -441,7 +467,7 @@ export class DeepseekRunner {
   kill(projectId) {
     this.cancelled.add(projectId);
     const info = this.running.get(projectId);
-    if (info?.visible && info.sessionId) {
+    if (info?.sessionId && this.ui.info(projectId)) {
       this.ui.cancelSession(projectId, info.sessionId).catch(() => {});
       this.ui.disposeServer(projectId);
       this.running.delete(projectId);
@@ -469,6 +495,10 @@ export class DeepseekRunner {
   /** 进程退出前关闭全部可见执行服务 */
   shutdownAll() {
     this.ui.shutdownAll();
+  }
+
+  detachAll() {
+    this.ui.detachAll();
   }
 }
 

@@ -115,6 +115,9 @@ export class DashboardServer {
       pending_model_replan: st.pending_model_replan,
       compaction: st.compaction,
       checkpoint: st.checkpoint,
+      current_dispatch_id: st.current_dispatch_id,
+      validation_results: st.validation_results,
+      executor: st.executor,
       model_recommendations: st.model_recommendations,
       pending_elapsed_s: ["COMPLETED", "CANCELED", "PAUSED"].includes(st.state)
         ? null
@@ -138,6 +141,9 @@ export class DashboardServer {
       }
       if (req.method === "GET" && (p === "/app.js" || p === "/style.css")) {
         return this.serveStatic(res, path.basename(p));
+      }
+      if (req.method === "GET" && p.startsWith("/assets/")) {
+        return this.serveStatic(res, p.slice(1));
       }
       if (req.method === "GET" && p === "/api/projects") {
         return sendJson(res, 200, {
@@ -194,6 +200,7 @@ export class DashboardServer {
             reasoningEffort: String(body.deepseek_selection.reasoningEffort || ""),
           };
         }
+        if (body.executor_type) opts.executor_type = String(body.executor_type);
         const id = await this.orchestrator.createProject(name, task, sourceDir, opts);
         return sendJson(res, 201, { id });
       }
@@ -205,6 +212,15 @@ export class DashboardServer {
         else if (body.action === "end") await this.orchestrator.endProject(id);
         else if (body.action === "resume") await this.orchestrator.resume(id);
         else if (body.action === "retry") await this.orchestrator.retry(id);
+        else if (body.action === "retry_task") await this.orchestrator.retryTask(id);
+        else if (body.action === "restore_checkpoint") {
+          const checkpoint = await this.orchestrator.restoreCheckpoint(id);
+          return sendJson(res, 200, { ok: true, checkpoint });
+        }
+        else if (body.action === "export_audit") {
+          const audit = this.orchestrator.exportAudit(id);
+          return sendJson(res, 200, { ok: true, ...audit });
+        }
         else if (body.action === "compact_session") {
           const result = await this.orchestrator.compactSession(id);
           return sendJson(res, 200, { ok: true, ...result });
@@ -220,6 +236,9 @@ export class DashboardServer {
           catch (e) { return sendJson(res, 400, { error: String(e.message) }); }
         } else if (body.action === "deepseek_model") {
           try { await this.orchestrator.setProjectDeepseekSelection(id, body.selection); }
+          catch (e) { return sendJson(res, 400, { error: String(e.message) }); }
+        } else if (body.action === "select_executor") {
+          try { await this.orchestrator.selectExecutor(id, body.executor_type); }
           catch (e) { return sendJson(res, 400, { error: String(e.message) }); }
         } else if (body.action === "delete") {
           try { await this.orchestrator.deleteProject(id); }
@@ -297,7 +316,8 @@ export class DashboardServer {
   }
 
   serveStatic(res, name) {
-    const file = path.join(WEB_DIR, name);
+    const file = path.resolve(WEB_DIR, name);
+    if (file !== WEB_DIR && !file.startsWith(WEB_DIR + path.sep)) { res.writeHead(403); return res.end("forbidden"); }
     if (!fs.existsSync(file)) { res.writeHead(404); return res.end("not found"); }
     res.writeHead(200, { "Content-Type": MIME[path.extname(file)] || "application/octet-stream" });
     return res.end(fs.readFileSync(file));

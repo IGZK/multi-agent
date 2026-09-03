@@ -39,7 +39,11 @@ goals:
 tasks:
 - id: TASK-001
   description: 任务描述
+  kind: coding | test | analysis | docs
   priority: high | medium | low
+  validation: npm test（可选；填写可重复执行的命令）
+  timeout: 900（可选，单位秒）
+  max_attempts: 2（可选）
   dependencies:
   - TASK-000（可选）
 
@@ -61,6 +65,21 @@ questions_for_executor:
 
 【增量规划原则】
 重新规划时：已 DONE 的任务保持 DONE；只修改 FAILED/阻塞的任务；可追加新任务。绝不要因为一次小问题推翻整个项目。`;
+
+export const PLAN_TEMPLATES = {
+  coding: "编码计划：优先按可交付功能拆分；每项写清影响文件，能自动检查时填写 validation。",
+  bugfix: "Bug 修复计划：先定位根因，再做最小修复，最后用能复现问题的 validation 验证。",
+  analysis: "分析计划：先收集证据，再形成结论；通常不填写会修改源码的验证命令。",
+  docs: "文档计划：先核对现状与受众，再更新文档；validation 使用链接、格式或示例检查。",
+};
+
+export function buildPlanTemplateHint(task = "") {
+  const text = String(task).toLowerCase();
+  if (/bug|修复|故障|报错|错误/.test(text)) return PLAN_TEMPLATES.bugfix;
+  if (/分析|调研|评估|报告/.test(text)) return PLAN_TEMPLATES.analysis;
+  if (/文档|readme|说明/.test(text)) return PLAN_TEMPLATES.docs;
+  return PLAN_TEMPLATES.coding;
+}
 
 /** 告诉 GPT 执行者能力档位；强模型少教步骤，弱模型把方法和验证写清楚。 */
 export function buildDeepseekPlanningGuidance(selection = {}) {

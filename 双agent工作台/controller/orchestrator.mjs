@@ -3,14 +3,32 @@
 //          → 继续/重规划 → 最终审查 → DONE。全部状态持久化，支持断点恢复。
 import fs from "node:fs";
 import path from "node:path";
+import crypto from "node:crypto";
+import { exec } from "node:child_process";
 import { sleep, projectLog, nowIso } from "./logger.mjs";
 import {
   parseGptResponse, parsePlan, mergePlan, fallbackParse, slimPlan,
-  wrapOrchestratorMsg, wrapDeepseekQuery,
+  wrapOrchestratorMsg, wrapDeepseekQuery, validateExecutorOutbox,
 } from "./protocol.mjs";
-import { GPT_SYSTEM_PROMPT, buildDeepseekPlanningGuidance } from "./prompts.mjs";
+import { GPT_SYSTEM_PROMPT, buildDeepseekPlanningGuidance, buildPlanTemplateHint } from "./prompts.mjs";
 
 const TOKEN_KEYS = ["uncachedInputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens"];
+
+export function runValidationCommand(command, cwd, timeoutMs = 300000) {
+  return new Promise((resolve) => {
+    const started = Date.now();
+    exec(String(command), { cwd, timeout: timeoutMs, maxBuffer: 1024 * 1024, windowsHide: true }, (error, stdout, stderr) => {
+      resolve({
+        ok: !error,
+        command: String(command),
+        exit_code: Number.isInteger(error?.code) ? error.code : error ? -1 : 0,
+        timed_out: !!error?.killed,
+        duration_ms: Date.now() - started,
+        output: `${stdout || ""}${stderr || ""}`.slice(-8000),
+      });
+    });
+  });
+}
 
 export function tokenUsageDelta(before, after) {
   if (!after) return null;
@@ -184,6 +202,7 @@ export class Orchestrator {
       case "EXECUTING": return this.stepExecuting(projectId, st);
       case "WAITING_FOR_EXECUTOR": return this.stepWaitingExecutor(projectId, st);
       case "ANALYZING": return this.stepAnalyzing(projectId, st);
+      case "DECISION_REQUIRED": return this.stepAnalyzing(projectId, st);
       case "WAITING_FOR_GPT": return this.stepWaitingGpt(projectId, st);
       case "REPLANNING": return sleep(500);
       case "ERROR": return this.stepError(projectId, st);
@@ -270,7 +289,7 @@ export class Orchestrator {
       if (!sel.selected) this.log("warn", projectId, `未选到目标模型 "${gcfg.modelName}"（可用: ${(sel.available || []).join(", ") || "未枚举"}），使用页面默认模型`);
     }
     // 发送：系统提示词 + 用户任务
-    const content = `${GPT_SYSTEM_PROMPT}\n\n================\n用户任务：\n${st.user_task}\n\n请输出 <GPT_RESPONSE> 开始规划。`;
+    const content = `${GPT_SYSTEM_PROMPT}\n\n================\n用户任务：\n${st.user_task}\n\n【本次计划模板】${buildPlanTemplateHint(st.user_task)}\n\n请输出 <GPT_RESPONSE> 开始规划。`;
     await this.sendToGpt(projectId, "PLAN_REQUEST", content, { intro: true });
     this.assertProjectActive(projectId, epoch);
     this.store.transition(projectId, "GPT_PLANNING", {
@@ -445,13 +464,47 @@ export class Orchestrator {
   }
 
   async stepAnalyzing(projectId, st) {
-    return this.dispatchExecutor(projectId, "ANALYZE", st.pending?.request || "分析当前项目", null);
+    if (st.current_dispatch_id && this.store.readInbox(projectId)?.dispatch_id === st.current_dispatch_id) {
+      return this.stepWaitingExecutor(projectId, st);
+    }
+    const type = st.pending?.type === "DECIDE" ? "DECIDE" : "ANALYZE";
+    return this.dispatchExecutor(projectId, type, st.pending?.request || (type === "DECIDE" ? "请评估并做出决定" : "分析当前项目"), null);
   }
 
   async stepWaitingExecutor(projectId, st) {
-    // 恢复场景：执行者已退出（重启后），直接重新分派
-    this.log("info", projectId, "WAITING_FOR_EXECUTOR 恢复：重新分派当前任务");
     const type = st.pending?.type || "EXECUTE_PLAN";
+    const savedEnvelope = this.store.readInbox(projectId);
+    if (st.current_dispatch_id && savedEnvelope?.dispatch_id === st.current_dispatch_id) {
+      const ready = this.store.readOutboxStatus(projectId);
+      if (ready.complete) {
+        this.log("info", projectId, `恢复时发现原任务结果: ${st.current_dispatch_id}`);
+        try {
+          return await this.handleExecutorResult(projectId, { exitCode: 0, timedOut: false, ms: 0, resumed: true }, savedEnvelope);
+        } catch (error) {
+          if (type === "EXECUTE_PLAN") {
+            return this.retryTaskAfterFailure(projectId, savedEnvelope, error.message, error.code || "OUTBOX_INVALID");
+          }
+          throw error;
+        }
+      }
+      const dirs = { projectDir: this.store.projectDir(projectId), workspaceDir: this.store.workspaceDir(projectId), sourceDir: this.store.sourceDir(projectId) };
+      const resumed = await this.runner.resume?.(projectId, dirs, savedEnvelope, this.store);
+      if (resumed && !resumed.resumeFailed) {
+        try {
+          return await this.handleExecutorResult(projectId, resumed, savedEnvelope);
+        } catch (error) {
+          if (type === "EXECUTE_PLAN") {
+            return this.retryTaskAfterFailure(projectId, savedEnvelope, error.message, error.code || "EXECUTOR_RESULT_ERROR");
+          }
+          throw error;
+        }
+      }
+      if (type === "EXECUTE_PLAN") {
+        this.log("warn", projectId, "原执行会话无法接管，恢复检查点后建立恢复会话");
+        return this.retryTaskAfterFailure(projectId, savedEnvelope, "工作台重启后无法接管原执行会话", "SESSION_TAKEOVER_FAILED");
+      }
+    }
+    this.log("info", projectId, "等待状态无可接管的 v3 派发，创建恢复会话");
     if (type === "ANALYZE" || type === "DECIDE") {
       return this.dispatchExecutor(projectId, type, st.pending?.request || "分析当前项目", null, 1);
     }
@@ -485,7 +538,16 @@ export class Orchestrator {
     const newDecisions = fresh ? decisions : decisions.slice(cache.decisions || 0);
     const newReplans = fresh ? replans : replans.slice(cache.replans || 0);
     const planChanged = fresh || this.planHash(st.plan?.parsed?.tasks) !== cache.plan_hash;
+    const taskId = task?.id || type;
+    const timeoutSeconds = Number(task?.timeout);
     return {
+      envelope_version: 3,
+      schema_version: 3,
+      dispatch_id: crypto.randomUUID(),
+      created_at: nowIso(),
+      workbench_dispatch: true,
+      project_id: projectId,
+      task_id: taskId,
       type,
       // 计划用"精简视图"（去掉完整任务描述），避免每任务重复携带完整计划文本；
       // 完整计划仍在 project_state.json / project_plan.md 中可读。
@@ -506,8 +568,8 @@ export class Orchestrator {
       attempt: attempt || 1,
       project_name: st.project_name,
       user_task: trunc(st.user_task, 1200),
-      executor_context_file: (st.compaction?.count || 0) > 0 ? ".gpt_workspace/executor_context.md" : null,
-      timeoutMs: this.cfg.deepseek?.executorTimeoutMs,
+      executor_context_file: (st.compaction?.count || 0) > 0 || this.store.readFileSafe(projectId, "executor_context.md") ? ".gpt_workspace/executor_context.md" : null,
+      timeoutMs: Number.isFinite(timeoutSeconds) && timeoutSeconds > 0 ? timeoutSeconds * 1000 : this.cfg.deepseek?.executorTimeoutMs,
     };
   }
 
@@ -539,6 +601,14 @@ export class Orchestrator {
     };
     const st = this.store.readState(projectId);
     const envelope = envelopeOrNull || this.buildEnvelope(projectId, st, type, requestOrTask, requestOrTask, attempt);
+    envelope.attempt = attempt || envelope.attempt || 1;
+    if (type === "EXECUTE_PLAN") {
+      const checkpoint = st.checkpoint;
+      if (!checkpoint || checkpoint.task_id !== envelope.task_id) {
+        this.store.createCheckpoint(projectId, envelope.task_id, envelope.dispatch_id);
+      }
+    }
+    this.store.writeState(projectId, { current_dispatch_id: envelope.dispatch_id });
     if (type === "ANALYZE") {
       this.store.writeState(projectId, { pending: { text: "DeepSeek 正在分析项目…（执行窗口可实时查看）", ts: nowIso(), type: "ANALYZE", request: requestOrTask } });
       this.store.transition(projectId, "ANALYZING");
@@ -554,13 +624,25 @@ export class Orchestrator {
     this.store.clearOutbox(projectId);
 
     if (epoch !== this.projectEpoch(projectId)) return null;
-    const result = await this.runner.run(projectId, dirs, envelope, this.store);
+    let result;
+    try {
+      result = await this.runner.run(projectId, dirs, envelope, this.store);
+    } catch (error) {
+      if (type === "EXECUTE_PLAN") return this.retryTaskAfterFailure(projectId, envelope, error.message, error.code || "RUNNER_ERROR");
+      throw error;
+    }
     const fresh = this.store.readState(projectId);
     if (result?.cancelled || epoch !== this.projectEpoch(projectId) || !fresh || fresh.state === "PAUSED") {
       this.log("info", projectId, "忽略已取消执行的迟到结果");
       return null;
     }
-    const outcome = await this.handleExecutorResult(projectId, result, envelope);
+    let outcome;
+    try {
+      outcome = await this.handleExecutorResult(projectId, result, envelope);
+    } catch (error) {
+      if (type === "EXECUTE_PLAN") return this.retryTaskAfterFailure(projectId, envelope, error.message, error.code || "EXECUTOR_RESULT_ERROR");
+      throw error;
+    }
     // 更新项目级上下文缓存基线：复用会话→记录已发送状态（下个任务增量）；新会话→重置（下个任务全量）
     if (result?.freshSession) {
       this.store.writeState(projectId, { context_cache: null });
@@ -569,6 +651,48 @@ export class Orchestrator {
     }
     await this.maybeCompactSession(projectId);
     return outcome;
+  }
+
+  async retryTaskAfterFailure(projectId, envelope, summary, code = "TASK_FAILED") {
+    let st = this.store.readState(projectId);
+    const taskId = envelope.task_id || envelope.current_task?.id;
+    const task = st?.plan?.parsed?.tasks?.find((item) => item.id === taskId) || st?.current_task || envelope.current_task;
+    const currentAttempt = Number(envelope.attempt || 1);
+    const maxAttempts = Math.min(10, Math.max(1, Number(task?.max_attempts || this.cfg.deepseek?.maxRetries || 2)));
+    try {
+      this.store.restoreCheckpoint(projectId);
+      this.log("warn", projectId, `任务 ${taskId} 失败后已恢复检查点（${code}）`);
+    } catch (error) {
+      this.store.writeState(projectId, {
+        state: "ERROR",
+        error_count: this.maxConsecutiveErrors + 1,
+        last_error: `CHECKPOINT_RESTORE: ${error.message}`,
+        pending: { text: `恢复检查点失败，已停止任务：${error.message}`, ts: nowIso(), retryState: "ERROR", errorCode: "CHECKPOINT_RESTORE" },
+      });
+      return null;
+    }
+    st = this.store.readState(projectId);
+    if (currentAttempt < maxAttempts) {
+      const nextAttempt = currentAttempt + 1;
+      const context = this.buildExecutorContext(projectId, st, `${code}: ${summary}`);
+      this.store.writeWorkspaceFile(projectId, "executor_context.md", context);
+      this.store.writeState(projectId, { pending: { text: `任务 ${taskId} 已回滚，正在重试 ${nextAttempt}/${maxAttempts}…`, ts: nowIso(), type: "EXECUTE_PLAN" } });
+      const nextEnvelope = this.buildEnvelope(projectId, st, "EXECUTE_PLAN", task, null, nextAttempt);
+      return this.dispatchExecutor(projectId, "EXECUTE_PLAN", task, nextEnvelope, nextAttempt);
+    }
+    const failed = (st.failed_tasks || []).filter((item) => item.id !== taskId);
+    failed.push({ id: taskId, ts: nowIso(), summary: String(summary || "未知失败"), attempt: currentAttempt, code });
+    this.store.writeState(projectId, { failed_tasks: failed, current_dispatch_id: null });
+    const query = wrapDeepseekQuery({
+      type: "DECISION_REQUIRED",
+      context: `项目 ${st.project_name}：任务已恢复到执行前检查点。`,
+      problem: `任务 ${taskId}${task?.description ? `（${task.description}）` : ""} 连续失败 ${maxAttempts} 次：${summary}`,
+      options: "A: 修改任务方案后重试\nB: 从计划中移除该任务",
+      recommendation: "请重新规划该任务，避免重复相同失败。",
+      question: "请决策如何继续。",
+    });
+    await this.sendToGpt(projectId, "QUERY", query);
+    return this.store.transition(projectId, "WAITING_FOR_GPT", { pending: { text: `任务 ${taskId} 已回滚，等待 GPT 调整计划。`, ts: nowIso(), retryState: "PLAN_READY" } });
   }
 
   recordExecutorUsage(projectId, result, envelope, completed) {
@@ -630,8 +754,29 @@ export class Orchestrator {
   async handleExecutorResult(projectId, result, envelope) {
     let st = this.store.readState(projectId);
     if (!st) return null;
-    const outbox = this.store.readOutbox(projectId);
-    const usageRecord = this.recordExecutorUsage(projectId, result, envelope, outbox?.type === "TASK_DONE");
+    const outboxStatus = this.store.readOutboxStatus(projectId);
+    const outbox = outboxStatus.data;
+    if (outbox) {
+      const checked = validateExecutorOutbox(outbox, envelope, st.processed_dispatch_ids || []);
+      if (!checked.ok) {
+        this.store.clearOutbox(projectId);
+        const error = new Error(checked.error);
+        error.code = checked.code;
+        throw error;
+      }
+    } else if (outboxStatus.exists) {
+      this.store.clearOutbox(projectId);
+      const error = new Error("outbox/message.json 未完成原子写入或 JSON 不完整");
+      error.code = "OUTBOX_INCOMPLETE";
+      throw error;
+    }
+    let validationResult = null;
+    if (outbox?.type === "TASK_DONE" && envelope.type === "EXECUTE_PLAN" && envelope.current_task?.validation) {
+      validationResult = await runValidationCommand(envelope.current_task.validation, this.store.sourceDir(projectId), envelope.timeoutMs || 300000);
+      validationResult = { ...validationResult, task_id: envelope.task_id, ts: nowIso() };
+      this.store.writeState(projectId, { validation_results: { ...(st.validation_results || {}), [envelope.task_id]: validationResult } });
+    }
+    const usageRecord = this.recordExecutorUsage(projectId, result, envelope, outbox?.type === "TASK_DONE" && validationResult?.ok !== false);
     st = this.store.readState(projectId);
     const runs = [...(st.executor_runs || [])];
     runs.push({
@@ -642,8 +787,11 @@ export class Orchestrator {
       visible: !!result.visible,
       model: result.actualModel || null,
       usage: usageRecord,
+      validation: validationResult,
+      resumed: !!result.resumed,
     });
-    this.store.writeState(projectId, { executor_runs: runs.slice(-100) });
+    const processed = outbox ? [...new Set([...(st.processed_dispatch_ids || []), outbox.dispatch_id])].slice(-200) : (st.processed_dispatch_ids || []);
+    this.store.writeState(projectId, { executor_runs: runs.slice(-100), processed_dispatch_ids: processed });
     this.store.clearOutbox(projectId);
 
     if (!outbox) {
@@ -656,6 +804,11 @@ export class Orchestrator {
             : new Error(`执行者退出（exitCode=${result.exitCode}）但未写 outbox/message.json`);
       err.code = result.timedOut ? "RUNNER_TIMEOUT" : result.uiCrashed ? "RUNNER_UI_CRASH" : "RUNNER_NO_OUTBOX";
       throw err;
+    }
+
+    if (validationResult && !validationResult.ok) {
+      this.log("warn", projectId, `任务 ${envelope.task_id} 验证失败: ${validationResult.command}`);
+      return this.retryTaskAfterFailure(projectId, envelope, `验证失败（exit=${validationResult.exit_code}）：${validationResult.output}`, "VALIDATION_FAILED");
     }
 
     if (outbox.type === "TASK_DONE") {
@@ -679,6 +832,7 @@ export class Orchestrator {
           pending: { text: "分析已发送给 GPT，等待决策…", ts: nowIso() },
           review_requested: st.review_requested || false,
         });
+        this.store.writeState(projectId, { current_dispatch_id: null });
         return this.store.transition(projectId, "WAITING_FOR_GPT");
       }
       // 普通任务完成
@@ -689,7 +843,8 @@ export class Orchestrator {
         report_file: outbox.report_file || null,
         summary: outbox.summary || "",
       });
-      this.store.writeState(projectId, { completed_tasks: completed });
+      this.store.clearCheckpoint(projectId);
+      this.store.writeState(projectId, { completed_tasks: completed, current_dispatch_id: null });
       this.log("info", projectId, `任务完成并记录: ${outbox.task_id}（已完成 ${completed.length} 项）`);
       if (this.store.readState(projectId)?.pending_model_replan?.status === "waiting_task") {
         return this.beginModelReplan(projectId);
@@ -699,35 +854,12 @@ export class Orchestrator {
 
     if (outbox.type === "TASK_FAILED") {
       const taskId = outbox.task_id || envelope.current_task?.id;
-      const task = st.plan?.parsed?.tasks?.find((t) => t.id === taskId) || st.current_task;
-      const maxRetries = this.cfg.deepseek?.maxRetries ?? 2;
-      const currentAttempt = envelope.attempt || 1;
-      const attemptNo = currentAttempt + 1;
-      if (attemptNo <= maxRetries) {
-        this.log("warn", projectId, `任务 ${taskId} 失败（第 ${currentAttempt} 次），自动重试 ${attemptNo}/${maxRetries}`);
-        this.store.writeState(projectId, { pending: { text: `任务 ${taskId} 失败，自动重试…`, ts: nowIso() } });
-        const envelope2 = this.buildEnvelope(projectId, st, "EXECUTE_PLAN", task, null, attemptNo);
-        return this.dispatchExecutor(projectId, "EXECUTE_PLAN", task, envelope2, attemptNo);
+      if (envelope.type !== "EXECUTE_PLAN") {
+        const error = new Error(outbox.summary || `${taskId} 失败`);
+        error.code = "TASK_FAILED";
+        throw error;
       }
-      const failed = (st.failed_tasks || []).filter((item) => item.id !== taskId);
-      failed.push({ id: taskId, ts: nowIso(), summary: outbox.summary || "", attempt: currentAttempt });
-      this.store.writeState(projectId, { failed_tasks: failed });
-      if (this.store.readState(projectId)?.pending_model_replan?.status === "waiting_task") {
-        return this.beginModelReplan(projectId);
-      }
-      // 多次失败 → 询问 GPT
-      this.log("warn", projectId, `任务 ${taskId} 连续失败 ${maxRetries} 次，询问 GPT`);
-      const report = this.store.readFileSafe(projectId, outbox.report_file || "") || "";
-      const query = wrapDeepseekQuery({
-        type: "DECISION_REQUIRED",
-        context: `项目 ${st.project_name}：已完成 ${(st.completed_tasks || []).length} 项任务。`,
-        problem: `任务 ${taskId}（${task?.description || ""}）连续失败 ${maxRetries} 次：${outbox.summary || "未知原因"}`,
-        options: report ? `执行报告摘录：\n${this.truncate(report, 4000)}` : "A: 修改任务方案后重试\nB: 放弃该任务并调整计划\nC: 其他",
-        recommendation: "请重新规划该任务（给出更可行的方案）或从计划中移除。",
-        question: "请决策：如何继续？",
-      });
-      await this.sendToGpt(projectId, "QUERY", query);
-      return this.store.transition(projectId, "WAITING_FOR_GPT");
+      return this.retryTaskAfterFailure(projectId, envelope, outbox.summary || `任务 ${taskId} 失败`, "TASK_FAILED");
     }
 
     if (outbox.type === "ASK_GPT") {
@@ -741,6 +873,7 @@ export class Orchestrator {
         question: outbox.question || "请给出决策。",
       });
       await this.sendToGpt(projectId, "QUERY", query);
+      this.store.writeState(projectId, { current_dispatch_id: null });
       return this.store.transition(projectId, "WAITING_FOR_GPT");
     }
 
@@ -1143,6 +1276,7 @@ export class Orchestrator {
     if (opts.deepseek_selection) {
       this.store.writeState(id, { deepseek_selection: opts.deepseek_selection });
     }
+    if (opts.executor_type) await this.selectExecutor(id, opts.executor_type);
     this.startLoop(id);
     return id;
   }
@@ -1188,6 +1322,20 @@ export class Orchestrator {
     });
     if (canReplan && !busy && !gptBusy && !paused) await this.beginModelReplan(projectId);
     return sel;
+  }
+
+  async selectExecutor(projectId, type) {
+    const st = this.store.readState(projectId);
+    if (!st) throw new Error(`项目不存在: ${projectId}`);
+    if (this.runner.isRunning?.(projectId)) throw new Error("执行中不能切换执行器");
+    const selected = String(type || "deepseek");
+    const available = this.runner.available?.() || [];
+    const entry = available.find((item) => item.type === selected);
+    if (!entry) throw new Error(`未知执行器: ${selected}`);
+    if (!entry.configured) throw new Error(`${entry.label} 尚未配置`);
+    const executor = { type: selected, capabilities: this.runner.capabilities(selected) };
+    this.store.writeState(projectId, { executor, session: selected === "deepseek" ? st.session : null, context_cache: null });
+    return executor;
   }
 
   async compactSession(projectId) {
@@ -1296,6 +1444,39 @@ export class Orchestrator {
       pending: { text: "用户点击重试。", ts: nowIso(), retryState: retry },
     });
     return this.store.transition(projectId, retry);
+  }
+
+  async retryTask(projectId) {
+    const st = this.store.readState(projectId);
+    if (!st) throw new Error(`项目不存在: ${projectId}`);
+    if (this.runner.isRunning?.(projectId)) throw new Error("当前任务仍在执行");
+    const task = st.current_task || st.plan?.parsed?.tasks?.find((item) => (st.failed_tasks || []).some((failed) => failed.id === item.id));
+    if (!task) throw new Error("没有可重试的任务");
+    const failed = (st.failed_tasks || []).filter((item) => item.id !== task.id);
+    this.store.writeState(projectId, {
+      current_task: task,
+      failed_tasks: failed,
+      error_count: 0,
+      current_dispatch_id: null,
+      pending: { text: `用户重试任务 ${task.id}。`, ts: nowIso(), retryState: "EXECUTING" },
+    });
+    this.store.clearOutbox(projectId);
+    this.store.transition(projectId, "EXECUTING");
+    this.startLoop(projectId);
+    return this.store.readState(projectId);
+  }
+
+  async restoreCheckpoint(projectId) {
+    const st = this.store.readState(projectId);
+    if (!st) throw new Error(`项目不存在: ${projectId}`);
+    if (this.runner.isRunning?.(projectId)) throw new Error("执行中不能手动恢复检查点");
+    const restored = this.store.restoreCheckpoint(projectId);
+    this.store.writeState(projectId, { pending: { text: `已恢复任务 ${restored.task_id} 的检查点。`, ts: nowIso(), retryState: st.state } });
+    return restored;
+  }
+
+  exportAudit(projectId) {
+    return this.store.exportAudit(projectId);
   }
 
   async injectMessage(projectId, text, attachments = []) {

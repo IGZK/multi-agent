@@ -1,107 +1,110 @@
-// Dashboard 前端：轮询 API，展示项目状态并支持控制
-const $ = (sel) => document.querySelector(sel);
-const $$ = (sel) => document.querySelectorAll(sel);
+const $ = (selector) => document.querySelector(selector);
+const $$ = (selector) => [...document.querySelectorAll(selector)];
+const icon = (name, alt = "") => `<img class="ui-icon" src="/assets/icons/${name}.svg" alt="${escapeHtml(alt)}" />`;
 
 let currentProjectId = null;
 let projectsCache = [];
-let modelCatalog = null; // { groups:[{id,name,models:[{id,name}]}], reasoningEfforts, current, fallback }
+let modelCatalog = null;
+let systemCache = null;
 let showArchived = false;
+let lastTasksSig = null;
+let lastChatSig = null;
+let lastChatCount = 0;
+let windowVisible = null;
 
 const STATE_META = {
-  INIT: ["初始化", "info"],
-  WAITING_FOR_LOGIN: ["等待登录 ChatGPT", "wait"],
-  GPT_PLANNING: ["GPT 规划中", "run"],
-  PLAN_READY: ["规划就绪", "info"],
-  EXECUTING: ["DeepSeek 执行中", "run"],
-  WAITING_FOR_EXECUTOR: ["DeepSeek 执行中", "run"],
-  ANALYZING: ["DeepSeek 分析中", "run"],
-  WAITING_FOR_GPT: ["等待 GPT 决策", "run"],
-  GPT_REVIEW: ["GPT 审查中", "run"],
-  DECISION_REQUIRED: ["决策中", "run"],
-  REPLANNING: ["GPT 重规划", "run"],
-  ERROR: ["错误", "err"],
-  COMPLETED: ["已完成", "ok"],
-  CANCELED: ["已取消", "err"],
-  PAUSED: ["已暂停", "wait"],
+  INIT: ["初始化", "info"], WAITING_FOR_LOGIN: ["等待登录", "wait"], GPT_PLANNING: ["GPT 规划中", "run"],
+  PLAN_READY: ["规划就绪", "info"], EXECUTING: ["执行中", "run"], WAITING_FOR_EXECUTOR: ["执行中", "run"],
+  ANALYZING: ["分析中", "run"], WAITING_FOR_GPT: ["等待 GPT", "run"], GPT_REVIEW: ["GPT 审查中", "run"],
+  DECISION_REQUIRED: ["决策中", "run"], REPLANNING: ["重新规划", "run"], ERROR: ["错误", "err"],
+  COMPLETED: ["已完成", "ok"], CANCELED: ["已取消", "err"], PAUSED: ["已暂停", "wait"],
 };
 
-function badge(state) {
-  const [label, cls] = STATE_META[state] || [state, ""];
-  const el = $("#dState");
-  el.textContent = label;
-  el.className = `badge ${cls}`;
-  const cp = $("#curpState");
-  if (cp) { cp.textContent = label; cp.className = `badge ${cls}`; }
-}
-
-async function api(path, opts) {
-  let res;
-  try {
-    res = await fetch(path, opts);
-  } catch {
-    throw new Error("工作台后台未运行，请重新运行 start.bat 后重试");
+async function api(url, options) {
+  let response;
+  try { response = await fetch(url, options); }
+  catch { throw new Error("工作台后台未运行，请重新启动后再试"); }
+  if (!response.ok) {
+    let message = `HTTP ${response.status}`;
+    try { message = (await response.json()).error || message; } catch { /* empty */ }
+    throw new Error(message);
   }
-  if (!res.ok) {
-    let msg = `HTTP ${res.status}`;
-    try { const j = await res.json(); if (j && j.error) msg = j.error; } catch { /* ignore */ }
-    throw new Error(msg);
-  }
-  return res.json();
+  return response.json();
 }
 
-// 调用后端原生文件夹选择器，返回 { path, canceled }
-async function pickFolder(startDir) {
-  return await api("/api/pickdir", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ start_dir: startDir || "" }),
-  });
-}
-
-// 模型下拉框选项值格式：`provider/model`
-function modelValue(provider, model) { return `${provider}/${model}`; }
-function splitModelValue(v) {
-  const i = (v || "").indexOf("/");
-  if (i < 0) return null;
-  return { provider: v.slice(0, i), model: v.slice(i + 1) };
-}
-
-function tokenTotal(tokens) {
-  if (!tokens) return null;
-  return ["uncachedInputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens"]
-    .reduce((sum, key) => sum + Number(tokens[key] || 0), 0);
+function escapeHtml(value) {
+  return String(value ?? "").replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[char]);
 }
 
 function fmtTokens(value) {
-  const n = Number(value || 0);
-  return n >= 1000000 ? `${(n / 1000000).toFixed(1)}M` : n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n);
+  const number = Number(value || 0);
+  if (number >= 1_000_000) return `${(number / 1_000_000).toFixed(1)}M`;
+  if (number >= 1_000) return `${(number / 1_000).toFixed(1)}k`;
+  return String(number);
 }
 
-// 拉取 DeepSeek 可用模型目录并填充所有下拉框（一次探测，多次复用）
+function tokenTotal(tokens) {
+  return ["uncachedInputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens"]
+    .reduce((sum, key) => sum + Number(tokens?.[key] || 0), 0);
+}
+
+function fmtDuration(seconds) {
+  const value = Math.max(0, Number(seconds || 0));
+  if (value < 60) return `${Math.round(value)}s`;
+  const minutes = Math.floor(value / 60);
+  if (minutes < 60) return `${minutes}分${Math.round(value % 60)}s`;
+  return `${Math.floor(minutes / 60)}时${minutes % 60}分`;
+}
+
+function fmtTime(value) {
+  return value ? String(value).replace("T", " ").slice(0, 19) : "—";
+}
+
+function stateMeta(state) { return STATE_META[state] || [state || "未知", "info"]; }
+
+function updateBadge(state) {
+  const [label, style] = stateMeta(state);
+  for (const selector of ["#dState", "#curpState"]) {
+    const node = $(selector);
+    if (node) { node.textContent = label; node.className = `badge ${style}`; }
+  }
+}
+
+function callout(node, visible, title, detail = "") {
+  if (!node) return;
+  node.classList.toggle("hidden", !visible);
+  if (!visible) return;
+  node.innerHTML = `<div class="callout-title">${escapeHtml(title)}</div>${detail ? `<div class="callout-sub">${detail}</div>` : ""}`;
+}
+
+function closeMenus() { $$('details[open]').forEach((details) => details.removeAttribute("open")); }
+
+function modelValue(provider, model) { return `${provider}/${model}`; }
+function splitModelValue(value) {
+  const index = String(value || "").indexOf("/");
+  return index < 0 ? null : { provider: value.slice(0, index), model: value.slice(index + 1) };
+}
+
 async function loadModelCatalog(force = false) {
   if (modelCatalog && !force) return modelCatalog;
-  try {
-    modelCatalog = await api("/api/deepseek/models");
-  } catch (e) {
-    console.error("加载 DeepSeek 模型目录失败", e);
-    modelCatalog = { groups: [], reasoningEfforts: ["off", "low", "high", "max"], current: null, fallback: true };
-  }
+  try { modelCatalog = await api("/api/deepseek/models"); }
+  catch { modelCatalog = { groups: [], reasoningEfforts: ["off", "low", "high", "max"], fallback: true }; }
   return modelCatalog;
 }
 
 function fillModelSelect(select) {
   if (!select) return;
-  const prev = select.value;
+  const previous = select.value;
   select.innerHTML = '<option value="">跟随 DeepSeek 默认</option>';
-  for (const g of (modelCatalog?.groups || [])) {
-    for (const m of (g.models || [])) {
-      const opt = document.createElement("option");
-      opt.value = modelValue(g.id, m.id);
-      opt.textContent = `${m.name || m.id}（${g.name || g.id}）`;
-      select.appendChild(opt);
+  for (const group of modelCatalog?.groups || []) {
+    for (const model of group.models || []) {
+      const option = document.createElement("option");
+      option.value = modelValue(group.id, model.id);
+      option.textContent = `${model.name || model.id}（${group.name || group.id}）`;
+      select.appendChild(option);
     }
   }
-  if (prev) select.value = prev;
+  if (previous) select.value = previous;
 }
 
 async function populateModelSelects() {
@@ -111,360 +114,284 @@ async function populateModelSelects() {
 }
 
 function selectedModelPayload() {
-  const v = splitModelValue($("#dsModel").value);
-  const effort = $("#dsReasoning").value;
-  if (!v) return null;
-  return { provider: v.provider, model: v.model, reasoningEffort: effort };
+  const selected = splitModelValue($("#dsModel").value);
+  if (!selected) return null;
+  return { ...selected, reasoningEffort: $("#dsReasoning").value };
 }
 
 async function refresh() {
   try {
     const data = await api("/api/projects");
     projectsCache = data.projects || [];
+    systemCache = data.system || null;
     renderProjectList();
-    renderSysStatus(data.system);
-    if (currentProjectId) {
-      await refreshDetail();
-    }
-  } catch (e) {
-    console.error("refresh failed", e);
-    $("#sysStatus").textContent = e.message;
+    renderSystem(data.system);
+    if (currentProjectId) await refreshDetail();
+  } catch (error) {
+    $("#sysStatus").textContent = error.message;
   }
 }
 
-function renderSysStatus(system) {
-  const parts = [];
-  if (system) {
-    const b = system.bridge || {};
-    const r = system.runner || {};
-    const live = b.live || {};
-    if (live.phase && live.phase !== "idle") {
-      const labels = {
-        navigating: "🧭 打开 ChatGPT…",
-        sending: "📤 发送消息…",
-        waiting_reply: "⏳ 等待 GPT 回复…",
-        thinking: "💭 GPT 正在思考…",
-        answering: "✍️ GPT 正在回答…",
-        complete: "✅ GPT 回复完成",
-      };
-      const t = Math.max(0, Math.round((live.elapsedMs || 0) / 1000));
-      const chars = live.replyChars ? ` · ${live.replyChars} 字` : "";
-      parts.push(`<span class="${live.slow ? "live-slow" : ""}">${live.slow ? "⚠️ 可能卡住 · " : ""}${labels[live.phase] || live.phase} ${t}s${chars}</span>`);
-    }
-    parts.push(`<span>${b.browserOk ? '<span class="dot ok"></span>浏览器' : '<span class="dot bad"></span>浏览器未连接'}</span>`);
-    parts.push(`<span>${b.loggedIn ? '<span class="dot ok"></span>ChatGPT 已登录' : b.loading ? '<span class="dot wait"></span>ChatGPT 加载中' : '<span class="dot wait"></span>ChatGPT 未登录/需处理'}</span>`);
-    parts.push(`<span>GPT桥: ${system.mode?.gpt || "?"}</span>`);
-    parts.push(`<span>执行者: ${system.mode?.deepseek || "?"}${(r.active || []).length ? `（${r.active.length} 个运行中）` : ""}${(r.uis || []).length ? ` · 🖥 ${r.uis.length} 个执行窗口` : ""}</span>`);
-  }
-  $("#sysStatus").innerHTML = parts.join("");
-  $("#sysInfo").textContent = "工作台运行中。\n项目数据保存在 projects/ 目录，\n重启后自动断点恢复。";
+function renderSystem(system) {
+  const bridge = system?.bridge || {};
+  const runner = system?.runner || {};
+  const running = runner.active?.length || 0;
+  const healthy = bridge.browserOk !== false;
+  const primary = running ? `${running} 个任务运行中` : healthy ? "系统正常" : "需要处理";
+  $("#sysStatus").innerHTML = `
+    <span class="status-item"><span class="status-mark ${healthy ? "ok" : "warn"}"></span>${escapeHtml(primary)}</span>
+    <span class="status-item secondary-status"><span class="status-mark ${bridge.loggedIn ? "ok" : "warn"}"></span>${bridge.loggedIn ? "ChatGPT 已连接" : "ChatGPT 待登录"}</span>
+    <span class="status-item hide-narrow">${escapeHtml(system?.mode?.gpt || "GPT")} · ${escapeHtml(system?.mode?.deepseek || "执行器")}</span>`;
+  $("#sysInfo").textContent = `数据保存在 projects 目录\n${running ? `${running} 个执行任务正在运行` : "当前没有运行中的执行任务"}`;
 }
 
 function renderProjectList() {
-  const ul = $("#projList");
-  ul.innerHTML = "";
-  const active = projectsCache.filter((p) => !p.archived);
-  const archived = projectsCache.filter((p) => p.archived);
-
-  if (projectsCache.length === 0) {
-    ul.innerHTML = '<li class="p-name" style="color:var(--dim)">暂无项目</li>';
+  const list = $("#projList");
+  list.innerHTML = "";
+  const active = projectsCache.filter((project) => !project.archived);
+  const archived = projectsCache.filter((project) => project.archived);
+  if (!projectsCache.length) {
+    list.innerHTML = '<li class="proj-empty">暂无项目</li>';
     return;
   }
 
-  const renderItem = (p) => {
-    const li = document.createElement("li");
-    if (p.id === currentProjectId) li.classList.add("active");
-    if (p.archived) li.classList.add("archived");
-    const [label, cls] = STATE_META[p.state] || [p.state, ""];
-    li.innerHTML = `
-      <div class="p-name">${escapeHtml(p.name || p.id)}</div>
-      <div class="p-meta"><span class="badge ${cls}" style="padding:2px 8px;font-size:11px">${label}</span> · ${(p.updated_at || "").replace("T", " ").slice(0, 16)}</div>
-      <div class="p-actions">
-        <button data-act="rename" title="重命名">✎ 重命名</button>
-        <button data-act="archive" title="归档/取消归档">${p.archived ? "🗂 取消归档" : "🗄 归档"}</button>
-        <button data-act="delete" class="danger" title="删除项目（不可恢复）">🗑 删除</button>
-      </div>`;
-    li.onclick = () => selectProject(p.id);
-    li.querySelectorAll("button[data-act]").forEach((btn) => {
-      btn.onclick = (e) => { e.stopPropagation(); projectAction(p, btn.dataset.act); };
+  const addProject = (project) => {
+    const row = document.createElement("li");
+    row.className = `project-row${project.id === currentProjectId ? " active" : ""}${project.archived ? " archived" : ""}`;
+    const [state, style] = stateMeta(project.state);
+    row.innerHTML = `
+      <button class="project-select" type="button" aria-label="打开项目 ${escapeHtml(project.name || project.id)}">
+        <span class="project-name">${escapeHtml(project.name || project.id)}</span>
+        <span class="project-meta"><span class="status-mark ${style === "ok" ? "ok" : style === "err" ? "bad" : style === "wait" ? "warn" : ""}"></span>${escapeHtml(state)} · ${escapeHtml(fmtTime(project.updated_at).slice(0, 16))}</span>
+      </button>
+      <details class="row-menu"><summary class="icon-button" title="项目操作" aria-label="${escapeHtml(project.name || project.id)} 的项目操作">${icon("ellipsis")}</summary>
+        <div class="row-menu-panel"><button data-act="rename" type="button">${icon("square-pen")}重命名</button><button data-act="archive" type="button">${icon("archive")}${project.archived ? "取消归档" : "归档"}</button><button data-act="delete" class="danger" type="button">${icon("trash-2")}删除</button></div>
+      </details>`;
+    row.querySelector(".project-select").onclick = () => selectProject(project.id);
+    row.querySelectorAll("[data-act]").forEach((button) => {
+      button.onclick = (event) => { event.stopPropagation(); projectAction(project, button.dataset.act); };
     });
-    ul.appendChild(li);
+    list.appendChild(row);
   };
 
-  // 分组：按项目源码所在工作目录分组，避免维护与文件位置脱节的额外配置。
-  const groups = new Map();
-  for (const p of active) {
-    const key = p.source_dir || "工作台默认目录";
-    if (!groups.has(key)) groups.set(key, []);
-    groups.get(key).push(p);
-  }
-  for (const [location, items] of [...groups.entries()].sort((a, b) => a[0].localeCompare(b[0], "zh-CN"))) {
-    const h = document.createElement("div");
-    h.className = "proj-group";
-    h.title = location;
-    h.textContent = `⌂ ${location}（${items.length}）`;
-    ul.appendChild(h);
-    items.forEach(renderItem);
-  }
-
-  // 归档区
-  if (archived.length > 0) {
-    const toggle = document.createElement("div");
+  active.forEach(addProject);
+  if (archived.length) {
+    const toggle = document.createElement("li");
     toggle.className = "archived-toggle";
-    toggle.textContent = `${showArchived ? "▾" : "▸"} 已归档（${archived.length}）`;
+    toggle.textContent = `${showArchived ? "隐藏" : "显示"}已归档（${archived.length}）`;
     toggle.onclick = () => { showArchived = !showArchived; renderProjectList(); };
-    ul.appendChild(toggle);
-    if (showArchived) archived.forEach(renderItem);
+    list.appendChild(toggle);
+    if (showArchived) archived.forEach(addProject);
   }
 }
 
-async function projectAction(p, act) {
-  const id = p.id;
-  if (act === "rename") {
-    const name = prompt("重命名项目：", p.name || p.id);
-    if (!name || !name.trim()) return;
-    await actionWith("rename", { name: name.trim() }, id);
-  } else if (act === "archive") {
-    await actionWith("archive", { archived: !p.archived }, id);
-  } else if (act === "delete") {
-    if (!confirm(`确认删除项目「${p.name}」？\n该操作会删除项目目录与全部执行记录，不可恢复。`)) return;
-    await actionWith("delete", {}, id);
-    if (currentProjectId === id) {
-      currentProjectId = null;
-      $("#detail").classList.add("hidden");
-      $("#createView").classList.add("hidden");
-      $("#emptyHint").classList.remove("hidden");
-      const curpBox = $("#currentProjBox");
-      if (curpBox) curpBox.classList.add("hidden");
-    }
+async function projectAction(project, actionName) {
+  if (actionName === "rename") {
+    const name = prompt("重命名项目：", project.name || project.id);
+    if (name?.trim()) await actionWith("rename", { name: name.trim() }, project.id);
+  } else if (actionName === "archive") {
+    await actionWith("archive", { archived: !project.archived }, project.id);
+  } else if (actionName === "delete") {
+    if (!confirm(`确认删除项目「${project.name}」？\n该操作不可恢复。`)) return;
+    await actionWith("delete", {}, project.id);
+    if (currentProjectId === project.id) showEmptyView();
   }
 }
 
-// 针对指定项目发 action 请求（区别于当前项目）
-async function actionWith(action, payload, id = currentProjectId) {
-  if (!id) return;
-  try {
-    await api(`/api/projects/${encodeURIComponent(id)}/action`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ action, ...payload }),
-    });
-    await refresh();
-  } catch (e) { alert(`操作失败: ${e.message}`); }
+function showEmptyView() {
+  currentProjectId = null;
+  $("#detail").classList.add("hidden");
+  $("#createView").classList.add("hidden");
+  $("#emptyHint").classList.remove("hidden");
+  $("#currentProjBox").classList.add("hidden");
 }
 
-function selectProject(id) {
-  currentProjectId = id;
-  lastChatSig = null;
-  lastChatCount = 0;
-  lastTasksSig = null;
+async function actionWith(actionName, payload = {}, projectId = currentProjectId) {
+  if (!projectId) return null;
+  const result = await api(`/api/projects/${encodeURIComponent(projectId)}/action`, {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: actionName, ...payload }),
+  });
+  await refresh();
+  return result;
+}
+
+function selectProject(projectId) {
+  currentProjectId = projectId;
+  lastChatSig = null; lastChatCount = 0; lastTasksSig = null;
   $("#emptyHint").classList.add("hidden");
   $("#createView").classList.add("hidden");
   $("#detail").classList.remove("hidden");
-  const curpBox = $("#currentProjBox");
-  if (curpBox) curpBox.classList.remove("hidden");
+  $("#currentProjBox").classList.remove("hidden");
   refreshDetail();
 }
 
 async function refreshDetail() {
   if (!currentProjectId) return;
   try {
-    const d = await api(`/api/projects/${encodeURIComponent(currentProjectId)}`);
-    $("#dName").textContent = `${d.name}（${d.id}）`;
-    const curpName = $("#curpName");
-    if (curpName) curpName.textContent = d.name;
-    const curpBox = $("#currentProjBox");
-    if (curpBox) curpBox.classList.remove("hidden");
-    badge(d.state);
-    $("#dMeta").innerHTML = `
-      状态机：<b>${d.state}</b> ← ${d.previous_state || "-"} ｜ 更新：${(d.updated_at || "").replace("T", " ").slice(0, 19)}
-      ｜ 错误次数：${d.error_count} ｜ GPT 会话：${d.gpt?.conversation_url ? `<a href="${escapeHtml(d.gpt.conversation_url)}" target="_blank">打开</a>` : "（未创建）"}
-      ｜ 模型：${escapeHtml(d.gpt?.model_selected || "默认")}`;
-    $("#dMeta").innerHTML += `<br>GPT 上下文文件: <code>${escapeHtml(d.workspace_dir || "")}</code> ｜ 源码目录: <code>${escapeHtml(d.source_dir || "")}</code>`;
-    $("#dMeta").innerHTML += `<br>${d.archived ? "已归档 ｜ " : ""}DeepSeek 模型：${d.deepseek_selection?.model ? escapeHtml(`${d.deepseek_selection.provider || "deepseek-official"}/${d.deepseek_selection.model}${d.deepseek_selection.reasoningEffort ? " · 推理=" + d.deepseek_selection.reasoningEffort : ""}`) : "跟随默认"}`;
-    const dst = d.usage?.deepseek?.totals || {};
-    const ctx = d.usage?.deepseek?.context;
-    const gu = d.usage?.gpt || {};
-    $("#dMeta").innerHTML += `<br>DeepSeek Token（真实）：输入 ${fmtTokens(dst.uncachedInputTokens)} · 输出 ${fmtTokens(dst.outputTokens)} · 缓存读 ${fmtTokens(dst.cacheReadTokens)} · 缓存写 ${fmtTokens(dst.cacheWriteTokens)}${ctx?.percentage != null ? ` ｜ 上下文 ${ctx.percentage}%` : " ｜ 上下文投影不可用"} ｜ GPT Token（估算）：输入 ${fmtTokens(gu.estimatedInputTokens)} · 输出 ${fmtTokens(gu.estimatedOutputTokens)}`;
-    if (d.compaction?.pending) $("#dMeta").innerHTML += "<br>会话压缩：已排队，将在当前任务结束后执行";
-    // 项目文件夹：空路径显示占位，长路径 title 全文
-    const dirHint = $("#dirHint");
-    if (dirHint) {
-      const src = d.source_dir || "";
-      dirHint.textContent = src || "默认工作台目录（未指定）";
-      dirHint.title = src || "默认工作台目录（未指定）";
-      dirHint.dataset.path = src;
-      dirHint.classList.toggle("empty", !src);
-    }
-    const composerDirLabel = $("#composerDirLabel");
-    if (composerDirLabel) {
-      composerDirLabel.textContent = d.source_dir || "默认工作目录";
-      composerDirLabel.title = d.source_dir || "默认工作目录";
-    }
+    const detail = await api(`/api/projects/${encodeURIComponent(currentProjectId)}`);
+    $("#dName").textContent = detail.name || detail.id;
+    $("#dName").title = detail.id;
+    $("#curpName").textContent = detail.name || detail.id;
+    updateBadge(detail.state);
 
-    // 同步本项目 DeepSeek 模型选择到 Composer（正在编辑时不做覆盖）
+    const sourceDir = detail.source_dir || "";
+    $("#dirHint").textContent = sourceDir || "默认工作台目录";
+    $("#dirHint").title = sourceDir || "默认工作台目录";
+    $("#dirHint").dataset.path = sourceDir;
+    $("#composerDirLabel").textContent = sourceDir || "默认工作目录";
+    $("#composerDirLabel").title = sourceDir || "默认工作目录";
+
+    const selection = detail.deepseek_selection;
     if (document.activeElement !== $("#cModel") && document.activeElement !== $("#cReasoning")) {
-      const sel = d.deepseek_selection;
-      const val = sel?.model ? modelValue(sel.provider || "deepseek-official", sel.model) : "";
-      if ($("#cModel").value !== val) $("#cModel").value = val;
-      const eff = sel?.reasoningEffort || "";
-      if ($("#cReasoning").value !== eff) $("#cReasoning").value = eff;
+      $("#cModel").value = selection?.model ? modelValue(selection.provider || "deepseek-official", selection.model) : "";
+      $("#cReasoning").value = selection?.reasoningEffort || "";
     }
 
-    const pending = d.pending;
-    if (pending && pending.text && !["COMPLETED"].includes(d.state)) {
-      $("#dPending").classList.remove("hidden");
-      const elapsed = d.pending_elapsed_s != null ? `（已等待 ${fmtDuration(d.pending_elapsed_s)}）` : "";
-      $("#dPending").textContent = `📌 ${pending.text}${elapsed}`;
-    } else {
-      $("#dPending").classList.add("hidden");
-    }
+    const pendingVisible = detail.pending?.text && detail.state !== "COMPLETED";
+    const pendingTime = detail.pending_elapsed_s == null ? "" : `已等待 ${fmtDuration(detail.pending_elapsed_s)}`;
+    callout($("#dPending"), pendingVisible, detail.pending?.text || "", pendingTime);
 
-    // DeepSeek 执行窗口（实时可见执行过程）
-    const eui = d.executor_ui;
-    if (eui && eui.url) {
-      $("#dExecUi").classList.remove("hidden");
-      const running = d.state === "WAITING_FOR_EXECUTOR" || d.state === "EXECUTING" || d.state === "ANALYZING" || d.state === "DECISION_REQUIRED";
-      const sessions = (eui.sessions || []).map((s) => `${escapeHtml(s.taskId || "")}`).join("、");
-      $("#dExecUi").innerHTML = `
-        <span class="pulse"></span>
-        <div class="l-text">🖥 DeepSeek 执行窗口${running ? "（执行中，实时可见）" : "（最近执行可回顾）"}</div>
-        <div class="l-sub"><a href="${escapeHtml(eui.url)}" target="_blank" rel="noopener">${escapeHtml(eui.url)}</a>${sessions ? ` · 会话任务: ${sessions}` : ""} · 首个任务会自动打开，后续任务复用同一窗口</div>`;
-    } else {
-      $("#dExecUi").classList.add("hidden");
-    }
+    const executorUi = detail.executor_ui;
+    const isRunning = ["WAITING_FOR_EXECUTOR", "EXECUTING", "ANALYZING", "DECISION_REQUIRED"].includes(detail.state);
+    callout(
+      $("#dExecUi"), !!executorUi?.url,
+      `DeepSeek 执行窗口${isRunning ? "正在运行" : "可供回顾"}`,
+      executorUi?.url ? `<a href="${escapeHtml(executorUi.url)}" target="_blank" rel="noopener">打开执行窗口</a>${executorUi.sessions?.length ? ` · ${executorUi.sessions.length} 个会话` : ""}` : "",
+    );
 
-    // GPT 实时状态
-    const live = d.gpt_live;
-    if (live && live.phase && live.phase !== "idle") {
-      const el = $("#dGptLive");
-      el.classList.remove("hidden");
-      el.className = "gpt-live";
-      const labels = {
-        navigating: "🧭 正在打开 ChatGPT…",
-        sending: "📤 正在发送消息…",
-        waiting_reply: "⏳ 等待 GPT 回复…",
-        thinking: "💭 GPT 正在思考（推理中）…",
-        answering: "✍️ GPT 正在回答…",
-        complete: "✅ GPT 回复完成",
-      };
-      let label = labels[live.phase] || live.phase;
-      const t = fmtDuration(Math.max(0, Math.round((live.elapsedMs || 0) / 1000)));
-      let sub = `已耗时 ${t}`;
-      if (live.replyChars) sub += ` · 已生成 ${live.replyChars} 字`;
-      if (live.slow) {
-        sub += " · ⚠️ 长时间无进展：可能是长回答，超时机制会自动兜底；也可点击“显示浏览器”查看";
-        el.classList.add("slow");
-      }
-      if (["thinking", "answering", "waiting_reply", "sending", "navigating"].includes(live.phase)) {
-        el.innerHTML = `<span class="pulse"></span><div class="l-text">${label}</div><div class="l-sub">${sub}</div>`;
-      } else {
-        el.innerHTML = `<div class="l-text">${label}</div><div class="l-sub">${sub}</div>`;
-      }
-      if (live.phase === "thinking") el.classList.add("thinking");
-      if (live.phase === "answering") el.classList.add("answering");
-      if (live.phase === "complete") el.classList.add("complete");
-    } else {
-      $("#dGptLive").classList.add("hidden");
+    const live = detail.gpt_live;
+    const liveLabels = { navigating: "正在打开 ChatGPT", sending: "正在发送消息", waiting_reply: "等待 GPT 回复", thinking: "GPT 正在思考", answering: "GPT 正在回答", complete: "GPT 回复完成" };
+    let liveDetail = "";
+    if (live?.phase && live.phase !== "idle") {
+      liveDetail = `已耗时 ${fmtDuration((live.elapsedMs || 0) / 1000)}${live.replyChars ? ` · 已生成 ${live.replyChars} 字` : ""}${live.slow ? " · 响应时间较长，可打开 GPT 浏览器查看" : ""}`;
     }
-    if (d.last_error && d.state === "ERROR") {
-      $("#dError").classList.remove("hidden");
-      $("#dError").textContent = `❌ ${d.last_error}`;
-    } else {
-      $("#dError").classList.add("hidden");
+    callout($("#dGptLive"), !!live?.phase && live.phase !== "idle", liveLabels[live?.phase] || live?.phase || "", liveDetail);
+    callout($("#dError"), detail.state === "ERROR" && !!detail.last_error, "任务已停止", escapeHtml(detail.last_error || ""));
+
+    renderOverview(detail);
+    renderTasks(detail);
+    renderChat(detail.conversation || []);
+    $("#planView").textContent = detail.plan_text || "（暂无规划）";
+    $("#analysisView").textContent = detail.analysis_text || "（暂无分析）";
+    $("#logView").textContent = detail.logs_tail || "（暂无日志）";
+
+    const capabilities = detail.executor?.capabilities || {};
+    $("#executorSelect").value = detail.executor?.type || "deepseek";
+    $("#btnExecWindow").classList.toggle("hidden", capabilities.visibleWindow === false);
+    $("#btnCompact").classList.toggle("hidden", capabilities.sessionResume === false);
+    $("#composerModelSlot").classList.toggle("hidden", capabilities.modelSelection === false);
+    $("#btnPause").classList.toggle("hidden", ["PAUSED", "COMPLETED", "CANCELED"].includes(detail.state));
+    $("#btnResume").classList.toggle("hidden", detail.state !== "PAUSED");
+    $("#btnRetryTask").disabled = !detail.current_task && !(detail.failed_tasks || []).length;
+    $("#btnOverviewRetry").disabled = $("#btnRetryTask").disabled;
+    $("#btnRestore").disabled = !detail.checkpoint || isRunning;
+    $("#btnOverviewRestore").disabled = $("#btnRestore").disabled;
+
+    const entries = systemCache?.runner?.executors || [];
+    for (const option of $("#executorSelect").options) {
+      const entry = entries.find((item) => item.type === option.value);
+      option.disabled = !!entry && !entry.configured;
+      if (entry && !entry.configured && !option.textContent.includes("未配置")) option.textContent += "（未配置）";
     }
-
-    $("#oTask").textContent = d.user_task || "";
-    $("#oCurrent").textContent = d.current_task
-      ? `${d.current_task.id}（${d.current_task.priority}）\n${d.current_task.description || ""}\n依赖: ${(d.current_task.dependencies || []).join(", ") || "无"}`
-      : "（无）";
-    const runs = (d.executor_runs || []).slice(-8).reverse().map((r) =>
-      `[${(r.ts || "").replace("T", " ").slice(0, 19)}] ${r.type} ${r.task_id || ""} attempt=${r.attempt} exit=${r.exitCode}${r.timedOut ? "（超时）" : ""}${r.visible ? "（可见窗口）" : ""} ${r.ms ? Math.round(r.ms / 1000) + "s" : ""}`
-    ).join("\n");
-    $("#oRuns").textContent = runs || "（尚无执行记录）";
-    $("#oUsage").textContent = `DeepSeek（Harness 真实投影）\n输入 ${dst.uncachedInputTokens || 0} ｜ 输出 ${dst.outputTokens || 0} ｜ 缓存读 ${dst.cacheReadTokens || 0} ｜ 缓存写 ${dst.cacheWriteTokens || 0}\n上下文 ${ctx?.percentage != null ? `${ctx.percentage}%（${ctx.pressureTokens}/${ctx.contextWindow}）` : "投影不可用"} ｜ 压缩 ${d.compaction?.count || 0} 次\n\nGPT（网页字符折算，估算）\n发送 ${gu.sentCharacters || 0} 字 / 约 ${gu.estimatedInputTokens || 0} token ｜ 接收 ${gu.receivedCharacters || 0} 字 / 约 ${gu.estimatedOutputTokens || 0} token`;
-
-    renderTasks(d);
-    $("#planView").textContent = d.plan_text || "（暂无规划）";
-    $("#analysisView").textContent = d.analysis_text || "（暂无分析，任务执行中自动生成）";
-    renderChat(d.conversation || []);
-    $("#logView").textContent = d.logs_tail || "（暂无日志）";
-  } catch (e) {
-    console.error(e);
+  } catch (error) {
+    console.error(error);
+    callout($("#dError"), true, "无法刷新项目", escapeHtml(error.message));
   }
 }
 
-let lastTasksSig = null;
-function renderTasks(d) {
-  const sig = JSON.stringify({
-    tasks: (d.tasks || []).map((t) => [t.id, t.description, t.priority, t.dependencies]),
-    completed: (d.completed_tasks || []).map((t) => t.id),
-    failed: (d.failed_tasks || []).map((t) => t.id),
-    current: d.current_task?.id || null,
-    metrics: (d.usage?.deepseek?.tasks || []).map((m) => [m.task_id, m.attempt, m.duration_ms, m.model, m.tokens, m.context]),
+function renderOverview(detail) {
+  const tasks = detail.tasks || [];
+  const completed = detail.completed_tasks || [];
+  const totals = detail.usage?.deepseek?.totals || {};
+  const gptUsage = detail.usage?.gpt || {};
+  const context = detail.usage?.deepseek?.context;
+  $("#oProgress").textContent = `${completed.length} / ${tasks.length}`;
+  $("#oCurrentTask").textContent = detail.current_task?.id || "暂无";
+  $("#oContext").textContent = context?.percentage == null ? "不可用" : `${context.percentage}%`;
+  $("#oTokens").textContent = fmtTokens(tokenTotal(totals) + Number(gptUsage.estimatedInputTokens || 0) + Number(gptUsage.estimatedOutputTokens || 0));
+  $("#oTask").textContent = detail.user_task || "";
+
+  const gptLink = detail.gpt?.conversation_url
+    ? `<a href="${escapeHtml(detail.gpt.conversation_url)}" target="_blank" rel="noopener">打开会话</a>` : "未创建";
+  $("#oProjectMeta").innerHTML = `
+    <dt>状态</dt><dd>${escapeHtml(detail.state || "—")}</dd>
+    <dt>更新时间</dt><dd>${escapeHtml(fmtTime(detail.updated_at))}</dd>
+    <dt>源码目录</dt><dd><code>${escapeHtml(detail.source_dir || "默认目录")}</code></dd>
+    <dt>工作区</dt><dd><code>${escapeHtml(detail.workspace_dir || "—")}</code></dd>
+    <dt>GPT 会话</dt><dd>${gptLink}</dd>
+    <dt>派发 ID</dt><dd><code>${escapeHtml(detail.current_dispatch_id || "—")}</code></dd>`;
+
+  const task = detail.current_task;
+  const checkpoint = detail.checkpoint;
+  $("#oCurrent").textContent = [
+    `执行器：${detail.executor?.type === "cli" ? "通用命令行" : "DeepSeek Harness"}`,
+    task ? `任务：${task.id} · ${task.kind || "coding"}\n${task.description || ""}` : "任务：暂无",
+    task ? `依赖：${(task.dependencies || []).join(", ") || "无"}` : "",
+    checkpoint ? `检查点：${checkpoint.task_id} · ${checkpoint.status || "ready"}` : "检查点：暂无",
+  ].filter(Boolean).join("\n");
+
+  const runs = (detail.executor_runs || []).slice(-8).reverse().map((run) =>
+    `[${fmtTime(run.ts)}] ${run.type || "执行"} ${run.task_id || ""} · 第 ${run.attempt || 1} 次 · ${run.timedOut ? "超时" : `exit ${run.exitCode ?? "—"}`} · ${fmtDuration((run.ms || 0) / 1000)}`
+  ).join("\n");
+  $("#oRuns").textContent = runs || "（尚无执行记录）";
+  $("#oUsage").textContent = `DeepSeek（Harness 真实投影）\n输入 ${totals.uncachedInputTokens || 0} · 输出 ${totals.outputTokens || 0} · 缓存读 ${totals.cacheReadTokens || 0} · 缓存写 ${totals.cacheWriteTokens || 0}\n上下文 ${context?.percentage == null ? "不可用" : `${context.percentage}%（${context.pressureTokens || 0}/${context.contextWindow || 0}）`} · 压缩 ${detail.compaction?.count || 0} 次\n\nGPT（网页字符折算，估算）\n发送 ${gptUsage.sentCharacters || 0} 字 / 约 ${gptUsage.estimatedInputTokens || 0} token · 接收 ${gptUsage.receivedCharacters || 0} 字 / 约 ${gptUsage.estimatedOutputTokens || 0} token`;
+}
+
+function renderTasks(detail) {
+  const signature = JSON.stringify({
+    tasks: detail.tasks, completed: detail.completed_tasks, failed: detail.failed_tasks,
+    current: detail.current_task?.id, metrics: detail.usage?.deepseek?.tasks, validation: detail.validation_results,
   });
-  if (sig === lastTasksSig) return;
-  lastTasksSig = sig;
-  const tbody = $("#taskTable tbody");
-  tbody.innerHTML = "";
-  const completed = new Set((d.completed_tasks || []).map((t) => t.id));
-  const failed = new Set((d.failed_tasks || []).map((t) => t.id));
-  const metrics = d.usage?.deepseek?.tasks || [];
-  for (const t of d.tasks || []) {
-    let status = "pending";
-    let cls = "pending";
-    if (completed.has(t.id)) { status = "completed"; cls = "completed"; }
-    else if (failed.has(t.id)) { status = "failed"; cls = "failed"; }
-    else if (d.current_task && d.current_task.id === t.id) { status = "running"; cls = "running"; }
-    const taskMetrics = metrics.filter((m) => m.task_id === t.id);
+  if (signature === lastTasksSig) return;
+  lastTasksSig = signature;
+  const body = $("#taskTable tbody");
+  body.innerHTML = "";
+  const completed = new Set((detail.completed_tasks || []).map((item) => item.id));
+  const failed = new Set((detail.failed_tasks || []).map((item) => item.id));
+  const metrics = detail.usage?.deepseek?.tasks || [];
+  for (const task of detail.tasks || []) {
+    const taskMetrics = metrics.filter((item) => item.task_id === task.id);
     const last = taskMetrics.at(-1);
-    const model = last?.model;
-    const modelText = model ? `${model.model || "默认"}${model.reasoningEffort ? ` / ${model.reasoningEffort}` : ""}` : "-";
-    const duration = taskMetrics.reduce((sum, m) => sum + Number(m.duration_ms || 0), 0);
-    const tokens = taskMetrics.reduce((sum, m) => sum + Number(tokenTotal(m.tokens) || 0), 0);
-    const tr = document.createElement("tr");
-    tr.innerHTML = `<td><b>${escapeHtml(t.id)}</b></td><td>${escapeHtml(t.description || "")}</td><td>${escapeHtml(modelText)}</td><td>${duration ? fmtDuration(Math.round(duration / 1000)) : "-"}</td><td>${taskMetrics.length ? `${taskMetrics.length} 次${taskMetrics.length > 1 ? `（重试 ${taskMetrics.length - 1}）` : ""}` : "-"}</td><td>${taskMetrics.some((m) => m.actual) ? fmtTokens(tokens) : "不可用"}</td><td>${last?.context?.percentage != null ? `${last.context.percentage}%` : "-"}</td><td><span class="task-status ${cls}">${status === "running" ? "▶ 执行中" : status === "completed" ? "✔ 完成" : status === "failed" ? "✖ 失败" : "… 待办"}</span></td>`;
-    tbody.appendChild(tr);
+    const duration = taskMetrics.reduce((total, item) => total + Number(item.duration_ms || 0), 0);
+    const tokens = taskMetrics.reduce((total, item) => total + Number(tokenTotal(item.tokens)), 0);
+    const validation = detail.validation_results?.[task.id];
+    let status = "待办", style = "pending";
+    if (completed.has(task.id)) { status = "完成"; style = "completed"; }
+    else if (failed.has(task.id)) { status = "失败"; style = "failed"; }
+    else if (detail.current_task?.id === task.id) { status = "执行中"; style = "running"; }
+    const execution = taskMetrics.length ? `${fmtDuration(duration / 1000)} · ${taskMetrics.length} 次` : "—";
+    const validationText = !task.validation ? "未配置" : !validation ? "待验证" : validation.ok ? "通过" : `失败：${validation.output || validation.error || "命令未通过"}`;
+    const row = document.createElement("tr");
+    row.innerHTML = `<td><strong>${escapeHtml(task.id)}</strong></td><td>${escapeHtml(task.description || "")}</td><td>${escapeHtml(task.kind || "coding")}</td><td>${escapeHtml(execution)}</td><td>${taskMetrics.some((item) => item.actual) ? fmtTokens(tokens) : "不可用"}</td><td><div class="validation-result ${validation?.ok ? "ok" : validation ? "failed" : ""}" title="${escapeHtml(validationText)}">${escapeHtml(validationText)}</div></td><td><span class="task-status ${style}">${status}</span></td>`;
+    body.appendChild(row);
   }
 }
 
-let lastChatSig = null;
-let lastChatCount = 0;
 function renderChat(messages) {
-  const list = messages || [];
-  const box = $("#chatList");
-  // 内容签名：无变化则跳过重渲染，避免每 2s 清空重建导致滚动条跳回顶部
-  const sig = list.length + ":" + list.map((m) => `${m.dir}|${m.type || ""}|${m.length}|${m.ts || ""}`).join("~");
-  if (sig === lastChatSig) return;
-  const isNew = list.length > lastChatCount;
-  const scroller = $("#convoView") || $(".main");
-  const nearBottom = scroller && (scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 140);
-  lastChatSig = sig;
-  lastChatCount = list.length;
-  box.innerHTML = "";
-  for (const m of list) {
-    const div = document.createElement("div");
-    div.className = `chat-msg ${m.dir}`;
-    const who = m.dir === "in" ? "GPT-5.6 Sol → 系统" : "系统 → GPT-5.6 Sol";
-    div.innerHTML = `<div class="c-head"><span>${who}${m.type ? `（${escapeHtml(m.type)}）` : ""}</span><span>${(m.ts || "").replace("T", " ").slice(0, 19)}</span></div><div class="c-body">${escapeHtml(m.text || "")}</div>`;
-    box.appendChild(div);
+  const signature = messages.length + ":" + messages.map((message) => `${message.dir}|${message.type || ""}|${message.length || message.text?.length || 0}|${message.ts || ""}`).join("~");
+  if (signature === lastChatSig) return;
+  const scroller = $("#convoView");
+  const nearBottom = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 140;
+  const isNew = messages.length > lastChatCount;
+  lastChatSig = signature;
+  lastChatCount = messages.length;
+  const list = $("#chatList");
+  list.innerHTML = "";
+  for (const message of messages) {
+    const kind = String(message.type || "").toUpperCase().includes("EXECUTOR") ? "executor" : message.dir === "in" ? "in" : "system";
+    const role = kind === "executor" ? "执行者" : kind === "in" ? "GPT" : message.type === "USER" ? "用户" : "工作台";
+    const text = String(message.text || "");
+    const body = text.length > 1800
+      ? `<details class="message-details"><summary>展开完整消息（${text.length} 字）</summary><div class="c-body">${escapeHtml(text)}</div></details>`
+      : `<div class="c-body">${escapeHtml(text)}</div>`;
+    const node = document.createElement("article");
+    node.className = `chat-msg ${kind}`;
+    node.innerHTML = `<div class="c-head"><span class="c-role">${role}${message.type ? ` · ${escapeHtml(message.type)}` : ""}</span><time>${escapeHtml(fmtTime(message.ts))}</time></div>${body}`;
+    list.appendChild(node);
   }
-  // 仅当新增消息且用户本就停在底部时自动跟随到底，其余情况保持用户当前滚动位置
-  if (isNew && nearBottom && scroller) scroller.scrollTop = scroller.scrollHeight;
+  if (isNew && nearBottom) scroller.scrollTop = scroller.scrollHeight;
 }
 
-function fmtDuration(s) {
-  if (s < 60) return `${s}s`;
-  const m = Math.floor(s / 60);
-  if (m < 60) return `${m}分${s % 60}s`;
-  return `${Math.floor(m / 60)}时${m % 60}分`;
-}
-
-function escapeHtml(s) {
-  return String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
-}
-
-// ---------- 交互 ----------
 function showCreateView() {
   currentProjectId = null;
   $("#emptyHint").classList.add("hidden");
@@ -473,241 +400,181 @@ function showCreateView() {
   $("#currentProjBox").classList.add("hidden");
   $("#projTask").focus();
 }
-$("#btnNewProject").addEventListener("click", showCreateView);
 
-// 新建项目：点击选择本地项目文件夹（代替手动复制/输入路径）
-$("#btnPickDir").onclick = async () => {
+async function pickFolder(startDir) {
+  return api("/api/pickdir", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ start_dir: startDir || "" }) });
+}
+
+async function chooseProjectFolder() {
+  const button = $("#btnPickDir");
+  const original = button.innerHTML;
   try {
-    $("#btnPickDir").disabled = true;
-    $("#btnPickDir").textContent = "选择中…";
-    const res = await pickFolder($("#projDir").value.trim());
-    if (res && res.path) {
-      $("#projDir").value = res.path;
-      $("#projDirLabel").textContent = res.path;
-      $("#projDir").style.borderColor = "var(--green)";
+    button.disabled = true; button.textContent = "选择中…";
+    const result = await pickFolder($("#projDir").value.trim());
+    if (result?.path) {
+      $("#projDir").value = result.path;
+      $("#projDirLabel").textContent = result.path;
+      $("#projDirLabel").title = result.path;
     }
-  } catch (e) {
-    alert(`选择文件夹失败：${e.message}\n\n你也可以直接在左侧输入框中手动填写绝对路径。`);
-  } finally {
-    $("#btnPickDir").disabled = false;
-    $("#btnPickDir").textContent = "📁";
-  }
-};
-$("#btnCreate").onclick = async () => {
+  } catch (error) { alert(`选择文件夹失败：${error.message}`); }
+  finally { button.disabled = false; button.innerHTML = original; }
+}
+
+async function createProject() {
   const task = $("#projTask").value.trim();
-  const dir = $("#projDir").value.trim();
-  if (!task) { alert("请先描述你想构建的内容"); $("#projTask").focus(); return; }
+  if (!task) { alert("请先描述你想完成的工作"); $("#projTask").focus(); return; }
+  const button = $("#btnCreate");
+  const original = button.innerHTML;
   try {
-    $("#btnCreate").disabled = true;
-    $("#btnCreate").textContent = "创建中…";
+    button.disabled = true; button.textContent = "创建中…";
     const payload = { task };
-    if (dir) payload.source_dir = dir;
-    const sel = selectedModelPayload();
-    if (sel) payload.deepseek_selection = sel;
-    const res = await api("/api/projects", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    });
+    const sourceDir = $("#projDir").value.trim();
+    if (sourceDir) payload.source_dir = sourceDir;
+    const selection = selectedModelPayload();
+    if (selection) payload.deepseek_selection = selection;
+    const result = await api("/api/projects", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
     $("#projTask").value = "";
     $("#projDir").value = "";
-    $("#projDirLabel").textContent = "未选择文件夹（将使用工作台默认目录）";
-    $("#projDir").style.borderColor = "";
-    currentProjectId = res.id;
-    $("#emptyHint").classList.add("hidden");
+    $("#projDirLabel").textContent = "未选择，将使用默认目录";
+    currentProjectId = result.id;
     $("#createView").classList.add("hidden");
     $("#detail").classList.remove("hidden");
     await refresh();
-  } catch (e) {
-    alert(`创建失败: ${e.message}`);
-  } finally {
-    $("#btnCreate").disabled = false;
-    $("#btnCreate").textContent = "↑";
-  }
-};
-
-async function action(name) {
-  if (!currentProjectId) return;
-  try {
-    await api(`/api/projects/${encodeURIComponent(currentProjectId)}/action`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ action: name }),
-    });
-    await refreshDetail();
-  } catch (e) { alert(`操作失败: ${e.message}`); }
+  } catch (error) { alert(`创建失败：${error.message}`); }
+  finally { button.disabled = false; button.innerHTML = original; }
 }
-$("#btnPause").onclick = () => action("pause");
-$("#btnResume").onclick = () => action("resume");
-$("#btnRetry").onclick = () => action("retry");
-$("#btnCompact").onclick = () => action("compact_session");
-$("#btnEnd").onclick = () => {
-  if (confirm("确定结束这个项目？\n正在运行的任务会被终止，项目记录会保留，但结束后不能继续。")) action("end");
-};
 
-// 修改项目文件夹：改为点击按钮 → 弹出系统文件夹选择器（不再用 prompt 输入）
-$("#btnSetDir").onclick = async () => {
+async function action(actionName) {
+  try { await actionWith(actionName); closeMenus(); }
+  catch (error) { alert(`操作失败：${error.message}`); }
+}
+
+async function setCurrentFolder() {
   if (!currentProjectId) return;
-  const dh = $("#dirHint");
-  const cur = (dh && dh.dataset.path) || "";
+  const button = $("#btnSetDir");
+  const original = button.innerHTML;
+  const currentPath = $("#dirHint")?.dataset.path || "";
   try {
-    $("#btnSetDir").disabled = true;
-    $("#btnSetDir").textContent = "选择中…";
-    const res = await pickFolder(cur);
-    if (!res || !res.path) return; // 用户取消
-    await api(`/api/projects/${encodeURIComponent(currentProjectId)}/action`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ action: "setdir", dir: res.path }),
-    });
-    await refreshDetail();
-  } catch (e) {
-    alert(`修改失败: ${e.message}`);
-  } finally {
-    $("#btnSetDir").disabled = false;
-    $("#btnSetDir").textContent = "修改";
-  }
-};
-$("#btnComposerDir").onclick = () => $("#btnSetDir").click();
+    button.disabled = true; button.setAttribute("aria-busy", "true");
+    const result = await pickFolder(currentPath);
+    if (result?.path) await actionWith("setdir", { dir: result.path });
+  } catch (error) { alert(`修改失败：${error.message}`); }
+  finally { button.disabled = false; button.removeAttribute("aria-busy"); button.innerHTML = original; }
+}
 
-// 显示/隐藏浏览器窗口
-let windowVisible = null;
-$("#btnWindow").onclick = async () => {
-  try {
-    const show = windowVisible !== true; // 未知状态默认先显示
-    const res = await api(`/api/projects/${encodeURIComponent(currentProjectId)}/action`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ action: show ? "window_show" : "window_hide" }),
-    });
-    windowVisible = !!res.windowVisible;
-    $("#btnWindow").textContent = windowVisible ? "🙈 隐藏浏览器" : "🖥 显示浏览器";
-  } catch (e) { alert(`窗口操作失败: ${e.message}`); }
-};
-
-// 打开本项目的 DeepSeek 执行窗口（首个任务自动打开，此处用于手动重开/查看）
-$("#btnExecWindow").onclick = async () => {
+async function toggleGptWindow() {
   if (!currentProjectId) return;
   try {
-    $("#btnExecWindow").disabled = true;
-    const res = await api(`/api/projects/${encodeURIComponent(currentProjectId)}/action`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ action: "executor_window" }),
-    });
-    if (res && res.url) {
-      if (!res.opened) window.open(res.url, "_blank");
-    } else {
-      alert("当前没有运行中的执行窗口。\n执行窗口会在本项目首个 DeepSeek 任务开始时自动打开。");
-    }
-  } catch (e) {
-    alert(`打开执行窗口失败: ${e.message}`);
-  } finally {
-    $("#btnExecWindow").disabled = false;
-  }
-};
+    const show = windowVisible !== true;
+    const result = await actionWith(show ? "window_show" : "window_hide");
+    windowVisible = !!result.windowVisible;
+    $("#btnWindow").innerHTML = `${icon("monitor")}${windowVisible ? "隐藏 GPT 浏览器" : "显示 GPT 浏览器"}`;
+  } catch (error) { alert(`窗口操作失败：${error.message}`); }
+}
 
-// 保存本项目的 DeepSeek 模型选择：Composer 内模型/推理下拉变化即持久化（实际请求用所选配置）
+async function openExecutorWindow() {
+  if (!currentProjectId) return;
+  const button = $("#btnExecWindow");
+  try {
+    button.disabled = true;
+    const result = await actionWith("executor_window");
+    if (result?.url && !result.opened) window.open(result.url, "_blank", "noopener");
+    if (!result?.url) alert("当前没有可用的执行窗口。");
+  } catch (error) { alert(`打开执行窗口失败：${error.message}`); }
+  finally { button.disabled = false; }
+}
+
+async function exportAudit() {
+  try {
+    const result = await actionWith("export_audit");
+    const blob = new Blob([result.content || ""], { type: "text/markdown;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url; link.download = `${currentProjectId || "project"}-audit.md`; link.click();
+    URL.revokeObjectURL(url);
+    closeMenus();
+  } catch (error) { alert(`导出失败：${error.message}`); }
+}
+
+async function selectExecutor() {
+  try { await actionWith("select_executor", { executor_type: $("#executorSelect").value }); }
+  catch (error) { alert(`切换执行器失败：${error.message}`); await refreshDetail(); }
+}
+
 let saveStatusTimer = null;
 async function saveComposerModelSelection() {
   if (!currentProjectId) return;
-  const v = splitModelValue($("#cModel").value);
+  const selected = splitModelValue($("#cModel").value);
   const effort = $("#cReasoning").value;
-  const status = $("#composerSaveStatus");
   try {
-    await api(`/api/projects/${encodeURIComponent(currentProjectId)}/action`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        action: "deepseek_model",
-        selection: v ? { provider: v.provider, model: v.model, reasoningEffort: effort } : { provider: "", model: "", reasoningEffort: "" },
-      }),
-    });
-    if (status) {
-      status.textContent = `✓ 已保存 ${v ? `${v.provider}/${v.model}` : "默认"}${effort ? ` · 推理 ${effort}` : ""}`;
-      status.classList.add("show");
-      clearTimeout(saveStatusTimer);
-      saveStatusTimer = setTimeout(() => { status.classList.remove("show"); status.textContent = ""; }, 3000);
-    }
-    await refreshDetail();
-  } catch (e) {
-    alert(`保存失败: ${e.message}`);
-  }
+    await actionWith("deepseek_model", { selection: selected ? { ...selected, reasoningEffort: effort } : { provider: "", model: "", reasoningEffort: "" } });
+    const status = $("#composerSaveStatus");
+    status.textContent = "模型设置已保存"; status.classList.add("show");
+    clearTimeout(saveStatusTimer);
+    saveStatusTimer = setTimeout(() => { status.classList.remove("show"); status.textContent = ""; }, 2400);
+  } catch (error) { alert(`保存失败：${error.message}`); }
 }
-const composerModel = $("#cModel");
-const composerReasoning = $("#cReasoning");
-if (composerModel) composerModel.addEventListener("change", saveComposerModelSelection);
-if (composerReasoning) composerReasoning.addEventListener("change", saveComposerModelSelection);
 
-// ---------- 底部输入区（Composer，TASK-004） ----------
+$("#btnNewProject").onclick = showCreateView;
+$("#btnPickDir").onclick = chooseProjectFolder;
+$("#btnCreate").onclick = createProject;
+$("#btnPause").onclick = () => action("pause");
+$("#btnResume").onclick = () => action("resume");
+$("#btnRetry").onclick = () => action("retry");
+$("#btnRetryTask").onclick = () => action("retry_task");
+$("#btnOverviewRetry").onclick = () => action("retry_task");
+$("#btnRestore").onclick = () => action("restore_checkpoint");
+$("#btnOverviewRestore").onclick = () => action("restore_checkpoint");
+$("#btnCompact").onclick = () => action("compact_session");
+$("#btnExportAudit").onclick = exportAudit;
+$("#btnWindow").onclick = toggleGptWindow;
+$("#btnExecWindow").onclick = openExecutorWindow;
+$("#btnSetDir").onclick = setCurrentFolder;
+$("#btnComposerDir").onclick = setCurrentFolder;
+$("#executorSelect").onchange = selectExecutor;
+$("#cModel").onchange = saveComposerModelSelection;
+$("#cReasoning").onchange = saveComposerModelSelection;
+$("#btnEnd").onclick = () => { if (confirm("确定结束这个项目？\n正在运行的任务会停止，项目记录会保留。")) action("end"); };
+
 const composerInput = $("#composerInput");
 const composerSend = $("#btnComposerSend");
+const MAX_ATTACH_SIZE = 50 * 1024 * 1024;
+let composerAttachments = [];
+let attachSeq = 0;
 
-function autoGrow(el) {
-  if (!el) return;
-  el.style.height = "auto";
-  el.style.height = Math.min(el.scrollHeight, 180) + "px";
+function autoGrow(element) {
+  element.style.height = "auto";
+  element.style.height = `${Math.min(element.scrollHeight, 180)}px`;
 }
 
 async function sendComposer() {
-  if (!composerInput || !currentProjectId) return;
+  if (!currentProjectId) return;
   const text = composerInput.value.trim();
-  if (!text && composerAttachments.length === 0) return;
-  if (composerSend) composerSend.disabled = true;
-  const ready = composerAttachments.filter((a) => a.status === "success");
-  const pending = composerAttachments.filter((a) => a.status === "uploading");
-  if (pending.length) { alert("附件仍在上传，请稍候再发送。"); if (composerSend) composerSend.disabled = false; return; }
-  const failed = composerAttachments.filter((a) => a.status === "failed");
-  if (failed.length) { alert("有附件上传失败，请重试或移除后再发送。"); if (composerSend) composerSend.disabled = false; return; }
+  if (!text && !composerAttachments.length) return;
+  if (composerAttachments.some((item) => item.status === "uploading")) return alert("附件仍在上传，请稍候再发送。");
+  if (composerAttachments.some((item) => item.status === "failed")) return alert("有附件上传失败，请重试或移除。");
   try {
+    composerSend.disabled = true;
     await api(`/api/projects/${encodeURIComponent(currentProjectId)}/message`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text, attachment_ids: ready.map((a) => a.serverId) }),
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text, attachment_ids: composerAttachments.map((item) => item.serverId).filter(Boolean) }),
     });
-    composerInput.value = "";
-    autoGrow(composerInput);
-    clearAttachments();
-    await refreshDetail();
-  } catch (e) {
-    alert(`发送失败: ${e.message}`);
-  } finally {
-    if (composerSend) composerSend.disabled = false;
-  }
+    composerInput.value = ""; autoGrow(composerInput); clearAttachments(); await refreshDetail();
+  } catch (error) { alert(`发送失败：${error.message}`); }
+  finally { composerSend.disabled = false; }
 }
 
-if (composerInput) {
-  composerInput.addEventListener("input", () => autoGrow(composerInput));
-  // 拖拽上传已关闭，但阻止浏览器默认打开文件，避免误离开工作台。
-  ["dragover", "drop"].forEach((eventName) => composerInput.addEventListener(eventName, (e) => e.preventDefault()));
-  composerInput.addEventListener("keydown", (e) => {
-    if (e.key === "Enter" && !e.shiftKey) {
-      e.preventDefault();
-      sendComposer();
-    }
-  });
-}
-if (composerSend) composerSend.addEventListener("click", sendComposer);
-
-// ---------- 附件上传 ----------
-const MAX_ATTACH_SIZE = 50 * 1024 * 1024; // 50MB
-let composerAttachments = []; // {id,file,name,size,type,status,serverId?,reason?,preview?}
-let attachSeq = 0;
+composerInput.addEventListener("input", () => autoGrow(composerInput));
+composerInput.addEventListener("keydown", (event) => {
+  if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); sendComposer(); }
+});
+for (const eventName of ["dragover", "drop"]) composerInput.addEventListener(eventName, (event) => event.preventDefault());
+composerSend.onclick = sendComposer;
 
 function fmtSize(bytes) {
   if (bytes < 1024) return `${bytes}B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)}KB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)}MB`;
-}
-
-function fileIcon(name, type) {
-  if (type && type.startsWith("image/")) return "🖼";
-  const ext = (name.split(".").pop() || "").toLowerCase();
-  if (["pdf"].includes(ext)) return "📕";
-  if (["zip", "rar", "7z", "tar", "gz"].includes(ext)) return "🗜";
-  if (["doc", "docx", "txt", "md"].includes(ext)) return "📄";
-  if (["xls", "xlsx", "csv"].includes(ext)) return "📊";
-  return "📎";
 }
 
 function fileAsDataUrl(file) {
@@ -720,153 +587,124 @@ function fileAsDataUrl(file) {
 }
 
 async function uploadAttachment(id) {
-  const a = composerAttachments.find((x) => x.id === id);
-  if (!a || !a.file || !currentProjectId) return;
-  a.status = "uploading";
-  a.reason = "";
-  renderAttachments();
+  const attachment = composerAttachments.find((item) => item.id === id);
+  if (!attachment?.file || !currentProjectId) return;
+  attachment.status = "uploading"; attachment.reason = ""; renderAttachments();
   try {
-    const data = await fileAsDataUrl(a.file);
-    const res = await api(`/api/projects/${encodeURIComponent(currentProjectId)}/attachments`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name: a.name, mime: a.type, data }),
+    const data = await fileAsDataUrl(attachment.file);
+    const result = await api(`/api/projects/${encodeURIComponent(currentProjectId)}/attachments`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: attachment.name, mime: attachment.type, data }),
     });
-    const cur = composerAttachments.find((x) => x.id === id);
-    if (cur) { cur.serverId = res.attachment.id; cur.status = "success"; }
-  } catch (e) {
-    const cur = composerAttachments.find((x) => x.id === id);
-    if (cur) { cur.status = "failed"; cur.reason = e.message; }
-  }
+    Object.assign(attachment, { serverId: result.attachment.id, status: "success" });
+  } catch (error) { Object.assign(attachment, { status: "failed", reason: error.message }); }
   renderAttachments();
 }
 
 function addFiles(fileList) {
-  const files = Array.from(fileList || []);
-  for (const f of files) {
-    if (f.size > MAX_ATTACH_SIZE) {
-      composerAttachments.push({ id: ++attachSeq, name: f.name, size: f.size, type: f.type, status: "failed", reason: "文件超过 50MB" });
-      continue;
+  for (const file of Array.from(fileList || [])) {
+    const attachment = { id: ++attachSeq, file, name: file.name, size: file.size, type: file.type, status: "uploading" };
+    if (file.size > MAX_ATTACH_SIZE) Object.assign(attachment, { status: "failed", reason: "文件超过 50MB" });
+    else if (file.type?.startsWith("image/")) {
+      try { attachment.preview = URL.createObjectURL(file); } catch { /* preview optional */ }
     }
-    const id = ++attachSeq;
-    const a = { id, file: f, name: f.name, size: f.size, type: f.type, status: "uploading" };
-    if (f.type && f.type.startsWith("image/")) {
-      try { a.preview = URL.createObjectURL(f); } catch (e) {}
-    }
-    composerAttachments.push(a);
-    uploadAttachment(id);
+    composerAttachments.push(attachment);
+    if (attachment.status === "uploading") uploadAttachment(attachment.id);
   }
   renderAttachments();
 }
 
 function removeAttachment(id) {
-  const i = composerAttachments.findIndex((x) => x.id === id);
-  if (i < 0) return;
-  if (composerAttachments[i].preview) URL.revokeObjectURL(composerAttachments[i].preview);
-  composerAttachments.splice(i, 1);
+  const index = composerAttachments.findIndex((item) => item.id === id);
+  if (index < 0) return;
+  if (composerAttachments[index].preview) URL.revokeObjectURL(composerAttachments[index].preview);
+  composerAttachments.splice(index, 1);
   renderAttachments();
 }
 
-function retryAttachment(id) {
-  const a = composerAttachments.find((x) => x.id === id);
-  if (!a) return;
-  uploadAttachment(id);
-}
+function retryAttachment(id) { uploadAttachment(id); }
 
 function clearAttachments() {
-  for (const a of composerAttachments) { if (a.preview) URL.revokeObjectURL(a.preview); }
+  for (const attachment of composerAttachments) if (attachment.preview) URL.revokeObjectURL(attachment.preview);
   composerAttachments = [];
-  const list = $("#attachList");
-  if (list) list.innerHTML = "";
+  $("#attachList").innerHTML = "";
 }
 
 function renderAttachments() {
   const list = $("#attachList");
-  if (!list) return;
-  if (composerAttachments.length === 0) { list.innerHTML = ""; return; }
   list.innerHTML = "";
-  for (const a of composerAttachments) {
+  for (const attachment of composerAttachments) {
     const card = document.createElement("div");
-    card.className = `attach-card ${a.status}`;
-    card.dataset.id = a.id;
-    const left = a.preview
-      ? `<div class="attach-thumb"><img src="${a.preview}" alt="" /></div>`
-      : `<div class="attach-icon">${fileIcon(a.name, a.type)}</div>`;
-    let statusHtml;
-    if (a.status === "uploading") statusHtml = `<span class="attach-state uploading"><span class="spinner"></span>上传中</span>`;
-    else if (a.status === "success") statusHtml = `<span class="attach-state success">✓ 已就绪</span>`;
-    else statusHtml = `<span class="attach-state failed" title="${escapeHtml(a.reason || "")}">✖ 失败${a.reason ? `：${escapeHtml(a.reason)}` : ""}</span>`;
-    const actionsHtml = a.status === "failed"
-      ? `<button class="attach-act retry" data-act="retry" title="重试">↻</button><button class="attach-act remove" data-act="remove" title="移除">×</button>`
-      : `<button class="attach-act remove" data-act="remove" title="移除">×</button>`;
-    card.innerHTML = `
-      ${left}
-      <div class="attach-info">
-        <div class="attach-name" title="${escapeHtml(a.name)}">${escapeHtml(a.name)}</div>
-        <div class="attach-meta">${fmtSize(a.size)} · ${statusHtml}</div>
-      </div>
-      <div class="attach-actions">${actionsHtml}</div>`;
-    card.querySelectorAll("[data-act]").forEach((btn) => {
-      btn.onclick = (e) => {
-        e.stopPropagation();
-        const id = Number(card.dataset.id);
-        if (btn.dataset.act === "remove") removeAttachment(id);
-        else if (btn.dataset.act === "retry") retryAttachment(id);
-      };
+    card.className = `attach-card ${attachment.status}`;
+    card.dataset.id = attachment.id;
+    const preview = attachment.preview
+      ? `<div class="attach-thumb"><img src="${attachment.preview}" alt="${escapeHtml(attachment.name)}" /></div>`
+      : `<div class="attach-icon">${icon(attachment.type?.startsWith("image/") ? "image" : "paperclip")}</div>`;
+    const state = attachment.status === "uploading" ? '<span class="attach-state"><span class="spinner"></span>上传中</span>'
+      : attachment.status === "success" ? '<span class="attach-state success">已就绪</span>'
+      : `<span class="attach-state failed" title="${escapeHtml(attachment.reason || "")}">失败${attachment.reason ? `：${escapeHtml(attachment.reason)}` : ""}</span>`;
+    card.innerHTML = `${preview}<div class="attach-info"><div class="attach-name" title="${escapeHtml(attachment.name)}">${escapeHtml(attachment.name)}</div><div class="attach-meta">${fmtSize(attachment.size)} · ${state}</div></div><div class="attach-actions">${attachment.status === "failed" ? '<button class="attach-act" data-act="retry" type="button" title="重试" aria-label="重试上传">重试</button>' : ""}<button class="attach-act" data-act="remove" type="button" title="移除" aria-label="移除附件">移除</button></div>`;
+    card.querySelectorAll("[data-act]").forEach((button) => {
+      button.onclick = () => button.dataset.act === "retry" ? retryAttachment(Number(card.dataset.id)) : removeAttachment(Number(card.dataset.id));
     });
     list.appendChild(card);
   }
 }
 
-// 上传入口
-const fileInput = $("#fileInput");
-const photoInput = $("#photoInput");
-const btnAttach = $("#btnAttach");
-const btnAttachPhoto = $("#btnAttachPhoto");
-if (btnAttach && fileInput) btnAttach.addEventListener("click", () => fileInput.click());
-if (btnAttachPhoto && photoInput) btnAttachPhoto.addEventListener("click", () => photoInput.click());
-if (fileInput) fileInput.addEventListener("change", () => { addFiles(fileInput.files); fileInput.value = ""; });
-if (photoInput) photoInput.addEventListener("change", () => { addFiles(photoInput.files); photoInput.value = ""; });
+$("#btnAttach").onclick = () => $("#fileInput").click();
+$("#btnAttachPhoto").onclick = () => $("#photoInput").click();
+$("#fileInput").onchange = () => { addFiles($("#fileInput").files); $("#fileInput").value = ""; };
+$("#photoInput").onchange = () => { addFiles($("#photoInput").files); $("#photoInput").value = ""; };
 
-// Tabs
-$$(".tab").forEach((t) => {
-  t.onclick = () => {
-    $$(".tab").forEach((x) => x.classList.remove("active"));
-    $$(".tab-body").forEach((x) => x.classList.add("hidden"));
-    t.classList.add("active");
-    const name = t.dataset.tab;
-    const convo = $("#convoView");
-    if (name === "chat") {
-      if (convo) convo.classList.remove("hidden");
-    } else {
-      if (convo) convo.classList.add("hidden");
-      const body = $(`#tab-${name}`);
-      if (body) body.classList.remove("hidden");
-    }
+function activateTab(tab) {
+  const tabs = $$(".tab");
+  for (const item of tabs) {
+    const active = item === tab;
+    item.classList.toggle("active", active);
+    item.setAttribute("aria-selected", String(active));
+    item.tabIndex = active ? 0 : -1;
+  }
+  const name = tab.dataset.tab;
+  for (const panel of [$("#convoView"), ...$$(".tab-body")]) panel.classList.add("hidden");
+  const panel = name === "chat" ? $("#convoView") : $(`#tab-${name}`);
+  panel?.classList.remove("hidden");
+}
+
+for (const tab of $$(".tab")) {
+  tab.onclick = () => activateTab(tab);
+  tab.onkeydown = (event) => {
+    const tabs = $$(".tab");
+    let index = tabs.indexOf(tab);
+    if (event.key === "ArrowRight") index = (index + 1) % tabs.length;
+    else if (event.key === "ArrowLeft") index = (index - 1 + tabs.length) % tabs.length;
+    else if (event.key === "Home") index = 0;
+    else if (event.key === "End") index = tabs.length - 1;
+    else return;
+    event.preventDefault(); activateTab(tabs[index]); tabs[index].focus();
   };
-});
-
-// 主题切换（深浅色，默认浅色，贴近创建页的 Harness 风格）
-const themeBtn = $("#btnTheme");
-function applyTheme(t) {
-  const theme = t === "light" ? "light" : "dark";
-  document.documentElement.setAttribute("data-theme", theme);
-  try { localStorage.setItem("wb-theme", theme); } catch (e) {}
-  if (themeBtn) themeBtn.textContent = theme === "light" ? "☀️ 浅色" : "🌙 深色";
 }
-if (themeBtn) {
-  themeBtn.addEventListener("click", () => {
-    const cur = document.documentElement.getAttribute("data-theme") === "light" ? "light" : "dark";
-    applyTheme(cur === "light" ? "dark" : "light");
-  });
-}
-(function initTheme() {
-  let t = "light";
-  try { t = localStorage.getItem("wb-theme") || "light"; } catch (e) {}
-  applyTheme(t);
-})();
 
-// 轮询
+for (const button of $$(".copy-button")) {
+  button.onclick = async () => {
+    const source = document.getElementById(button.dataset.copy);
+    try { await navigator.clipboard.writeText(source?.textContent || ""); button.title = "已复制"; }
+    catch { button.title = "复制失败"; }
+    setTimeout(() => { button.title = "复制"; }, 1600);
+  };
+}
+
+const themeButton = $("#btnTheme");
+function applyTheme(value) {
+  const theme = value === "dark" ? "dark" : "light";
+  document.documentElement.dataset.theme = theme;
+  themeButton.innerHTML = icon(theme === "dark" ? "sun" : "moon");
+  themeButton.title = theme === "dark" ? "切换到浅色主题" : "切换到深色主题";
+  themeButton.setAttribute("aria-label", themeButton.title);
+  try { localStorage.setItem("wb-theme", theme); } catch { /* local storage optional */ }
+}
+themeButton.onclick = () => applyTheme(document.documentElement.dataset.theme === "dark" ? "light" : "dark");
+try { applyTheme(localStorage.getItem("wb-theme") || "light"); } catch { applyTheme("light"); }
+
 populateModelSelects();
 refresh();
 setInterval(refresh, 2000);

@@ -1,173 +1,67 @@
 <!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="zh-CN" data-theme="dark">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>双 Agent 协作工作台</title>
+  <title>双 Agent 工作台</title>
   <link rel="stylesheet" href="/style.css" />
 </head>
 <body>
   <header class="topbar">
-    <div class="brand">🤝 双 Agent 协作工作台</div>
-    <div class="top-right">
-      <button class="btn small" id="btnTheme" type="button" title="切换深浅色主题">🌙 深色</button>
-      <div class="top-status" id="sysStatus">系统状态加载中…</div>
-    </div>
+    <div class="brand"><img src="/assets/icons/bot.svg" alt="" />双 Agent 工作台</div>
+    <div class="top-right"><div class="top-status" id="sysStatus" aria-live="polite">正在连接系统…</div><button class="icon-button" id="btnTheme" type="button" title="切换主题" aria-label="切换深浅色主题"><img src="/assets/icons/sun.svg" alt="" /></button></div>
   </header>
 
   <div class="layout">
-    <!-- ============ 左侧：项目上下文 + 文件夹选择 ============ -->
     <aside class="sidebar">
-      <button id="btnNewProject" class="btn primary new-project-button" type="button">＋ 新建项目</button>
-      <!-- 当前项目（含文件夹选择），未选中时隐藏 -->
+      <button id="btnNewProject" class="button primary new-project-button" type="button"><img src="/assets/icons/plus.svg" alt="" />新建项目</button>
       <div id="currentProjBox" class="current-project hidden">
-        <div class="curp-head">
-          <span class="curp-label">当前项目</span>
-          <span class="badge" id="curpState">-</span>
-        </div>
-        <div class="curp-name" id="curpName">（未选择）</div>
-        <div class="curp-folder">
-          <div class="curp-folder-title">📁 项目文件夹</div>
-          <div class="curp-dir-row">
-            <span class="curp-dir" id="dirHint" title=""></span>
-            <button class="btn small" id="btnSetDir" title="用鼠标选择本项目的本地文件夹">修改</button>
-          </div>
-        </div>
+        <div class="eyebrow">当前项目</div>
+        <div class="current-project-row"><strong id="curpName">（未选择）</strong><span class="badge" id="curpState">-</span></div>
+        <button class="folder-row" id="btnSetDir" type="button" title="修改工作文件夹"><img src="/assets/icons/folder.svg" alt="" /><span class="curp-dir" id="dirHint"></span><span>修改</span></button>
       </div>
-
-      <div class="proj-list-header">项目列表</div>
+      <div class="sidebar-section-title">项目</div>
       <ul id="projList" class="proj-list"></ul>
-      <div class="sidebar-footer">
-        <div id="sysInfo" class="sys-info"></div>
-      </div>
+      <div class="sidebar-footer"><div id="sysInfo" class="sys-info"></div></div>
     </aside>
 
-    <!-- ============ 右侧：对话工作台 ============ -->
     <main class="main">
-      <div id="emptyHint" class="empty-hint">点击左上角“新建项目”，或从左侧选择一个项目。</div>
+      <div id="emptyHint" class="empty-hint"><img src="/assets/icons/panel-left.svg" alt="" /><h1>选择一个项目开始</h1><p>从左侧打开已有项目，或新建一个工作台任务。</p></div>
       <div id="createView" class="create-view hidden">
+        <div class="create-header"><div class="eyebrow">新项目</div><h1>描述想完成的工作</h1><p>工作台会让 GPT 规划，再由执行器逐项完成。</p></div>
         <div class="create-composer">
-          <textarea id="projTask" rows="5" placeholder="描述你想构建的内容"></textarea>
-          <input id="projDir" type="hidden" />
-          <div class="create-toolbar">
-            <div class="create-toolbar-left">
-              <button id="btnPickDir" class="create-tool-btn" type="button" title="选择工作文件夹">📁</button>
-              <span id="projDirLabel" class="create-dir-label">未选择文件夹（将使用工作台默认目录）</span>
-            </div>
-            <div class="create-toolbar-right">
-              <label class="create-select-label"><span>模型</span><select id="dsModel"><option value="">跟随默认</option></select></label>
-              <label class="create-select-label"><span>推理</span><select id="dsReasoning">
-                <option value="">默认</option><option value="off">off</option><option value="low">low</option><option value="high">high</option><option value="max">max</option>
-              </select></label>
-              <button id="btnCreate" class="create-send-btn" type="button" title="创建并开始">↑</button>
-            </div>
-          </div>
+          <textarea id="projTask" rows="7" placeholder="例如：修复登录页的状态同步问题，并运行现有测试"></textarea><input id="projDir" type="hidden" />
+          <div class="create-toolbar"><div class="create-toolbar-left"><button id="btnPickDir" class="button secondary" type="button"><img src="/assets/icons/folder.svg" alt="" />选择工作文件夹</button><span id="projDirLabel" class="create-dir-label">未选择，将使用默认目录</span></div><div class="create-toolbar-right"><label class="field compact"><span>模型</span><select id="dsModel"><option value="">跟随默认</option></select></label><label class="field compact"><span>推理</span><select id="dsReasoning"><option value="">默认</option><option value="off">off</option><option value="low">low</option><option value="high">high</option><option value="max">max</option></select></label><button id="btnCreate" class="button primary" type="button"><img src="/assets/icons/play.svg" alt="" />创建并开始</button></div></div>
         </div>
       </div>
+
       <div id="detail" class="detail hidden">
-        <!-- 项目顶部信息/状态/设置（过高时可独立滚动，保证底部输入区始终固定） -->
         <div class="detail-top">
-          <!-- 项目工具栏 -->
           <div class="detail-head">
-            <h2 id="dName">项目</h2>
-            <span id="dState" class="badge">-</span>
-            <div class="actions">
-              <button class="btn small" id="btnExecWindow" title="打开本项目的 DeepSeek 执行窗口（实时查看任务执行过程）">🖥 打开执行窗口</button>
-              <button class="btn small" id="btnWindow">🖥 显示浏览器</button>
-              <button class="btn small" id="btnPause">⏸ 暂停</button>
-              <button class="btn small" id="btnResume">▶ 继续</button>
-              <button class="btn small" id="btnRetry">🔄 重试</button>
-              <button class="btn small" id="btnCompact">🗜 压缩会话</button>
-              <button class="btn small danger" id="btnEnd">⏹ 结束项目</button>
-            </div>
+            <div class="title-group"><div class="eyebrow">项目</div><div class="title-row"><h1 id="dName">项目</h1><span id="dState" class="badge">-</span></div></div>
+            <div class="actions"><button class="button secondary" id="btnPause" type="button"><img src="/assets/icons/pause.svg" alt="" />暂停</button><button class="button secondary" id="btnResume" type="button"><img src="/assets/icons/play.svg" alt="" />继续</button><details class="more-actions"><summary class="icon-button" title="更多操作" aria-label="更多项目操作"><img src="/assets/icons/ellipsis.svg" alt="" /></summary><div class="action-menu"><button id="btnRetryTask" type="button"><img src="/assets/icons/rotate-ccw.svg" alt="" />重试当前任务</button><button id="btnRestore" type="button"><img src="/assets/icons/undo-2.svg" alt="" />恢复最近检查点</button><button id="btnCompact" type="button"><img src="/assets/icons/archive.svg" alt="" />压缩执行会话</button><button id="btnExecWindow" type="button"><img src="/assets/icons/monitor.svg" alt="" />打开执行窗口</button><button id="btnWindow" type="button"><img src="/assets/icons/monitor.svg" alt="" />显示 GPT 浏览器</button><button id="btnRetry" type="button"><img src="/assets/icons/rotate-ccw.svg" alt="" />重试工作流</button><button id="btnExportAudit" type="button"><img src="/assets/icons/download.svg" alt="" />导出审计记录</button><button class="danger" id="btnEnd" type="button"><img src="/assets/icons/trash-2.svg" alt="" />结束项目</button></div></details></div>
           </div>
-
-          <!-- 状态/设置带 -->
-          <div id="dGptLive" class="gpt-live hidden"></div>
-          <div class="meta" id="dMeta"></div>
-          <div id="dPending" class="pending-banner hidden"></div>
-          <div id="dExecUi" class="exec-ui-banner hidden"></div>
-          <div id="dError" class="error-banner hidden"></div>
-
-          <!-- 次级导航 -->
-          <div class="tabs">
-            <button class="tab active" data-tab="chat">GPT 对话</button>
-            <button class="tab" data-tab="overview">概览</button>
-            <button class="tab" data-tab="tasks">任务进度</button>
-            <button class="tab" data-tab="plan">GPT 规划</button>
-            <button class="tab" data-tab="analysis">项目分析</button>
-            <button class="tab" data-tab="logs">日志</button>
-          </div>
+          <div class="callout-stack" aria-live="polite"><div id="dGptLive" class="callout info hidden"></div><div id="dPending" class="callout warning hidden"></div><div id="dExecUi" class="callout success hidden"></div><div id="dError" class="callout danger hidden"></div></div>
+          <div class="tabs" role="tablist" aria-label="项目视图"><button class="tab active" id="tab-button-chat" role="tab" aria-selected="true" aria-controls="convoView" tabindex="0" data-tab="chat">对话</button><button class="tab" id="tab-button-overview" role="tab" aria-selected="false" aria-controls="tab-overview" tabindex="-1" data-tab="overview">概览</button><button class="tab" id="tab-button-tasks" role="tab" aria-selected="false" aria-controls="tab-tasks" tabindex="-1" data-tab="tasks">任务</button><button class="tab" id="tab-button-plan" role="tab" aria-selected="false" aria-controls="tab-plan" tabindex="-1" data-tab="plan">规划</button><button class="tab" id="tab-button-analysis" role="tab" aria-selected="false" aria-controls="tab-analysis" tabindex="-1" data-tab="analysis">分析</button><button class="tab" id="tab-button-logs" role="tab" aria-selected="false" aria-controls="tab-logs" tabindex="-1" data-tab="logs">日志</button></div>
         </div>
 
-        <!-- 主体：对话为主视图，次级面板可切换 -->
         <div class="workbench-body">
-          <div id="convoView" class="convo-scroll">
-            <div id="chatList" class="chat-list"></div>
-          </div>
-
-          <section class="tab-body hidden" id="tab-overview">
-            <div class="card"><h4>用户任务</h4><pre id="oTask"></pre></div>
-            <div class="card"><h4>当前执行</h4><pre id="oCurrent"></pre></div>
-            <div class="card"><h4>最近执行记录</h4><pre id="oRuns"></pre></div>
-            <div class="card"><h4>用量汇总</h4><pre id="oUsage"></pre></div>
+          <div id="convoView" class="convo-scroll" role="tabpanel" aria-labelledby="tab-button-chat"><div id="chatList" class="chat-list"></div></div>
+          <section class="tab-body hidden" id="tab-overview" role="tabpanel" aria-labelledby="tab-button-overview">
+            <div class="overview-grid"><article class="metric-card"><span>总体进度</span><strong id="oProgress">0 / 0</strong></article><article class="metric-card"><span>当前任务</span><strong id="oCurrentTask">暂无</strong></article><article class="metric-card"><span>上下文</span><strong id="oContext">—</strong></article><article class="metric-card"><span>总 Token</span><strong id="oTokens">0</strong></article></div>
+            <div class="overview-columns"><article class="card"><div class="card-head"><h2>项目信息</h2></div><dl class="detail-list" id="oProjectMeta"></dl><h3>用户目标</h3><pre id="oTask"></pre></article><article class="card"><div class="card-head"><h2>执行器</h2></div><label class="field"><span>当前执行器</span><select id="executorSelect"><option value="deepseek">DeepSeek Harness</option><option value="cli">通用命令行</option></select></label><pre id="oCurrent"></pre><div class="checkpoint-actions"><button class="button secondary" id="btnOverviewRetry" type="button">重试任务</button><button class="button secondary" id="btnOverviewRestore" type="button">恢复检查点</button></div></article></div>
+            <article class="card"><div class="card-head"><h2>最近执行</h2></div><pre id="oRuns"></pre></article><article class="card"><div class="card-head"><h2>用量</h2></div><pre id="oUsage"></pre></article>
           </section>
-
-          <section class="tab-body hidden" id="tab-tasks">
-            <table class="task-table" id="taskTable"><thead><tr><th>ID</th><th>描述</th><th>模型 / 推理</th><th>耗时</th><th>执行</th><th>Token</th><th>上下文</th><th>状态</th></tr></thead><tbody></tbody></table>
-          </section>
-
-          <section class="tab-body hidden" id="tab-plan">
-            <pre class="file-view" id="planView">（暂无规划）</pre>
-          </section>
-
-          <section class="tab-body hidden" id="tab-analysis">
-            <pre class="file-view" id="analysisView">（暂无分析，任务执行中自动生成）</pre>
-          </section>
-
-          <section class="tab-body hidden" id="tab-logs">
-            <pre class="file-view logs" id="logView"></pre>
-          </section>
+          <section class="tab-body hidden" id="tab-tasks" role="tabpanel" aria-labelledby="tab-button-tasks"><div class="table-scroll"><table class="task-table" id="taskTable"><thead><tr><th>ID</th><th>任务</th><th>类型</th><th>执行</th><th>Token</th><th>验证</th><th>状态</th></tr></thead><tbody></tbody></table></div></section>
+          <section class="tab-body hidden text-panel" id="tab-plan" role="tabpanel" aria-labelledby="tab-button-plan"><div class="panel-toolbar"><span>GPT 规划</span><button class="icon-button copy-button" data-copy="planView" type="button" title="复制规划" aria-label="复制规划"><img src="/assets/icons/copy.svg" alt="" /></button></div><pre class="file-view" id="planView">（暂无规划）</pre></section>
+          <section class="tab-body hidden text-panel" id="tab-analysis" role="tabpanel" aria-labelledby="tab-button-analysis"><div class="panel-toolbar"><span>项目分析</span><button class="icon-button copy-button" data-copy="analysisView" type="button" title="复制分析" aria-label="复制分析"><img src="/assets/icons/copy.svg" alt="" /></button></div><pre class="file-view" id="analysisView">（暂无分析）</pre></section>
+          <section class="tab-body hidden text-panel" id="tab-logs" role="tabpanel" aria-labelledby="tab-button-logs"><div class="panel-toolbar"><span>最近日志</span><button class="icon-button copy-button" data-copy="logView" type="button" title="复制日志" aria-label="复制日志"><img src="/assets/icons/copy.svg" alt="" /></button></div><pre class="file-view logs" id="logView"></pre></section>
         </div>
 
-        <!-- 底部输入区（Composer）：输入框居中，右侧为操作栏（模型/推理在 TASK-005 加入） -->
         <div class="composer" id="composer">
-          <div class="composer-context">
-            <button class="composer-folder-btn" id="btnComposerDir" type="button" title="选择当前项目的工作文件夹">📁</button>
-            <span class="composer-dir-label" id="composerDirLabel" title="">默认工作目录</span>
-          </div>
-          <div class="composer-attachments" id="attachList"></div>
-          <div class="composer-main">
-            <div class="composer-left">
-              <button class="icon-btn" id="btnAttach" type="button" title="上传文件到 GPT">＋</button>
-              <button class="icon-btn" id="btnAttachPhoto" type="button" title="添加照片（将发送给 GPT）">📷</button>
-              <input type="file" id="fileInput" multiple hidden />
-              <input type="file" id="photoInput" accept="image/*" multiple hidden />
-            </div>
-            <div class="composer-input-wrap">
-              <textarea id="composerInput" rows="1" placeholder="给 GPT-5.6 Sol 发送消息…（Enter 发送，Shift+Enter 换行）"></textarea>
-            </div>
-            <div class="composer-ops">
-              <div class="composer-model-slot" id="composerModelSlot">
-                <label class="cs-field" title="DeepSeek 模型">
-                  <span class="cs-label">模型</span>
-                  <select id="cModel" class="composer-select"><option value="">默认</option></select>
-                </label>
-                <label class="cs-field" title="推理强度">
-                  <span class="cs-label">推理</span>
-                  <select id="cReasoning" class="composer-select">
-                    <option value="">默认</option>
-                    <option value="off">off</option>
-                    <option value="low">low</option>
-                    <option value="high">high</option>
-                    <option value="max">max</option>
-                  </select>
-                </label>
-              </div>
-              <button class="btn primary send" id="btnComposerSend" type="button" title="发送到当前项目">发送</button>
-            </div>
-          </div>
-          <div class="composer-hint">附件将发送给 GPT · Enter 发送 · Shift+Enter 换行 · <span id="composerSaveStatus" class="composer-save-status"></span></div>
+          <div class="composer-context"><button class="icon-button" id="btnComposerDir" type="button" title="选择工作文件夹" aria-label="选择当前项目工作文件夹"><img src="/assets/icons/folder.svg" alt="" /></button><span class="composer-dir-label" id="composerDirLabel">默认工作目录</span></div><div class="composer-attachments" id="attachList"></div>
+          <div class="composer-main"><div class="composer-left"><button class="icon-button" id="btnAttach" type="button" title="添加文件" aria-label="添加文件"><img src="/assets/icons/paperclip.svg" alt="" /></button><button class="icon-button" id="btnAttachPhoto" type="button" title="添加图片" aria-label="添加图片"><img src="/assets/icons/image.svg" alt="" /></button><input type="file" id="fileInput" multiple hidden /><input type="file" id="photoInput" accept="image/*" multiple hidden /></div><div class="composer-input-wrap"><textarea id="composerInput" rows="1" placeholder="给 GPT 发送消息…"></textarea></div><div class="composer-ops"><div class="composer-model-slot" id="composerModelSlot"><label class="field compact"><span>模型</span><select id="cModel" class="composer-select"><option value="">默认</option></select></label><label class="field compact"><span>推理</span><select id="cReasoning" class="composer-select"><option value="">默认</option><option value="off">off</option><option value="low">low</option><option value="high">high</option><option value="max">max</option></select></label></div><button class="button primary send" id="btnComposerSend" type="button"><img src="/assets/icons/send.svg" alt="" />发送</button></div></div>
+          <div class="composer-hint">Enter 发送 · Shift+Enter 换行 <span id="composerSaveStatus" class="composer-save-status"></span></div>
         </div>
       </div>
     </main>

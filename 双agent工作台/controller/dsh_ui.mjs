@@ -13,6 +13,7 @@ import path from "node:path";
 import os from "node:os";
 import { spawn, execFile } from "node:child_process";
 import { sleep } from "./logger.mjs";
+import { ensureProfileSkill } from "./workbench_skill.mjs";
 
 /** 与 dsh Web GUI 通信的官方 RPC 客户端。 */
 export function rpc(port, method, payload, timeoutMs = 30000) {
@@ -142,12 +143,13 @@ export class UiExecutor {
       fs.writeFileSync(path.join(dir, "cordis.patch.yml"), "[]\n", "utf8");
       this.log("info", `已创建可见执行 profile: ${dir}`);
     }
-    return { name, dir };
+    const skill = ensureProfileSkill(dir);
+    return { name, dir, skillRoot: path.join(dir, "skills"), skill };
   }
 
   /** 服务进程是否存活且 API 可用。 */
   async isAlive(server) {
-    if (!server || !server.child || server.child.exitCode !== null) return false;
+    if (!server || (server.child && server.child.exitCode !== null)) return false;
     try {
       await rpc(server.port, "host.describe", {}, 4000);
       return true;
@@ -169,7 +171,7 @@ export class UiExecutor {
       }
       this.disposeServer(projectId);
     }
-    this.ensureProfile();
+    const profile = this.ensureProfile();
     const port = await findFreePort();
     const logFile = path.join(logDir, `executor-ui-${Date.now()}.log`);
     fs.mkdirSync(logDir, { recursive: true });
@@ -186,6 +188,7 @@ export class UiExecutor {
       child = spawn(this.cfg.nodeBin || "node", args, {
         cwd: os.homedir(),
         stdio: ["ignore", fd, fd],
+        env: { ...process.env, DSH_BUNDLED_SKILL_DIR: profile.skillRoot },
         windowsHide: true,
       });
     } catch (e) {
@@ -218,6 +221,35 @@ export class UiExecutor {
     }
     this.log("info", `可见执行服务就绪: ${server.url}`);
     return server;
+  }
+
+  /** 接管工作台重启前遗留的 Harness 服务与会话，不创建新会话也不重复提交任务。 */
+  async adoptSession(projectId, saved, sourceDir) {
+    if (!saved?.service_url || !saved?.session_id) return null;
+    let url;
+    try { url = new URL(saved.service_url); } catch { return null; }
+    const port = Number(url.port);
+    if (!port || !["127.0.0.1", "localhost"].includes(url.hostname)) return null;
+    const server = {
+      port,
+      url: `http://127.0.0.1:${port}`,
+      child: null,
+      fd: undefined,
+      logFile: saved.log_file || null,
+      startedAt: saved.started_at ? new Date(saved.started_at).getTime() : Date.now(),
+      sessionId: saved.session_id,
+      needsBootstrap: false,
+      adopted: true,
+      sessions: new Map([[saved.session_id, { taskId: saved.task_id || "-", startedAt: Date.now() }]]),
+    };
+    if (!(await this.isAlive(server))) return null;
+    const list = await rpc(port, "session.list", {}, 15000).catch(() => null);
+    const row = (list?.items || []).find((item) => item.sessionId === saved.session_id);
+    if (!row) return null;
+    if (saved.cwd && path.resolve(saved.cwd) !== path.resolve(sourceDir)) return null;
+    this.servers.set(projectId, server);
+    this.cancelDispose(projectId);
+    return { server, sessionId: saved.session_id, running: !!row.running };
   }
 
   /**
@@ -405,7 +437,7 @@ export class UiExecutor {
         execFile("taskkill", ["/PID", String(s.child.pid), "/T", "/F"], { stdio: "ignore", windowsHide: true }, () => {});
       }
     } catch { /* ignore */ }
-    try { fs.closeSync(s.fd); } catch { /* ignore */ }
+    if (s.fd !== undefined) { try { fs.closeSync(s.fd); } catch { /* ignore */ } }
     this.log("info", `可见执行服务已关闭: ${s.url}（project=${projectId}）`);
   }
 
@@ -435,6 +467,7 @@ export class UiExecutor {
       port: s.port,
       startedAt: s.startedAt,
       sessionId: s.sessionId || null,
+      adopted: !!s.adopted,
       sessions: [...s.sessions.values()].map((v) => ({ taskId: v.taskId, startedAt: v.startedAt })),
     };
   }
@@ -452,5 +485,13 @@ export class UiExecutor {
   /** 退出前关闭全部服务。 */
   shutdownAll() {
     for (const id of [...this.servers.keys()]) this.disposeServer(id);
+  }
+
+  /** 工作台正常退出时仅放下本地句柄，让 Harness 服务可被下一进程接管。 */
+  detachAll() {
+    for (const s of this.servers.values()) {
+      if (s.fd !== undefined) { try { fs.closeSync(s.fd); } catch { /* ignore */ } }
+    }
+    this.servers.clear();
   }
 }

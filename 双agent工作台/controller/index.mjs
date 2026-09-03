@@ -9,7 +9,7 @@ import { fileURLToPath } from "node:url";
 import { Logger, ROOT_DIR, sleep } from "./logger.mjs";
 import { ProjectStore } from "./store.mjs";
 import { GptBridge, MockGptBridge } from "./gpt_bridge.mjs";
-import { DeepseekRunner } from "./deepseek_runner.mjs";
+import { ExecutorRouter } from "./executor_router.mjs";
 import { Orchestrator } from "./orchestrator.mjs";
 import { DashboardServer } from "./server.mjs";
 
@@ -40,7 +40,7 @@ export function buildSystem(opts = {}) {
   const bridge = config.gpt.mode === "mock"
     ? new MockGptBridge(config.gpt, logger)
     : new GptBridge(config.gpt, logger, ROOT_DIR);
-  const runner = new DeepseekRunner(config.deepseek, logger);
+  const runner = new ExecutorRouter(config, logger, store);
   const orchestrator = new Orchestrator(config, logger, bridge, runner, store);
   const server = new DashboardServer(config, logger, orchestrator, store, bridge, runner);
   return { config, logger, store, bridge, runner, orchestrator, server };
@@ -110,13 +110,13 @@ async function main() {
   // 优雅退出
   const shutdown = async () => {
     logger.info("main", "收到退出信号，正在关闭…");
-    try { runner.shutdownAll?.(); } catch (e) { logger.warn("main", `关闭执行窗口失败: ${e.message}`); }
+    try { runner.detachAll?.(); } catch (e) { logger.warn("main", `释放执行句柄失败: ${e.message}`); }
     process.exit(0);
   };
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);
-  // 兜底：进程退出时清理可见执行服务（防止孤儿 dsh web 进程占用端口）
-  process.on("exit", () => { try { runner.shutdownAll?.(); } catch { /* ignore */ } });
+  // 保留 Harness 服务，供工作台重启后按持久化的服务地址与会话 ID 接管。
+  process.on("exit", () => { try { runner.detachAll?.(); } catch { /* ignore */ } });
   process.on("uncaughtException", (e) => logger.error("main", `uncaughtException: ${e.stack || e.message}`));
   process.on("unhandledRejection", (e) => logger.error("main", `unhandledRejection: ${e?.stack || e}`));
 }

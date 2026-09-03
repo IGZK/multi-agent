@@ -52,7 +52,7 @@ export function newProjectId(name) {
 
 export function initialProjectState(projectId, name, task) {
   return {
-    schema: 2,
+    schema: 3,
     project_id: projectId,
     project_name: name,
     created_at: new Date().toISOString(),
@@ -91,6 +91,14 @@ export function initialProjectState(projectId, name, task) {
     analysis_reports: [],
     usage: defaultUsage(),
     session_generations: [],
+    session: null,
+    current_dispatch_id: null,
+    processed_dispatch_ids: [],
+    validation_results: {},
+    executor: {
+      type: "deepseek",
+      capabilities: { modelSelection: true, sessionResume: true, usage: true, visibleWindow: true },
+    },
     pending_model_replan: null,
     compaction: { pending: false, in_progress: false, count: 0, last: null },
     checkpoint: null,
@@ -123,9 +131,13 @@ export function defaultUsage() {
 export function normalizeProjectState(state) {
   if (!state) return null;
   const defaults = defaultUsage();
+  const executorType = state.executor?.type || "deepseek";
+  const executorDefaults = executorType === "cli"
+    ? { modelSelection: false, sessionResume: false, usage: false, visibleWindow: false }
+    : { modelSelection: true, sessionResume: true, usage: true, visibleWindow: true };
   return {
     ...state,
-    schema: 2,
+    schema: 3,
     usage: {
       ...defaults,
       ...(state.usage || {}),
@@ -133,6 +145,17 @@ export function normalizeProjectState(state) {
       gpt: { ...defaults.gpt, ...(state.usage?.gpt || {}) },
     },
     session_generations: state.session_generations || [],
+    session: state.session || null,
+    current_dispatch_id: state.current_dispatch_id || null,
+    processed_dispatch_ids: state.processed_dispatch_ids || [],
+    validation_results: state.validation_results || {},
+    executor: {
+      type: executorType,
+      capabilities: {
+        ...executorDefaults,
+        ...(state.executor?.capabilities || {}),
+      },
+    },
     pending_model_replan: state.pending_model_replan || null,
     compaction: { pending: false, in_progress: false, count: 0, last: null, ...(state.compaction || {}) },
     checkpoint: state.checkpoint || null,
@@ -381,19 +404,153 @@ export class ProjectStore {
   }
 
   readOutbox(projectId) {
+    return this.readOutboxStatus(projectId).data;
+  }
+
+  readOutboxStatus(projectId) {
+    const file = path.join(this.workspaceDir(projectId), "outbox", "message.json");
     try {
-      const f = path.join(this.workspaceDir(projectId), "outbox", "message.json");
-      const raw = fs.readFileSync(f, "utf8");
-      return raw.trim() ? JSON.parse(raw) : null;
+      const raw = fs.readFileSync(file, "utf8");
+      if (!raw.trim()) return { exists: true, complete: false, data: null, error: "empty" };
+      return { exists: true, complete: true, data: JSON.parse(raw), error: null };
+    } catch (error) {
+      return { exists: fs.existsSync(file), complete: false, data: null, error: error.message };
+    }
+  }
+
+  readInbox(projectId) {
+    try {
+      return JSON.parse(fs.readFileSync(path.join(this.workspaceDir(projectId), "inbox", "task.json"), "utf8"));
     } catch {
       return null;
     }
+  }
+
+  writeOutboxAtomic(projectId, value) {
+    const file = path.join(this.workspaceDir(projectId), "outbox", "message.json");
+    const tmp = file + `.tmp-${process.pid}-${Date.now()}`;
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(tmp, JSON.stringify(value, null, 2), "utf8");
+    fs.renameSync(tmp, file);
+    return file;
   }
 
   clearOutbox(projectId) {
     try {
       fs.unlinkSync(path.join(this.workspaceDir(projectId), "outbox", "message.json"));
     } catch { /* ignore */ }
+  }
+
+  createCheckpoint(projectId, taskId, dispatchId) {
+    const source = path.resolve(this.sourceDir(projectId));
+    if (source === path.parse(source).root) throw new Error("拒绝为磁盘根目录创建检查点");
+    const safeTask = String(taskId || "task").replace(/[^a-z0-9_-]+/gi, "-");
+    const safeDispatch = String(dispatchId || Date.now()).replace(/[^a-z0-9_-]+/gi, "-");
+    const rel = path.join("checkpoints", `${safeTask}-${safeDispatch}`);
+    const dir = this.resolveWorkspacePath(projectId, rel);
+    const snapshot = path.join(dir, "source");
+    const excluded = new Set([".git", ".gpt_workspace", "node_modules", ".pnpm-store", ".yarn", ".venv", "venv", "dist", "build", "out", "target", "coverage", ".cache"]);
+    fs.rmSync(dir, { recursive: true, force: true });
+    fs.mkdirSync(snapshot, { recursive: true });
+    try {
+      if (fs.existsSync(source)) {
+        fs.cpSync(source, snapshot, {
+          recursive: true,
+          filter: (entry) => {
+            const relPath = path.relative(source, entry);
+            if (!relPath) return true;
+            return !excluded.has(relPath.split(path.sep)[0]);
+          },
+        });
+      }
+      const checkpoint = {
+        task_id: String(taskId || ""),
+        dispatch_id: String(dispatchId || ""),
+        relative_path: rel.replace(/\\/g, "/"),
+        source_dir: source,
+        created_at: new Date().toISOString(),
+        restored_at: null,
+        status: "ready",
+      };
+      fs.writeFileSync(path.join(dir, "checkpoint.json"), JSON.stringify(checkpoint, null, 2), "utf8");
+      this.writeState(projectId, { checkpoint });
+      return checkpoint;
+    } catch (error) {
+      fs.rmSync(dir, { recursive: true, force: true });
+      throw error;
+    }
+  }
+
+  restoreCheckpoint(projectId) {
+    const st = this.readState(projectId);
+    const checkpoint = st?.checkpoint;
+    if (!checkpoint?.relative_path) throw new Error("没有可恢复的检查点");
+    const dir = this.resolveWorkspacePath(projectId, checkpoint.relative_path);
+    const snapshot = path.join(dir, "source");
+    const source = path.resolve(this.sourceDir(projectId));
+    if (source === path.parse(source).root || !fs.existsSync(snapshot)) throw new Error("检查点不可用或源码目录不安全");
+    const excluded = new Set([".git", ".gpt_workspace", "node_modules", ".pnpm-store", ".yarn", ".venv", "venv", "dist", "build", "out", "target", "coverage", ".cache"]);
+    fs.mkdirSync(source, { recursive: true });
+    for (const entry of fs.readdirSync(source, { withFileTypes: true })) {
+      if (excluded.has(entry.name)) continue;
+      fs.rmSync(path.join(source, entry.name), { recursive: true, force: true });
+    }
+    for (const entry of fs.readdirSync(snapshot, { withFileTypes: true })) {
+      fs.cpSync(path.join(snapshot, entry.name), path.join(source, entry.name), { recursive: true });
+    }
+    const restored = { ...checkpoint, restored_at: new Date().toISOString(), status: "restored" };
+    this.writeState(projectId, { checkpoint: restored });
+    return restored;
+  }
+
+  clearCheckpoint(projectId) {
+    const checkpoint = this.readState(projectId)?.checkpoint;
+    if (checkpoint?.relative_path) {
+      const dir = this.resolveWorkspacePath(projectId, checkpoint.relative_path);
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+    this.writeState(projectId, { checkpoint: null });
+  }
+
+  exportAudit(projectId) {
+    const st = this.readState(projectId);
+    if (!st) throw new Error(`项目不存在: ${projectId}`);
+    const lines = [
+      `# ${st.project_name} 审计记录`,
+      "",
+      `- 导出时间：${new Date().toISOString()}`,
+      `- 当前状态：${st.state}`,
+      `- 执行器：${st.executor?.type || "deepseek"}`,
+      `- 当前任务：${st.current_task?.id || "无"}`,
+      `- 当前派发：${st.current_dispatch_id || "无"}`,
+      "",
+      "## 计划",
+      "",
+      st.plan?.raw || "（无）",
+      "",
+      "## 已完成任务",
+      "",
+      JSON.stringify(st.completed_tasks || [], null, 2),
+      "",
+      "## 失败任务",
+      "",
+      JSON.stringify(st.failed_tasks || [], null, 2),
+      "",
+      "## 验证结果",
+      "",
+      JSON.stringify(st.validation_results || {}, null, 2),
+      "",
+      "## 执行与恢复记录",
+      "",
+      JSON.stringify({ executor_runs: st.executor_runs || [], checkpoint: st.checkpoint, session_generations: st.session_generations || [] }, null, 2),
+      "",
+      "## 用量",
+      "",
+      JSON.stringify(st.usage || {}, null, 2),
+    ];
+    const content = lines.join("\n");
+    this.writeWorkspaceFile(projectId, "audit-export.md", content);
+    return { file: ".gpt_workspace/audit-export.md", content };
   }
 
   saveAttachment(projectId, name, mime, buffer) {

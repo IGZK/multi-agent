@@ -106,7 +106,19 @@ export function parsePlan(text) {
   let currentTask = null;
   let expectingDeps = false; // "dependencies:" 后跨空行收集依赖（GPT 变体格式）
   const LIST_SECTIONS = new Set(["goals", "acceptance_criteria", "constraints", "questions_for_executor"]);
-  const TASK_ATTRS = new Set(["description", "priority", "dependencies", "id"]);
+  const TASK_ATTRS = new Set(["description", "priority", "dependencies", "id", "kind", "validation", "timeout", "max_attempts"]);
+  const newTask = (id, description = "") => ({
+    id: String(id || "").toUpperCase(), description, priority: "medium", dependencies: [],
+    kind: "coding", validation: null, timeout: null, max_attempts: null,
+  });
+  const assignTaskAttr = (task, key, val) => {
+    if (key === "description") task.description = val;
+    else if (key === "priority") task.priority = val;
+    else if (key === "kind") task.kind = ["coding", "test", "analysis", "docs"].includes(val.toLowerCase()) ? val.toLowerCase() : "coding";
+    else if (key === "validation") task.validation = val || null;
+    else if (key === "timeout") task.timeout = Number.isFinite(Number(val)) && Number(val) > 0 ? Number(val) : null;
+    else if (key === "max_attempts") task.max_attempts = Number.isFinite(Number(val)) && Number(val) > 0 ? Math.floor(Number(val)) : null;
+  };
 
   const sectionOf = (line) => {
     const m = line.match(/^([a-z_]+)\s*:\s*$/i);
@@ -134,9 +146,8 @@ export function parsePlan(text) {
         if (akv) {
           const key = akv[1].toLowerCase();
           const val = akv[2].trim();
-          if (key === "description") currentTask.description = val;
-          else if (key === "priority") currentTask.priority = val;
-          else if (key === "dependencies") {
+          if (key !== "dependencies") assignTaskAttr(currentTask, key, val);
+          else {
             if (val) {
               for (const d of val.replace(/[\[\]]/g, "").split(/[,，]/)) {
                 const dd = d.trim().replace(/,$/, "");
@@ -173,12 +184,7 @@ export function parsePlan(text) {
       }
       // GPT 变体：顶格 "id: TASK-xxx" 新任务
       if (key === "id" && /^TASK-/i.test(val)) {
-        currentTask = {
-          id: val.replace(/[,.:：].*$/, "").trim().toUpperCase(),
-          description: "",
-          priority: "medium",
-          dependencies: [],
-        };
+        currentTask = newTask(val.replace(/[,.:：].*$/, "").trim());
         plan.tasks.push(currentTask);
         section = "tasks";
         expectingDeps = false;
@@ -186,9 +192,8 @@ export function parsePlan(text) {
       }
       // GPT 变体：任务属性顶格（未缩进）
       if (currentTask && TASK_ATTRS.has(key)) {
-        if (key === "description" && val) currentTask.description = val;
-        else if (key === "priority" && val) currentTask.priority = val;
-        else if (key === "dependencies") {
+        if (key !== "dependencies") assignTaskAttr(currentTask, key, val);
+        else {
           if (val) {
             for (const d of val.replace(/[\[\]]/g, "").split(/[,，]/)) {
               const dd = d.trim().replace(/,$/, "");
@@ -216,12 +221,7 @@ export function parsePlan(text) {
     const bareTask = !currentTask ? trimmed.match(/^(TASK-[\w-]+)(?:\s*[:：\-–—]\s*(.+))?$/i) : null;
     const taskMatch = taskId || bareTask;
     if (taskMatch) {
-      currentTask = {
-        id: taskMatch[1].toUpperCase(),
-        description: (taskMatch[2] || "").trim(),
-        priority: "medium",
-        dependencies: [],
-      };
+      currentTask = newTask(taskMatch[1], (taskMatch[2] || "").trim());
       plan.tasks.push(currentTask);
       section = "tasks";
       expectingDeps = false;
@@ -256,7 +256,7 @@ export function parsePlan(text) {
     for (const line of lines) {
       const m = line.trim().match(/^(?:[-*]\s*)?(TASK-[\w-]+)\s*[:：\-–—]?\s*(.*)$/i);
       if (m && !plan.tasks.some((t) => t.id === m[1].toUpperCase())) {
-        plan.tasks.push({ id: m[1].toUpperCase(), description: m[2] || "", priority: "medium", dependencies: [] });
+        plan.tasks.push(newTask(m[1], m[2] || ""));
       }
     }
   }
@@ -323,6 +323,27 @@ export function wrapDeepseekQuery(payload) {
     payload.question ? `\nquestion:\n${payload.question}` : "",
   ].join("");
   return `<DEEPSEEK_QUERY>\n${fields}\n</DEEPSEEK_QUERY>`;
+}
+
+const EXECUTOR_RESULT_TYPES = new Set(["TASK_DONE", "TASK_FAILED", "ASK_GPT"]);
+
+/** v3 outbox 边界校验：拒绝旧、重复、未知或与当前派发不匹配的结果。 */
+export function validateExecutorOutbox(outbox, envelope, processedDispatchIds = [], now = Date.now()) {
+  if (!outbox || typeof outbox !== "object" || Array.isArray(outbox)) return { ok: false, code: "OUTBOX_INCOMPLETE", error: "结果信封不完整" };
+  if (Number(outbox.schema_version) !== 3) return { ok: false, code: "OUTBOX_SCHEMA", error: "结果信封 schema_version 必须为 3" };
+  if (!EXECUTOR_RESULT_TYPES.has(outbox.type)) return { ok: false, code: "OUTBOX_TYPE", error: `未知结果类型: ${outbox.type || "空"}` };
+  if (!outbox.dispatch_id || outbox.dispatch_id !== envelope?.dispatch_id) return { ok: false, code: "OUTBOX_DISPATCH", error: "结果 dispatch_id 与当前派发不匹配" };
+  if (processedDispatchIds.includes(outbox.dispatch_id)) return { ok: false, code: "OUTBOX_DUPLICATE", error: "结果 dispatch_id 已处理" };
+  if (!outbox.project_id || outbox.project_id !== envelope?.project_id) return { ok: false, code: "OUTBOX_PROJECT", error: "结果 project_id 与当前项目不匹配" };
+  const expectedTask = String(envelope?.task_id || envelope?.current_task?.id || envelope?.type || "").toUpperCase();
+  if (!outbox.task_id || String(outbox.task_id).toUpperCase() !== expectedTask) return { ok: false, code: "OUTBOX_TASK", error: "结果 task_id 与当前任务不匹配" };
+  const created = Date.parse(outbox.created_at || "");
+  const dispatched = Date.parse(envelope?.created_at || envelope?.dispatched_at || "");
+  const maxAge = Math.max(60000, Number(envelope?.timeoutMs || 2700000)) + 300000;
+  if (!Number.isFinite(created) || (Number.isFinite(dispatched) && created + 1000 < dispatched) || created > now + 300000 || created < now - maxAge) {
+    return { ok: false, code: "OUTBOX_STALE", error: "结果时间早于当前派发或无效" };
+  }
+  return { ok: true };
 }
 
 export function extractMsgType(text) {
@@ -482,6 +503,17 @@ questions_for_executor:
   check("gpt-variant desc", pv.tasks[0].description.includes("主程序") && pv.tasks[2].description === "运行验证");
   check("gpt-variant criteria", pv.acceptance_criteria.length === 1 && pv.constraints.length === 1);
   check("gpt-variant goals", pv.goals.length === 1);
+
+  const taskFields = parsePlan(`status: READY\ntasks:\n- id: TASK-010\n  description: 修复问题\n  kind: test\n  validation: npm test\n  timeout: 120\n  max_attempts: 3\n  dependencies: []`);
+  check("task fields", taskFields.tasks[0].kind === "test" && taskFields.tasks[0].validation === "npm test" && taskFields.tasks[0].timeout === 120 && taskFields.tasks[0].max_attempts === 3);
+
+  const dispatchedAt = new Date().toISOString();
+  const envelope = { schema_version: 3, project_id: "demo", task_id: "TASK-010", dispatch_id: "dispatch-10", created_at: dispatchedAt };
+  const result = { schema_version: 3, type: "TASK_DONE", project_id: "demo", task_id: "TASK-010", dispatch_id: "dispatch-10", created_at: dispatchedAt };
+  check("valid v3 outbox", validateExecutorOutbox(result, envelope).ok);
+  check("reject wrong dispatch", validateExecutorOutbox({ ...result, dispatch_id: "wrong" }, envelope).code === "OUTBOX_DISPATCH");
+  check("reject duplicate dispatch", validateExecutorOutbox(result, envelope, ["dispatch-10"]).code === "OUTBOX_DUPLICATE");
+  check("reject expired outbox", validateExecutorOutbox({ ...result, created_at: "2020-01-01T00:00:00.000Z" }, { ...envelope, created_at: "2020-01-01T00:00:00.000Z", timeoutMs: 1000 }).code === "OUTBOX_STALE");
 
   // DeepSeek Query 包装
   const q = wrapDeepseekQuery({ type: "DECISION_REQUIRED", problem: "冲突", question: "选哪个?" });

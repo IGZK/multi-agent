@@ -1,6 +1,6 @@
 {
   "name": "ai-dual-agent-workbench",
-  "version": "1.7.0",
+  "version": "2.0.0",
   "private": true,
   "type": "module",
   "description": "双 Agent 协作工作台：GPT-5.6 Sol（聊天型 ChatGPT，浏览器桥）+ DeepSeek Harness（无头执行者）+ 本地编排器 + Web Dashboard",
