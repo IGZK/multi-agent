@@ -635,7 +635,7 @@ test("新建项目可由工作目录自动命名并按目录暴露", async () =>
   let created;
   const sourceDir = path.join(f.root, "demo-source");
   const orchestrator = {
-    async createProject(name, task, dir) { created = { name, task, dir }; return "demo-source"; },
+    async createProject(name, task, dir, opts) { created = { name, task, dir, opts }; return "demo-source"; },
   };
   const bridge = { async getSystemState() { return {}; } };
   const runner = { status() { return {}; } };
@@ -645,10 +645,12 @@ test("新建项目可由工作目录自动命名并按目录暴露", async () =>
     const base = `http://127.0.0.1:${server.server.address().port}`;
     const response = await fetch(`${base}/api/projects`, {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ task: "实现一个目录内工具", source_dir: sourceDir }),
+      body: JSON.stringify({ task: "实现一个目录内工具", source_dir: sourceDir, attachments: [{ name: "需求.txt", mime: "text/plain", data: "data:text/plain;base64,5L2g5aW9" }] }),
     });
     assert.equal(response.status, 201);
-    assert.deepEqual(created, { name: "demo-source", task: "实现一个目录内工具", dir: path.resolve(sourceDir) });
+    assert.deepEqual({ name: created.name, task: created.task, dir: created.dir }, { name: "demo-source", task: "实现一个目录内工具", dir: path.resolve(sourceDir) });
+    assert.equal(created.opts.attachments[0].name, "需求.txt");
+    assert.equal(created.opts.attachments[0].buffer.toString("utf8"), "你好");
   } finally {
     if (server.server?.listening) await new Promise((resolve) => server.server.close(resolve));
     f.cleanup();

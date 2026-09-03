@@ -132,20 +132,13 @@ code, pre, .mono { font-family: "Cascadia Code", Consolas, monospace; }
 .empty-hint h1, .create-header h1, .detail-head h1 { margin: 0; color: var(--text); letter-spacing: -.025em; }
 .empty-hint h1 { font-size: 22px; }
 .empty-hint p, .create-header p { margin: 8px 0 0; }
-.create-view { place-content: center stretch; justify-items: center; overflow-y: auto; }
-.create-header, .create-composer { width: min(820px, 100%); }
-.create-header { margin-bottom: 20px; }
-.create-header h1 { margin-top: 4px; font-size: 28px; }
-.create-header p { color: var(--text-muted); }
-.create-composer { padding: 16px; border: 1px solid var(--border); border-radius: 12px; background: var(--surface); box-shadow: var(--shadow); }
+.create-view { width: 100%; grid-template-columns: minmax(0, 1fr); place-content: end stretch; justify-items: center; padding: 32px 0 0; overflow-y: auto; }
+.create-header { width: min(840px, calc(100% - 48px)); }
+.create-header { margin-bottom: 10px; }
+.create-header h1 { font-size: 20px; }
 textarea, select { border: 1px solid var(--border); background: var(--surface); }
 textarea:hover, select:hover { border-color: var(--border-strong); }
 textarea:focus, select:focus { border-color: var(--focus); outline: 2px solid color-mix(in srgb, var(--focus) 24%, transparent); outline-offset: 0; }
-.create-composer textarea { width: 100%; min-height: 164px; padding: 12px; resize: vertical; border: 0; background: transparent; outline: 0; line-height: 1.65; }
-.create-toolbar, .create-toolbar-left, .create-toolbar-right { display: flex; align-items: end; gap: 8px; }
-.create-toolbar { justify-content: space-between; padding-top: 12px; border-top: 1px solid var(--border); }
-.create-toolbar-left { min-width: 0; align-items: center; }
-.create-dir-label { max-width: 260px; color: var(--text-subtle); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .field { display: grid; gap: 4px; }
 .field > span { color: var(--text-muted); font-size: 12px; }
 .field select { min-height: 36px; padding: 0 28px 0 10px; border-radius: 6px; }
@@ -230,7 +223,7 @@ textarea:focus, select:focus { border-color: var(--focus); outline: 2px solid co
 .file-view { width: min(1040px, calc(100% - 48px)); height: calc(100% - 68px); margin: 12px auto; padding: 16px; border: 0; border-radius: var(--radius); background: var(--surface-subtle); color: var(--text); white-space: pre-wrap; overflow: auto; font-size: 13px; line-height: 1.65; tab-size: 2; }
 .file-view.logs { white-space: pre; }
 
-.composer { z-index: 20; padding: 8px 24px 12px; background: var(--surface); border-top: 1px solid var(--border); box-shadow: 0 -8px 20px rgb(24 35 51 / 5%); }
+.composer { z-index: 20; width: min(840px, calc(100% - 48px)); margin-bottom: 12px; padding: 8px 10px; justify-self: center; background: var(--surface); border: 1px solid var(--border); border-radius: 10px; box-shadow: var(--shadow); }
 .composer-context { min-width: 0; display: flex; align-items: center; gap: 6px; color: var(--text-subtle); font-size: 11px; }
 .composer-context .icon-button { width: 28px; height: 28px; }
 .composer-dir-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -238,10 +231,11 @@ textarea:focus, select:focus { border-color: var(--focus); outline: 2px solid co
 .composer-main { min-width: 0; display: flex; align-items: end; gap: 8px; }
 .composer-left, .composer-ops, .composer-model-slot { display: flex; align-items: end; gap: 6px; }
 .composer-input-wrap { min-width: 120px; flex: 1; }
-.composer-input-wrap textarea { width: 100%; min-height: 40px; max-height: 180px; padding: 9px 11px; resize: none; border-radius: var(--radius); line-height: 1.5; }
+.composer-input-wrap textarea { width: 100%; min-height: 36px; max-height: 120px; padding: 7px 10px; resize: none; border-radius: var(--radius); line-height: 1.5; }
 .composer-select { max-width: 160px; }
-.button.send { min-height: 40px; }
-.composer-hint { margin-top: 4px; text-align: right; color: var(--text-subtle); font-size: 11px; }
+.composer-model-slot .field > span { display: none; }
+.button.send { min-height: 36px; }
+.composer-hint { display: none; }
 .composer-save-status { color: var(--success); opacity: 0; transition: opacity .15s; }
 .composer-save-status.show { opacity: 1; }
 .attach-card { flex: 0 0 auto; width: 236px; min-height: 52px; margin: 6px 0; padding: 6px; display: flex; align-items: center; gap: 8px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface-subtle); }
@@ -268,13 +262,12 @@ textarea:focus, select:focus { border-color: var(--focus); outline: 2px solid co
   :root { --sidebar-w: 232px; }
   .top-status .secondary-status { display: none; }
   .detail-top, .convo-scroll, .tab-body { padding-left: 16px; padding-right: 16px; }
-  .composer { padding-left: 16px; padding-right: 16px; }
+  .composer { width: calc(100% - 32px); }
   .detail-head { align-items: flex-start; }
   .detail-head .button { width: 36px; padding: 0; font-size: 0; }
+  .detail-head .lifecycle-action { width: auto; padding: 0 10px; font-size: 13px; }
   .detail-head .button img { width: 16px; height: 16px; }
   .overview-columns { grid-template-columns: 1fr; }
-  .create-toolbar { align-items: stretch; }
-  .create-toolbar, .create-toolbar-right { flex-wrap: wrap; }
   .composer-model-slot { display: none; }
 }
 @media (max-width: 700px) {
@@ -291,13 +284,11 @@ textarea:focus, select:focus { border-color: var(--focus); outline: 2px solid co
   .tabs { gap: 16px; }
   .overview-grid { grid-template-columns: 1fr 1fr; gap: 8px; }
   .metric-card { padding: 10px 12px; }
-  .create-view { padding: 20px 16px; }
-  .create-toolbar-left, .create-toolbar-right { width: 100%; }
-  .create-toolbar-right .button { margin-left: auto; }
+  .create-view { padding: 20px 0 0; }
   .composer-context { display: none; }
   .composer-main { gap: 4px; }
   .composer-left { gap: 2px; }
   .composer-left .icon-button { width: 32px; }
   .button.send { width: 40px; padding: 0; font-size: 0; }
-  .composer-hint { display: none; }
+  .detail-head .lifecycle-action { padding: 0 8px; font-size: 12px; }
 }

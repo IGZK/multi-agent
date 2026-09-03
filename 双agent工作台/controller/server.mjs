@@ -40,6 +40,16 @@ function readBody(req, maxBytes = 1024 * 1024) {
   });
 }
 
+function decodeAttachment(input) {
+  const encoded = String(input?.data || "").replace(/^data:[^,]*;base64,/, "").replace(/\s/g, "");
+  if (!input?.name || !encoded || encoded.length % 4 === 1 || !/^[A-Za-z0-9+/]*={0,2}$/.test(encoded)) {
+    throw Object.assign(new Error("附件数据无效"), { statusCode: 400 });
+  }
+  const buffer = Buffer.from(encoded, "base64");
+  if (buffer.length > 50 * 1024 * 1024) throw Object.assign(new Error("附件超过 50MB"), { statusCode: 413 });
+  return { name: String(input.name), mime: String(input.mime || "application/octet-stream"), buffer };
+}
+
 function readTextTail(file, maxBytes = 64 * 1024) {
   // ponytail: 64KB 足够容纳常规 60 行日志；超长单行出现时再改为分块向前读取。
   const size = fs.statSync(file).size;
@@ -173,7 +183,7 @@ export class DashboardServer {
         }
       }
       if (p === "/api/projects" && req.method === "POST") {
-        const body = await readBody(req);
+        const body = await readBody(req, 72 * 1024 * 1024);
         const task = String(body.task || "").trim();
         if (!task) return sendJson(res, 400, { error: "需要 task" });
         let sourceDir = null;
@@ -201,6 +211,11 @@ export class DashboardServer {
           };
         }
         if (body.executor_type) opts.executor_type = String(body.executor_type);
+        try {
+          opts.attachments = (Array.isArray(body.attachments) ? body.attachments : []).map(decodeAttachment);
+        } catch (error) {
+          return sendJson(res, error.statusCode || 400, { error: error.message });
+        }
         const id = await this.orchestrator.createProject(name, task, sourceDir, opts);
         return sendJson(res, 201, { id });
       }
@@ -262,13 +277,10 @@ export class DashboardServer {
       if (ma && req.method === "POST") {
         const body = await readBody(req, 72 * 1024 * 1024);
         const id = decodeURIComponent(ma[1]);
-        const encoded = String(body.data || "").replace(/^data:[^,]*;base64,/, "").replace(/\s/g, "");
-        if (!body.name || !encoded || encoded.length % 4 === 1 || !/^[A-Za-z0-9+/]*={0,2}$/.test(encoded)) {
-          return sendJson(res, 400, { error: "附件数据无效" });
-        }
-        const buffer = Buffer.from(encoded, "base64");
-        if (buffer.length > 50 * 1024 * 1024) return sendJson(res, 413, { error: "附件超过 50MB" });
-        const attachment = this.store.saveAttachment(id, body.name, body.mime, buffer);
+        let decoded;
+        try { decoded = decodeAttachment(body); }
+        catch (error) { return sendJson(res, error.statusCode || 400, { error: error.message }); }
+        const attachment = this.store.saveAttachment(id, decoded.name, decoded.mime, decoded.buffer);
         return sendJson(res, 201, { attachment });
       }
       const m3 = p.match(/^\/api\/projects\/([^/]+)\/message$/);

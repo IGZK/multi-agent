@@ -280,7 +280,10 @@ async function refreshDetail() {
     $("#btnExecWindow").classList.toggle("hidden", capabilities.visibleWindow === false);
     $("#btnCompact").classList.toggle("hidden", capabilities.sessionResume === false);
     $("#composerModelSlot").classList.toggle("hidden", capabilities.modelSelection === false);
-    $("#btnPause").classList.toggle("hidden", ["PAUSED", "COMPLETED", "CANCELED"].includes(detail.state));
+    const pauseUnavailable = ["COMPLETED", "CANCELED", "ERROR"].includes(detail.state);
+    $("#btnPause").classList.toggle("hidden", detail.state === "PAUSED");
+    $("#btnPause").disabled = pauseUnavailable;
+    $("#btnPause").title = pauseUnavailable ? "当前项目无法暂停" : "暂停项目";
     $("#btnResume").classList.toggle("hidden", detail.state !== "PAUSED");
     $("#btnRetryTask").disabled = !detail.current_task && !(detail.failed_tasks || []).length;
     $("#btnOverviewRetry").disabled = $("#btnRetryTask").disabled;
@@ -398,6 +401,7 @@ function showCreateView() {
   $("#detail").classList.add("hidden");
   $("#createView").classList.remove("hidden");
   $("#currentProjBox").classList.add("hidden");
+  autoGrow($("#projTask"));
   $("#projTask").focus();
 }
 
@@ -423,6 +427,7 @@ async function chooseProjectFolder() {
 async function createProject() {
   const task = $("#projTask").value.trim();
   if (!task) { alert("请先描述你想完成的工作"); $("#projTask").focus(); return; }
+  if (createAttachments.some((item) => item.status === "failed")) return alert("有附件无法使用，请先移除后再创建项目。");
   const button = $("#btnCreate");
   const original = button.innerHTML;
   try {
@@ -432,10 +437,20 @@ async function createProject() {
     if (sourceDir) payload.source_dir = sourceDir;
     const selection = selectedModelPayload();
     if (selection) payload.deepseek_selection = selection;
+    if (createAttachments.length) {
+      payload.attachments = await Promise.all(createAttachments.map(async (item) => ({
+        name: item.name,
+        mime: item.type,
+        data: await fileAsDataUrl(item.file),
+      })));
+    }
     const result = await api("/api/projects", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
     $("#projTask").value = "";
     $("#projDir").value = "";
-    $("#projDirLabel").textContent = "未选择，将使用默认目录";
+    $("#projDirLabel").textContent = "默认工作目录";
+    $("#projDirLabel").removeAttribute("title");
+    autoGrow($("#projTask"));
+    clearCreateAttachments();
     currentProjectId = result.id;
     $("#createView").classList.add("hidden");
     $("#detail").classList.remove("hidden");
@@ -538,8 +553,10 @@ $("#btnEnd").onclick = () => { if (confirm("确定结束这个项目？\n正在�
 
 const composerInput = $("#composerInput");
 const composerSend = $("#btnComposerSend");
+const projectInput = $("#projTask");
 const MAX_ATTACH_SIZE = 50 * 1024 * 1024;
 let composerAttachments = [];
+let createAttachments = [];
 let attachSeq = 0;
 
 function autoGrow(element) {
@@ -570,6 +587,10 @@ composerInput.addEventListener("keydown", (event) => {
 });
 for (const eventName of ["dragover", "drop"]) composerInput.addEventListener(eventName, (event) => event.preventDefault());
 composerSend.onclick = sendComposer;
+projectInput.addEventListener("input", () => autoGrow(projectInput));
+projectInput.addEventListener("keydown", (event) => {
+  if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); createProject(); }
+});
 
 function fmtSize(bytes) {
   if (bytes < 1024) return `${bytes}B`;
@@ -630,6 +651,50 @@ function clearAttachments() {
   $("#attachList").innerHTML = "";
 }
 
+function addCreateFiles(fileList) {
+  for (const file of Array.from(fileList || [])) {
+    const attachment = { id: ++attachSeq, file, name: file.name, size: file.size, type: file.type, status: "ready" };
+    if (file.size > MAX_ATTACH_SIZE) Object.assign(attachment, { status: "failed", reason: "文件超过 50MB" });
+    else if (file.type?.startsWith("image/")) {
+      try { attachment.preview = URL.createObjectURL(file); } catch { /* preview optional */ }
+    }
+    createAttachments.push(attachment);
+  }
+  renderCreateAttachments();
+}
+
+function removeCreateAttachment(id) {
+  const index = createAttachments.findIndex((item) => item.id === id);
+  if (index < 0) return;
+  if (createAttachments[index].preview) URL.revokeObjectURL(createAttachments[index].preview);
+  createAttachments.splice(index, 1);
+  renderCreateAttachments();
+}
+
+function clearCreateAttachments() {
+  for (const attachment of createAttachments) if (attachment.preview) URL.revokeObjectURL(attachment.preview);
+  createAttachments = [];
+  $("#createAttachList").innerHTML = "";
+}
+
+function renderCreateAttachments() {
+  const list = $("#createAttachList");
+  list.innerHTML = "";
+  for (const attachment of createAttachments) {
+    const card = document.createElement("div");
+    card.className = `attach-card ${attachment.status}`;
+    const preview = attachment.preview
+      ? `<div class="attach-thumb"><img src="${attachment.preview}" alt="${escapeHtml(attachment.name)}" /></div>`
+      : `<div class="attach-icon">${icon(attachment.type?.startsWith("image/") ? "image" : "paperclip")}</div>`;
+    const state = attachment.status === "failed"
+      ? `<span class="attach-state failed">失败：${escapeHtml(attachment.reason || "无法使用")}</span>`
+      : '<span class="attach-state success">创建时上传</span>';
+    card.innerHTML = `${preview}<div class="attach-info"><div class="attach-name" title="${escapeHtml(attachment.name)}">${escapeHtml(attachment.name)}</div><div class="attach-meta">${fmtSize(attachment.size)} · ${state}</div></div><div class="attach-actions"><button class="attach-act" type="button" title="移除" aria-label="移除附件">移除</button></div>`;
+    card.querySelector("button").onclick = () => removeCreateAttachment(attachment.id);
+    list.appendChild(card);
+  }
+}
+
 function renderAttachments() {
   const list = $("#attachList");
   list.innerHTML = "";
@@ -653,8 +718,12 @@ function renderAttachments() {
 
 $("#btnAttach").onclick = () => $("#fileInput").click();
 $("#btnAttachPhoto").onclick = () => $("#photoInput").click();
+$("#btnCreateAttach").onclick = () => $("#createFileInput").click();
+$("#btnCreateAttachPhoto").onclick = () => $("#createPhotoInput").click();
 $("#fileInput").onchange = () => { addFiles($("#fileInput").files); $("#fileInput").value = ""; };
 $("#photoInput").onchange = () => { addFiles($("#photoInput").files); $("#photoInput").value = ""; };
+$("#createFileInput").onchange = () => { addCreateFiles($("#createFileInput").files); $("#createFileInput").value = ""; };
+$("#createPhotoInput").onchange = () => { addCreateFiles($("#createPhotoInput").files); $("#createPhotoInput").value = ""; };
 
 function activateTab(tab) {
   const tabs = $$(".tab");

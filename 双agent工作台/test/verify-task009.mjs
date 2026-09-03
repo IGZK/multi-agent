@@ -31,6 +31,7 @@ const uploadedAttachments = [];
 const dialogs = [];
 let pickDirBodies = [];
 let fakeDir = "C:/fake/project/dir/演示路径";
+let projectState = "PAUSED";
 
 page.on("console", (m) => { if (m.type() === "error") errors.push(m.text()); });
 page.on("pageerror", (e) => errors.push("pageerror: " + e.message));
@@ -62,10 +63,10 @@ await page.route("**/api/projects/*/action", async (route) => {
 await page.route("**/api/projects", async (route) => {
   const req = route.request();
   if (req.method() === "POST") { try { createPayload.push(req.postDataJSON()); } catch (e) {} await route.fulfill({ status: 400, contentType: "application/json", body: JSON.stringify({ error: "reg-test-blocked" }) }); }
-  else await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ projects: [{ id: "demo", name: "演示", state: "PAUSED", source_dir: "C:/demo", updated_at: new Date().toISOString() }], system: { bridge: { browserOk: true, loggedIn: true }, runner: { active: [], uis: [], executors: [{ type: "deepseek", configured: true }, { type: "cli", configured: false }] }, mode: { gpt: "mock", deepseek: "mock" } } }) });
+  else await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ projects: [{ id: "demo", name: "演示", state: projectState, source_dir: "C:/demo", updated_at: new Date().toISOString() }], system: { bridge: { browserOk: true, loggedIn: true }, runner: { active: [], uis: [], executors: [{ type: "deepseek", configured: true }, { type: "cli", configured: false }] }, mode: { gpt: "mock", deepseek: "mock" } } }) });
 });
 await page.route("**/api/projects/demo", async (route) => route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({
-  id: "demo", name: "演示", state: "PAUSED", user_task: "测试", created_at: new Date().toISOString(), updated_at: new Date().toISOString(),
+  id: "demo", name: "演示", state: projectState, user_task: "测试", created_at: new Date().toISOString(), updated_at: new Date().toISOString(),
   current_task: { id: "TASK-002", description: "验证工作台交互", kind: "test", priority: "high", dependencies: ["TASK-001"], validation: "npm test" },
   completed_tasks: [{ id: "TASK-001" }], failed_tasks: [], tasks: [{ id: "TASK-001", description: "整理状态协议", kind: "coding", dependencies: [], validation: "npm test" }, { id: "TASK-002", description: "验证工作台交互", kind: "test", dependencies: ["TASK-001"], validation: "npm test" }], decisions: [], replans: [], analysis_reports: [], executor_runs: [{ ts: new Date().toISOString(), type: "EXECUTE_PLAN", task_id: "TASK-001", attempt: 1, exitCode: 0, ms: 1200 }],
   conversation: [{ dir: "out", type: "PLAN_REQUEST", ts: new Date().toISOString(), text: "请规划这个项目" }, { dir: "in", type: "READY", ts: new Date().toISOString(), text: "计划已经准备完成。" }],
@@ -94,17 +95,19 @@ const layout = await page.evaluate(() => {
   const main = document.querySelector(".main").getBoundingClientRect();
   const composer = document.querySelector("#composer").getBoundingClientRect();
   const input = document.querySelector("#composerInput").getBoundingClientRect();
-  const wrap = document.querySelector(".composer-input-wrap").getBoundingClientRect();
+  const wrap = document.querySelector("#composer .composer-input-wrap").getBoundingClientRect();
   const sidebar = document.querySelector(".sidebar").getBoundingClientRect();
   return {
-    composerAtBottom: Math.abs(composer.bottom - main.bottom) < 2,
+    composerAtBottom: main.bottom - composer.bottom <= 16,
+    composerCentered: Math.abs((main.left + main.width / 2) - (composer.left + composer.width / 2)) < 3,
+    composerCompact: composer.width <= 840 && composer.height <= 100,
     inputCenterOff: Math.round(Math.abs((wrap.left + wrap.width / 2) - (input.left + input.width / 2))),
     sidebarLeft: sidebar.left === 0,
     sidebarW: Math.round(sidebar.width),
   };
 });
-ok("Composer 位于右区底部", layout.composerAtBottom);
-ok("输入框在其可用区内水平居中(≤5px)", layout.inputCenterOff <= 5); // 输入框相对 .composer-input-wrap 居中（右侧为模型/推理操作栏，属正常非对称布局）
+ok("Composer 位于右区底部居中且紧凑", layout.composerAtBottom && layout.composerCentered && layout.composerCompact);
+results.push({ check: "输入框在其可用区内水平居中(≤5px)", pass: layout.inputCenterOff <= 5, got: layout.inputCenterOff }); // 输入框相对 .composer-input-wrap 居中（右侧为模型/推理操作栏，属正常非对称布局）
 ok("侧栏在左侧", layout.sidebarLeft);
 eq("侧栏宽度", layout.sidebarW, 280);
 
@@ -126,16 +129,38 @@ await page.click("#btnNewProject");
 const createLayout = await page.evaluate(() => {
   const main = document.querySelector(".main").getBoundingClientRect();
   const form = document.querySelector(".create-composer").getBoundingClientRect();
-  return { visible: form.width > 0, inside: form.top >= main.top && form.bottom <= main.bottom, centered: Math.abs((main.left + main.width / 2) - (form.left + form.width / 2)) < 3 };
+  return {
+    visible: form.width > 0,
+    inside: form.top >= main.top && form.bottom <= main.bottom,
+    centered: Math.abs((main.left + main.width / 2) - (form.left + form.width / 2)) < 3,
+    bottom: main.bottom - form.bottom <= 16,
+    compact: form.width <= 840 && form.height <= 100,
+    sharedComposer: document.querySelector(".create-composer").classList.contains("composer"),
+    heading: document.querySelector(".create-header").textContent.trim(),
+  };
 });
 ok("新建项目切换到右侧表单", createLayout.visible);
-ok("新建表单位于右侧主区域中央", createLayout.inside && createLayout.centered);
+ok("新建表单与已有项目 Composer 使用相同 UI", createLayout.inside && createLayout.centered && createLayout.bottom && createLayout.compact && createLayout.sharedComposer);
+eq("新建项目标题已精简", createLayout.heading, "新项目");
+ok("新建项目显示文件和图片上传按钮", await page.locator("#btnCreateAttach").isVisible() && await page.locator("#btnCreateAttachPhoto").isVisible());
+await page.setInputFiles("#createFileInput", [{ name: "创建需求.txt", mimeType: "text/plain", buffer: Buffer.from("create") }]);
+await page.setInputFiles("#createPhotoInput", [{ name: "参考图.png", mimeType: "image/png", buffer: Buffer.from([0x89,0x50,0x4e,0x47]) }]);
+ok("新建项目附件显示预览", await page.locator("#createAttachList .attach-card").count() === 2);
 fakeDir = "C:/fake/newproj/path";
 await page.click("#btnPickDir");
 await page.waitForTimeout(400);
 const projDirVal = await page.evaluate(() => document.querySelector("#projDir").value);
 eq("新建表单目录填充", projDirVal, fakeDir);
 await page.click("#projList li");
+await page.waitForTimeout(200);
+
+ok("暂停态显示继续项目", await page.locator("#btnResume").isVisible() && (await page.textContent("#btnResume")).trim() === "继续项目");
+projectState = "EXECUTING";
+await page.evaluate(() => refreshDetail());
+await page.waitForTimeout(200);
+ok("运行态显示暂停项目", await page.locator("#btnPause").isVisible() && (await page.textContent("#btnPause")).trim() === "暂停项目");
+projectState = "PAUSED";
+await page.evaluate(() => refreshDetail());
 await page.waitForTimeout(200);
 
 // 模型/推理：选择在输入框右侧 + 变更触发 deepseek_model
@@ -208,12 +233,12 @@ await page.setInputFiles("#fileInput", [
   { name: "notes.txt", mimeType: "text/plain", buffer: Buffer.from("hi") },
 ]);
 await page.waitForTimeout(900);
-const afterFiles = await page.evaluate(() => Array.from(document.querySelectorAll(".attach-card")).map(c => c.className));
+const afterFiles = await page.evaluate(() => Array.from(document.querySelectorAll("#attachList .attach-card")).map(c => c.className));
 ok("多文件加入且成功", afterFiles.length >= 2 && afterFiles.every(c => c.includes("success")));
 
 await page.setInputFiles("#photoInput", [{ name: "照片.png", mimeType: "image/png", buffer: Buffer.from([0x89,0x50,0x4e,0x47]) }]);
 await page.waitForTimeout(900);
-const hasPhoto = await page.evaluate(() => !!document.querySelector(".attach-card .attach-thumb img"));
+const hasPhoto = await page.evaluate(() => !!document.querySelector("#attachList .attach-card .attach-thumb img"));
 ok("照片加入且有缩略图", hasPhoto);
 
 // 拖拽入口已移除，浏览器不再接管或上传拖入文件
@@ -223,28 +248,28 @@ await page.evaluate(() => {
   document.querySelector("#composerInput").dispatchEvent(new DragEvent("drop", { bubbles: true, dataTransfer: dt }));
 });
 await page.waitForTimeout(200);
-ok("拖拽上传已移除", await page.evaluate(() => !Array.from(document.querySelectorAll(".attach-name")).some((el) => el.textContent === "拖拽.txt")));
+ok("拖拽上传已移除", await page.evaluate(() => !Array.from(document.querySelectorAll("#attachList .attach-name")).some((el) => el.textContent === "拖拽.txt")));
 
 // 失败态
 const failInfo = await page.evaluate(() => {
   window.addFiles([{ name: "big.zip", size: 60 * 1024 * 1024, type: "application/zip" }]);
-  const c = Array.from(document.querySelectorAll(".attach-card")).find(c => c.className.includes("failed"));
+  const c = Array.from(document.querySelectorAll("#attachList .attach-card")).find(c => c.className.includes("failed"));
   return { exists: !!c, hasRetry: !!c && !!c.querySelector("[data-act=retry]"), hasRemove: !!c && !!c.querySelector("[data-act=remove]") };
 });
 ok("大文件显示失败态", failInfo.exists);
 ok("失败态有重试/移除", failInfo.hasRetry && failInfo.hasRemove);
 
 // 删除一张
-const beforeRemove = await page.evaluate(() => document.querySelectorAll(".attach-card").length);
-await page.evaluate(() => { document.querySelector(".attach-card [data-act=remove]").click(); });
+const beforeRemove = await page.evaluate(() => document.querySelectorAll("#attachList .attach-card").length);
+await page.evaluate(() => { document.querySelector("#attachList .attach-card [data-act=remove]").click(); });
 await page.waitForTimeout(200);
-const afterRemove = await page.evaluate(() => document.querySelectorAll(".attach-card").length);
+const afterRemove = await page.evaluate(() => document.querySelectorAll("#attachList .attach-card").length);
 ok("可删除单个附件", afterRemove === beforeRemove - 1);
 
 // 重试失败项
 await page.evaluate(() => { const b = composerAttachments.find(a => a.name === "big.zip"); if (b) { b.size = 10; b.file = new File(["ok"], "big.zip", { type: "application/zip" }); b.reason = ""; window.retryAttachment(b.id); } });
 await page.waitForTimeout(900);
-const retried = await page.evaluate(() => { const c = Array.from(document.querySelectorAll(".attach-card")).find(c => c.querySelector(".attach-name")?.textContent === "big.zip"); return c ? c.className.includes("success") : false; });
+const retried = await page.evaluate(() => { const c = Array.from(document.querySelectorAll("#attachList .attach-card")).find(c => c.querySelector(".attach-name")?.textContent === "big.zip"); return c ? c.className.includes("success") : false; });
 ok("失败项重试后成功", retried);
 
 // 发送带附件 → 消息携带后端附件 ID
@@ -265,6 +290,7 @@ ok("新建项目请求已构造", createPayload.length === 1);
 const cp = createPayload[0] || {};
 ok("新建界面已移除名称与分类字段", !(await page.locator("#projName").count()) && !(await page.locator("#projCategory").count()));
 ok("新建 payload 仅需任务描述", !cp.name && !cp.category && cp.task === "测试任务描述");
+ok("新建 payload 携带附件", cp.attachments?.length === 2 && cp.attachments.every((item) => item.data.startsWith("data:")));
 await page.click("#projList li");
 await page.waitForTimeout(200);
 
@@ -278,11 +304,11 @@ for (const [w,h] of sizes) {
     const sb = document.querySelector(".sidebar").getBoundingClientRect();
     const mb = document.querySelector(".main").getBoundingClientRect();
     const cb = document.querySelector("#composer").getBoundingClientRect();
-    return { overlap: sb.right > mb.left + 1, overflowX: document.documentElement.scrollWidth > window.innerWidth, overflowY: document.documentElement.scrollHeight > window.innerHeight, composerBottom: Math.abs(cb.bottom - mb.bottom) < 2 };
+    return { overlap: sb.right > mb.left + 1, overflowX: document.documentElement.scrollWidth > window.innerWidth, overflowY: document.documentElement.scrollHeight > window.innerHeight, composerBottom: mb.bottom - cb.bottom <= 16, composerCentered: Math.abs((mb.left + mb.width / 2) - (cb.left + cb.width / 2)) < 3 };
   });
   sizeResults.push({ w, h, ...r });
 }
-ok("各尺寸无错位/遮挡", sizeResults.every(r => !r.overlap && !r.overflowX && r.composerBottom));
+ok("各尺寸无错位/遮挡", sizeResults.every(r => !r.overlap && !r.overflowX && r.composerBottom && r.composerCentered));
 ok("各尺寸无垂直溢出", sizeResults.every(r => !r.overflowY));
 
 // 主题切换

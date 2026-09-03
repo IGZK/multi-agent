@@ -56,6 +56,9 @@ export class GptBridge {
     this.rootDir = rootDir;
     this.browser = null;
     this.page = null;
+    this.connectPromise = null;
+    this.navigationPromise = null;
+    this.lastDebugProbe = { at: 0, up: false };
     this.chromePath = findChrome(this.cfg.chromePath);
     this.profileDir = path.resolve(rootDir, this.cfg.profileDir || "browser-profile");
     this.baseUrl = this.cfg.baseUrl || "https://chatgpt.com/";
@@ -96,11 +99,15 @@ export class GptBridge {
   log(level, msg) { this.logger?.[level]?.("gpt-bridge", msg); }
 
   // ---------- 浏览器生命周期 ----------
-  async isDebugPortUp() {
+  async isDebugPortUp(force = false) {
+    if (this.browser?.isConnected?.()) return true;
+    if (!force && Date.now() - this.lastDebugProbe.at < 1000) return this.lastDebugProbe.up;
     try {
       await httpGetJson(`http://127.0.0.1:${this.cfg.debugPort}/json/version`, 1500);
+      this.lastDebugProbe = { at: Date.now(), up: true };
       return true;
     } catch {
+      this.lastDebugProbe = { at: Date.now(), up: false };
       return false;
     }
   }
@@ -126,14 +133,24 @@ export class GptBridge {
     child.on("error", (e) => this.log("error", `浏览器启动失败: ${e.message}`));
     child.unref();
     for (let i = 0; i < 40; i++) {
-      if (await this.isDebugPortUp()) return true;
-      await sleep(1000);
+      if (await this.isDebugPortUp(true)) return true;
+      await sleep(250);
     }
     throw new BridgeError("GPT_BROWSER_ERROR", `Chrome 启动后调试端口 ${this.cfg.debugPort} 未就绪。`);
   }
 
   async ensureBrowser() {
     if (this.browser?.isConnected?.() && this.page && !this.page.isClosed?.()) return true;
+    if (this.connectPromise) return this.connectPromise;
+    this.connectPromise = this.connectBrowser();
+    try {
+      return await this.connectPromise;
+    } finally {
+      this.connectPromise = null;
+    }
+  }
+
+  async connectBrowser() {
     try {
       if (!this.browser?.isConnected?.()) {
         if (!(await this.isDebugPortUp())) await this.launchChrome();
@@ -141,7 +158,11 @@ export class GptBridge {
       }
       const contexts = this.browser.contexts();
       const ctx = contexts[0] || (await this.browser.newContext());
-      const page = ctx.pages().find((candidate) => !candidate.isClosed()) || (await ctx.newPage());
+      const pages = ctx.pages().filter((candidate) => !candidate.isClosed());
+      const targetOrigin = new URL(this.baseUrl).origin;
+      const page = pages.find((candidate) => {
+        try { return new URL(candidate.url()).origin === targetOrigin; } catch { return false; }
+      }) || pages[0] || (await ctx.newPage());
       this.page = page;
       page.setDefaultTimeout(30000);
       page.on("close", () => { if (this.page === page) this.page = null; });
@@ -158,17 +179,53 @@ export class GptBridge {
     try { await this.browser?.close(); } catch { /* ignore */ }
     this.browser = null;
     this.page = null;
+    this.connectPromise = null;
+    this.navigationPromise = null;
   }
 
   // ---------- 页面状态 ----------
   async gotoChat() {
     await this.ensureBrowser();
+    const current = await this.detectState();
+    let sameOrigin = false;
+    try { sameOrigin = new URL(current.url).origin === new URL(this.baseUrl).origin; } catch { /* navigate below */ }
+    if (sameOrigin && (current.loggedIn || current.challenge || current.loginButton || !current.loading)) return current;
+    if (this.navigationPromise) return this.navigationPromise;
+    this.navigationPromise = this.navigateToChat();
+    try {
+      return await this.navigationPromise;
+    } finally {
+      this.navigationPromise = null;
+    }
+  }
+
+  async waitForChatReady(timeoutMs = 45000, page = this.page) {
+    if (!page) return this.detectState();
+    await page.waitForFunction(() => {
+      const body = document.body;
+      const title = document.title || "";
+      const hasComposer = !!document.querySelector('#prompt-textarea, div[contenteditable="true"], textarea[contenteditable="true"]');
+      const hasLogin = !!document.querySelector('[data-testid="login-button"], a[href*="auth/login"]');
+      const hasChallenge = /just a moment|verify you are human|checking your browser|access denied|blocked/i.test(title)
+        || !!document.querySelector('iframe[src*="challenge"], #challenge-running, [data-testid*="challenge"]');
+      return document.readyState === "complete" && (!!body && (hasComposer || hasLogin || hasChallenge));
+    }, null, { timeout: timeoutMs, polling: 100 }).catch(() => {});
+    return this.detectState();
+  }
+
+  async navigateToChat() {
     this.setLive("navigating", "打开 ChatGPT…");
     try {
       await this.page.goto(this.baseUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
     } catch { /* 导航超时也要继续检测 */ }
-    await sleep(3000);
-    return await this.detectState();
+    return this.waitForChatReady(this.cfg.loginGraceMs || 45000);
+  }
+
+  async warmup() {
+    const state = await this.gotoChat();
+    if (state.loggedIn && !state.challenge) await this.setWindowVisible(false);
+    this.log("info", `GPT 预热完成（${state.loggedIn ? "已登录" : state.challenge ? "需处理验证" : "待登录"}）`);
+    return state;
   }
 
   /**

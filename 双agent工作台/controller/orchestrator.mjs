@@ -289,11 +289,16 @@ export class Orchestrator {
       if (!sel.selected) this.log("warn", projectId, `未选到目标模型 "${gcfg.modelName}"（可用: ${(sel.available || []).join(", ") || "未枚举"}），使用页面默认模型`);
     }
     // 发送：系统提示词 + 用户任务
-    const content = `${GPT_SYSTEM_PROMPT}\n\n================\n用户任务：\n${st.user_task}\n\n【本次计划模板】${buildPlanTemplateHint(st.user_task)}\n\n请输出 <GPT_RESPONSE> 开始规划。`;
-    await this.sendToGpt(projectId, "PLAN_REQUEST", content, { intro: true });
+    const initialAttachments = this.store.getAttachments(projectId, st.initial_attachment_ids || []);
+    const attachmentNote = initialAttachments.length
+      ? `\n\n用户随项目附加了以下文件，请结合内容规划：\n${initialAttachments.map((item) => `- ${item.name}`).join("\n")}`
+      : "";
+    const content = `${GPT_SYSTEM_PROMPT}\n\n================\n用户任务：\n${st.user_task}${attachmentNote}\n\n【本次计划模板】${buildPlanTemplateHint(st.user_task)}\n\n请输出 <GPT_RESPONSE> 开始规划。`;
+    await this.sendToGpt(projectId, "PLAN_REQUEST", content, { intro: true, attachments: initialAttachments });
     this.assertProjectActive(projectId, epoch);
     this.store.transition(projectId, "GPT_PLANNING", {
       pending: { text: "已向 GPT 发送任务，等待规划…", ts: nowIso() },
+      initial_attachment_ids: [],
     });
   }
 
@@ -1273,6 +1278,9 @@ export class Orchestrator {
   // ================= 控制指令（Dashboard 用） =================
   async createProject(name, task, sourceDir, opts = {}) {
     const id = this.store.createProject(name, task, sourceDir);
+    const initialAttachments = (Array.isArray(opts.attachments) ? opts.attachments : [])
+      .map((item) => this.store.saveAttachment(id, item.name, item.mime, item.buffer));
+    if (initialAttachments.length) this.store.writeState(id, { initial_attachment_ids: initialAttachments.map((item) => item.id) });
     if (opts.deepseek_selection) {
       this.store.writeState(id, { deepseek_selection: opts.deepseek_selection });
     }
