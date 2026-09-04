@@ -5,6 +5,7 @@
 //   node controller/index.mjs --port=3700
 import fs from "node:fs";
 import path from "node:path";
+import os from "node:os";
 import { fileURLToPath } from "node:url";
 import { Logger, ROOT_DIR, sleep } from "./logger.mjs";
 import { ProjectStore } from "./store.mjs";
@@ -12,30 +13,12 @@ import { GptBridge, MockGptBridge } from "./gpt_bridge.mjs";
 import { ExecutorRouter } from "./executor_router.mjs";
 import { Orchestrator } from "./orchestrator.mjs";
 import { DashboardServer } from "./server.mjs";
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-
-function parseArgs(argv) {
-  const out = { gpt: null, executor: null, port: null, selftest: false, projectsRoot: null };
-  for (const a of argv) {
-    if (a === "--selftest") out.selftest = true;
-    else if (a.startsWith("--gpt=")) out.gpt = a.split("=")[1];
-    else if (a.startsWith("--executor=")) out.executor = a.split("=")[1];
-    else if (a.startsWith("--port=")) out.port = parseInt(a.split("=")[1], 10);
-    else if (a.startsWith("--projects=")) out.projectsRoot = a.split("=")[1];
-  }
-  return out;
-}
+import { loadConfig, parseArgs } from "./config.mjs";
+import { openBrowserWindow } from "./browser_runtime.mjs";
 
 export function buildSystem(opts = {}) {
-  const configPath = path.join(ROOT_DIR, "config", "config.json");
-  const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
-  if (opts.gpt) config.gpt.mode = opts.gpt;
-  if (opts.executor) config.deepseek.mode = opts.executor;
-  if (opts.port) config.dashboard.port = opts.port;
-  if (opts.projectsRoot) config.projectsRoot = path.resolve(ROOT_DIR, opts.projectsRoot);
-
-  const logger = new Logger(path.join(ROOT_DIR, "logs"));
+  const config = loadConfig(opts);
+  const logger = new Logger(config.logsDir);
   const store = new ProjectStore(config.projectsRoot || path.join(ROOT_DIR, "projects"), logger);
   const bridge = config.gpt.mode === "mock"
     ? new MockGptBridge(config.gpt, logger)
@@ -54,7 +37,7 @@ export function buildSystem(opts = {}) {
 export async function acquireInstanceLock(logger, projectsRoot) {
   const crypto = await import("node:crypto").catch(() => null);
   const scope = projectsRoot ? (crypto ? crypto.createHash("md5").update(projectsRoot).digest("hex").slice(0, 8) : path.basename(projectsRoot)) : "default";
-  const lockFile = path.join(ROOT_DIR, "logs", `workbench-${scope}.lock`);
+  const lockFile = path.join(logger?.dir || path.join(ROOT_DIR, "logs"), `workbench-${scope}.lock`);
   try {
     if (fs.existsSync(lockFile)) {
       const old = JSON.parse(fs.readFileSync(lockFile, "utf8"));
@@ -78,13 +61,13 @@ export async function acquireInstanceLock(logger, projectsRoot) {
 
 async function main() {
   const opts = parseArgs(process.argv.slice(2));
+  if (Number(process.versions.node.split(".")[0]) < 22) throw new Error("请安装 Node.js 22 或更高版本（建议当前 LTS）。");
   const selftestProjectsRoot = opts.selftest
-    ? path.join(ROOT_DIR, ".selftest-projects")
+    ? fs.mkdtempSync(path.join(os.tmpdir(), "workbench-selftest-"))
     : null;
   if (selftestProjectsRoot) {
-    // 自测使用独立目录，避免与正式项目冲突；先清理旧残留
-    try { fs.rmSync(selftestProjectsRoot, { recursive: true, force: true }); } catch { /* ignore */ }
-    opts.projectsRoot = selftestProjectsRoot;
+    opts.dataDir = selftestProjectsRoot;
+    opts.projectsRoot = path.join(selftestProjectsRoot, "projects");
   }
   const { config, logger, runner, orchestrator, server, store } = buildSystem(opts);
 
@@ -105,6 +88,13 @@ async function main() {
   }
 
   await server.start();
+  if (opts.open) {
+    const host = ["0.0.0.0", "::"].includes(config.dashboard.host) ? "127.0.0.1" : config.dashboard.host;
+    const url = `http://${host.includes(":") ? `[${host}]` : host}:${config.dashboard.port}`;
+    openBrowserWindow(url, config.gpt.chromePath)
+      .then((opened) => { if (!opened) logger.warn("main", `请手动打开 ${url}`); })
+      .catch((error) => logger.warn("main", `请手动打开 ${url}：${error.message}`));
+  }
   await orchestrator.boot();
 
   // 优雅退出

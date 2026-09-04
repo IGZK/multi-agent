@@ -14,11 +14,13 @@
 import fs from "node:fs";
 import { resolveDeepseekSelection, planningPolicy, validateTaskContract } from "./planning_policy.mjs";
 import path from "node:path";
+import os from "node:os";
 import crypto from "node:crypto";
 import { spawn, execFile } from "node:child_process";
 import { sleep, projectLog, nowIso } from "./logger.mjs";
 import { buildExecutorPrompt, buildExecutorTurnPrompt } from "./prompts.mjs";
 import { UiExecutor } from "./dsh_ui.mjs";
+import { requireDshBin } from "./executor_runtime.mjs";
 
 /** 用目录事件即时唤醒，以短轮询作为 Windows/网络盘上的丢事件兜底。 */
 export function createFileWake(directory, targetName) {
@@ -73,9 +75,6 @@ export class DeepseekRunner {
     this.running = new Map(); // projectId -> {pid, startedAt, sessionId?, visible?}
     this.cancelled = new Set();
     this.ui = new UiExecutor(config, logger);
-    if (!this.cfg.dshBin || !fs.existsSync(this.cfg.dshBin)) {
-      this.logger?.warn("deepseek-runner", `dshBin 不存在: ${this.cfg.dshBin}（将在运行时再检查）`);
-    }
   }
 
   log(level, msg) { this.logger?.[level]?.("deepseek-runner", msg); }
@@ -268,8 +267,12 @@ export class DeepseekRunner {
 
     // 只在项目会话首次建立时打开窗口；后续 Task 复用现有窗口。
     if (!sessionReused && this.visibleEnabled && this.cfg.uiOpenWindow !== false) {
-      const opened = this.ui.openWindow(projectId)?.opened === true;
-      this.log("info", `执行窗口${opened ? "已打开" : "打开失败"}: ${server.url}（任务 ${taskId}）`);
+      try {
+        const opened = (await this.ui.openWindow(projectId))?.opened === true;
+        this.log("info", `执行窗口${opened ? "已打开" : "打开失败"}: ${server.url}（任务 ${taskId}）`);
+      } catch (error) {
+        this.log("warn", `执行窗口未打开，可从 Dashboard 重试：${error.message}（${server.url}）`);
+      }
     }
 
     // e. 轮询 outbox + 会话状态 + 崩溃检测。崩溃后由编排器先回滚检查点再重试。
@@ -457,21 +460,22 @@ export class DeepseekRunner {
   // ---------- headless 模式（原有逻辑） ----------
 
   async runHeadless(projectId, dirs, envelope, prompt) {
+    const dshBin = requireDshBin(this.cfg);
     const { projectDir, workspaceDir, sourceDir } = dirs;
     const logFile = path.join(workspaceDir, "logs", `executor-${Date.now()}.log`);
     fs.mkdirSync(path.dirname(logFile), { recursive: true });
     const fd = fs.openSync(logFile, "a");
     projectLog(projectDir, `[dispatch] headless type=${envelope.type} task=${envelope.current_task?.id || "-"} attempt=${envelope.attempt || 1}`);
 
-    const args = [this.cfg.dshBin, "--profile", this.cfg.profile || "headless", prompt];
+    const args = [dshBin, "--profile", this.cfg.profile || "headless", prompt];
     this.log("info", `启动 headless 执行会话: type=${envelope.type} task=${envelope.current_task?.id || "-"}（cwd=${sourceDir}）`);
     const startedAt = Date.now();
     let child;
     try {
-      child = spawn(this.cfg.nodeBin || "node", args, {
+      child = spawn(this.cfg.nodeBin || process.execPath, args, {
         cwd: sourceDir,
         stdio: ["ignore", fd, fd], // 输出直接进文件，避免管道
-        env: { ...process.env, DSH_BUNDLED_SKILL_DIR: path.join(this.ui.ensureProfile().dir, "skills") },
+        env: { ...process.env, DSH_HOME: this.ui.dshHome(), DSH_BUNDLED_SKILL_DIR: path.join(this.ui.ensureProfile().dir, "skills") },
         windowsHide: true,
       });
     } catch (e) {
@@ -483,10 +487,11 @@ export class DeepseekRunner {
     const timeoutMs = envelope.timeoutMs || this.cfg.executorTimeoutMs || 2700000;
     const result = await new Promise((resolve) => {
       let settled = false;
-      const finish = (r) => { if (!settled) { settled = true; resolve(r); } };
+      let timer;
+      const finish = (r) => { if (!settled) { settled = true; clearTimeout(timer); resolve(r); } };
       child.on("error", (e) => finish({ exitCode: -1, timedOut: false, error: e.message }));
       child.on("exit", (code) => finish({ exitCode: code, timedOut: false }));
-      const timer = setTimeout(() => {
+      timer = setTimeout(() => {
         if (settled) return;
         this.log("warn", `执行会话超时（${Math.round(timeoutMs / 1000)}s），强制终止 PID ${child.pid}`);
         execFile("taskkill", ["/PID", String(child.pid), "/T", "/F"], { stdio: "ignore", windowsHide: true }, () => {});
@@ -548,8 +553,8 @@ export class DeepseekRunner {
   }
 
   /** 重新打开某项目的执行窗口（用户手动点击用） */
-  openUiWindow(projectId) {
-    const res = this.ui.openWindow(projectId);
+  async openUiWindow(projectId) {
+    const res = await this.ui.openWindow(projectId);
     return res ? { url: res.url, opened: res.opened } : null;
   }
 
@@ -595,7 +600,7 @@ export class DeepseekRunner {
 // ---------- 自测：真实 headless 微任务 ----------
 export async function selftest() {
   const logger = { info: () => {}, warn: () => {}, error: () => {} };
-  const tmp = fs.mkdtempSync(path.join(process.env.TEMP || ".", "dsh-runner-test-"));
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-runner-test-"));
   const dirs = {
     projectDir: tmp,
     workspaceDir: path.join(tmp, ".gpt_workspace"),
@@ -609,8 +614,8 @@ export async function selftest() {
     mode: "real",
     visible: false, // 自测保持 headless，避免弹窗
     useSessionPool: false, // 自测走纯 headless（每任务一个进程），不启动 web 服务
-    nodeBin: "node",
-    dshBin: "C:/Users/Administrator/AppData/Roaming/npm/node_modules/@deepseek-ai/dsh/lib/bin.js",
+    nodeBin: process.execPath,
+    dshBin: "",
     profile: "headless",
     executorTimeoutMs: 240000,
   };

@@ -1,5 +1,6 @@
+import { testBrowserPath } from "./browser-test-support.mjs";
 import { chromium } from "playwright-core";
-const browser = await chromium.launch({ executablePath: "C:/Program Files/Google/Chrome/Application/chrome.exe", headless: true });
+const browser = await chromium.launch({ executablePath: testBrowserPath(), headless: true });
 const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
 const errors = [];
 page.on("console", (m) => { if (m.type() === "error") errors.push(m.text()); });

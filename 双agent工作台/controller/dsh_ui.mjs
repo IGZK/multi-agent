@@ -12,8 +12,11 @@ import net from "node:net";
 import path from "node:path";
 import os from "node:os";
 import { spawn, execFile } from "node:child_process";
-import { sleep } from "./logger.mjs";
+import { sleep, ROOT_DIR } from "./logger.mjs";
 import { ensureProfileSkill } from "./workbench_skill.mjs";
+import { openBrowserWindow } from "./browser_runtime.mjs";
+import { requireDshBin } from "./executor_runtime.mjs";
+export { openBrowserWindow } from "./browser_runtime.mjs";
 
 /** 与 dsh Web GUI 通信的官方 RPC 客户端。 */
 export function rpc(port, method, payload, timeoutMs = 30000) {
@@ -67,9 +70,9 @@ export function findFreePort(host = "127.0.0.1") {
 }
 
 /** 轮询等待 dsh web 服务就绪（/api/host.describe 可响应）。 */
-export async function waitPort(port, timeoutMs) {
+export async function waitPort(port, timeoutMs, signal) {
   const t0 = Date.now();
-  while (Date.now() - t0 < timeoutMs) {
+  while (Date.now() - t0 < timeoutMs && !signal?.aborted) {
     try {
       await rpc(port, "host.describe", {}, 3000);
       return true;
@@ -78,32 +81,6 @@ export async function waitPort(port, timeoutMs) {
     }
   }
   return false;
-}
-
-/** 打开一个新的浏览器窗口显示指定 URL（优先 Chrome --new-window，回退系统默认浏览器）。 */
-export function openBrowserWindow(url, chromePath = "") {
-  if (!url) return false;
-  const candidates = [
-    chromePath,
-    "C:/Program Files/Google/Chrome/Application/chrome.exe",
-    "C:/Program Files (x86)/Google/Chrome/Application/chrome.exe",
-  ].filter(Boolean);
-  for (const exe of candidates) {
-    if (fs.existsSync(exe)) {
-      try {
-        const c = spawn(exe, ["--new-window", url], { detached: true, stdio: "ignore" });
-        c.unref?.();
-        return true;
-      } catch { /* 尝试下一个 */ }
-    }
-  }
-  try {
-    const c = spawn("cmd", ["/c", "start", '""', url], { detached: true, stdio: "ignore", windowsHide: true });
-    c.unref?.();
-    return true;
-  } catch {
-    return false;
-  }
 }
 
 const DEFAULT_BUNDLES = ["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-web-app"];
@@ -126,24 +103,30 @@ export class UiExecutor {
 
   get profileName() { return this.cfg.uiProfile || "workbench-exec"; }
 
-  dshHome() { return process.env.DSH_HOME || path.join(os.homedir(), ".dsh"); }
+  dshHome() { return path.resolve(ROOT_DIR, process.env.DSH_HOME || path.join(os.homedir(), ".dsh")); }
 
   /** 确保专用可见执行 profile 存在（首次自动创建，结构与 headless profile 一致）。 */
   ensureProfile() {
     const name = this.profileName;
+    if (!name || name === "." || name === ".." || name === "node_modules" || /[\\/:*?"<>|]/.test(name)) {
+      throw new Error("执行器 uiProfile 必须是单个合法文件夹名称");
+    }
     const dir = path.join(this.dshHome(), "profiles", name);
-    if (!fs.existsSync(dir)) {
-      fs.mkdirSync(dir, { recursive: true });
+    fs.mkdirSync(dir, { recursive: true });
+    if (!fs.existsSync(path.join(dir, "package.json"))) {
       fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({
         name: `dsh-profile-${name}`,
         private: true,
         dependencies: {},
         dsh: { profile: { bundles: DEFAULT_BUNDLES } },
       }, null, 2), "utf8");
-      fs.writeFileSync(path.join(dir, "pnpm-workspace.yaml"), "packages:\n  - .\n\nnodeLinker: hoisted\nautoInstallPeers: false\n", "utf8");
-      fs.writeFileSync(path.join(dir, "cordis.yml"), "[]\n", "utf8");
-      fs.writeFileSync(path.join(dir, "cordis.patch.yml"), "[]\n", "utf8");
       this.log("info", `已创建可见执行 profile: ${dir}`);
+    }
+    for (const [file, content] of [
+      ["pnpm-workspace.yaml", "packages:\n  - .\n\nnodeLinker: hoisted\nautoInstallPeers: false\n"],
+      ["cordis.yml", "[]\n"], ["cordis.patch.yml", "[]\n"],
+    ]) {
+      if (!fs.existsSync(path.join(dir, file))) fs.writeFileSync(path.join(dir, file), content, "utf8");
     }
     const skill = ensureProfileSkill(dir);
     return { name, dir, skillRoot: path.join(dir, "skills"), skill };
@@ -184,13 +167,14 @@ export class UiExecutor {
       }
       this.disposeServer(projectId);
     }
+    const dshBin = requireDshBin(this.cfg);
     const profile = this.ensureProfile();
     const port = await findFreePort();
     const logFile = path.join(logDir, `executor-ui-${Date.now()}.log`);
     fs.mkdirSync(logDir, { recursive: true });
     const fd = fs.openSync(logFile, "a");
     const args = [
-      this.cfg.dshBin,
+      dshBin,
       "--profile", this.profileName,
       "--port", String(port),
       "--no-open",
@@ -198,10 +182,10 @@ export class UiExecutor {
     this.log("info", `启动可见执行服务: port=${port} profile=${this.profileName}（project=${projectId}）`);
     let child;
     try {
-      child = spawn(this.cfg.nodeBin || "node", args, {
+      child = spawn(this.cfg.nodeBin || process.execPath, args, {
         cwd: os.homedir(),
         stdio: ["ignore", fd, fd],
-        env: { ...process.env, DSH_BUNDLED_SKILL_DIR: profile.skillRoot },
+        env: { ...process.env, DSH_HOME: this.dshHome(), DSH_BUNDLED_SKILL_DIR: profile.skillRoot },
         windowsHide: true,
       });
     } catch (e) {
@@ -222,10 +206,15 @@ export class UiExecutor {
     this.servers.set(projectId, server);
     this.cancelDispose(projectId);
 
+    const boot = new AbortController();
     const up = await Promise.race([
-      waitPort(port, this.cfg.uiBootTimeoutMs ?? 90000),
-      new Promise((resolve) => child.once("exit", () => resolve(false))), // 服务启动即崩溃 → 快速失败
+      waitPort(port, this.cfg.uiBootTimeoutMs ?? 90000, boot.signal),
+      new Promise((resolve) => {
+        child.once("exit", () => resolve(false));
+        child.once("error", (error) => { this.log("error", "无法启动执行器: " + error.message); resolve(false); });
+      }), // 服务启动即崩溃 → 快速失败
     ]);
+    boot.abort();
     if (!up) {
       const bootMs = Date.now() - server.startedAt;
       this.log("error", `可见执行服务 ${port} 启动失败（${Math.round(bootMs / 1000)}s），日志: ${logFile}`);
@@ -414,17 +403,20 @@ export class UiExecutor {
     let port;
     let fd;
     let child;
+    const boot = new AbortController();
     try {
-      this.ensureProfile();
+      const dshBin = requireDshBin(this.cfg);
+      const profile = this.ensureProfile();
       port = await findFreePort();
       const logFile = path.join(os.tmpdir(), `dsh-model-probe-${Date.now()}.log`);
       fd = fs.openSync(logFile, "a");
-      child = spawn(this.cfg.nodeBin || "node", [
-        this.cfg.dshBin, "--profile", this.profileName, "--port", String(port), "--no-open",
-      ], { cwd: os.homedir(), stdio: ["ignore", fd, fd], windowsHide: true });
+      child = spawn(this.cfg.nodeBin || process.execPath, [
+        dshBin, "--profile", this.profileName, "--port", String(port), "--no-open",
+      ], { cwd: os.homedir(), stdio: ["ignore", fd, fd], windowsHide: true,
+        env: { ...process.env, DSH_HOME: this.dshHome(), DSH_BUNDLED_SKILL_DIR: profile.skillRoot } });
       const up = await Promise.race([
-        waitPort(port, this.cfg.uiBootTimeoutMs ?? 60000),
-        new Promise((resolve) => child.once("exit", () => resolve(false))),
+        waitPort(port, this.cfg.uiBootTimeoutMs ?? 60000, boot.signal),
+        new Promise((resolve) => { child.once("exit", () => resolve(false)); child.once("error", () => resolve(false)); }),
       ]);
       if (!up) return FALLBACK;
       const created = await rpc(port, "session.create", { cwd: os.homedir() }, 60000);
@@ -440,6 +432,7 @@ export class UiExecutor {
       this.log("warn", `模型目录探测失败（使用内置目录）: ${e.message}`);
       return FALLBACK;
     } finally {
+      boot.abort();
       if (child && child.exitCode === null) {
         execFile("taskkill", ["/PID", String(child.pid), "/T", "/F"], { stdio: "ignore", windowsHide: true }, () => {});
       }
@@ -483,10 +476,10 @@ export class UiExecutor {
   }
 
   /** 打开该项目的执行窗口（新浏览器窗口）。 */
-  openWindow(projectId) {
+  async openWindow(projectId) {
     const s = this.servers.get(projectId);
     if (!s) return null;
-    const opened = openBrowserWindow(s.url, this.cfg.uiChromePath || "");
+    const opened = await openBrowserWindow(s.url, this.cfg.uiChromePath || "");
     return { url: s.url, opened };
   }
 

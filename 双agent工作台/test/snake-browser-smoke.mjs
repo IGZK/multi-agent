@@ -1,10 +1,16 @@
+import { testBrowserPath } from "./browser-test-support.mjs";
 import assert from "node:assert/strict";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { chromium } from "playwright-core";
 
-const source = path.resolve(process.argv[2] || "projects/2026-09-04-贪吃蛇速度验收/source");
-const browser = await chromium.launch({ executablePath: process.env.CHROME_PATH || "C:/Program Files/Google/Chrome/Application/chrome.exe", headless: true });
+const sourceArg = process.argv[2] || process.env.SNAKE_SOURCE_DIR;
+if (!sourceArg) {
+  console.error("用法：node test/snake-browser-smoke.mjs <贪吃蛇项目源码目录>（或设置 SNAKE_SOURCE_DIR）");
+  process.exit(1);
+}
+const source = path.resolve(sourceArg);
+const browser = await chromium.launch({ executablePath: testBrowserPath(), headless: true });
 try {
   const page = await browser.newPage({ viewport: { width: 1000, height: 850 } });
   const errors = [];

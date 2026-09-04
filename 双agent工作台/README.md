@@ -4,14 +4,38 @@
 
 ## 快速开始
 
-环境要求：Windows、Node.js 20+、Chrome、已安装并可用的 DeepSeek Harness。
+支持 **Windows 10/11 桌面环境**。不同用户名、系统盘、项目盘符、中文和空格路径均不需要修改源码。本次不提供 macOS/Linux 支持。
+
+1. 安装 **Node.js 22+（建议 LTS）**，勾选加入 PATH；安装后重新打开终端。使用 Git 拉取时保留整个仓库目录。
+2. 在仓库根目录（README.md、package.json 和“双agent工作台”文件夹所在目录）执行：
 
 ```powershell
-npm install
-.\start.bat
+npm ci
+npm run demo
 ```
 
-`start.bat` intentionally contains ASCII-only launcher text. Windows `cmd` may parse a UTF-8 batch file before the code-page switch and turn Chinese text into commands or invalid paths; the Dashboard itself remains fully localized.
+打开 <http://127.0.0.1:3700> 即可体验模拟规划和执行，不需要账号或 DeepSeek。Mock 只验证工作流，不会由模型实现任意需求。结束后台后再启动真实模式。
+
+真实运行还需要：
+
+- 安装 Chrome 或 Edge；程序自动发现常见系统级/用户级安装位置以及 PATH 中的浏览器。
+- 安装并配置 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)。本项目对接并验证的版本为 **0.1.1-rc.2**，建议先使用此版本：
+
+```powershell
+npm install -g @deepseek-ai/dsh@0.1.1-rc.2
+dsh web
+```
+
+在 Harness 网页中配置自己的模型服务和凭据，确认能正常使用后，再执行：
+
+```powershell
+npm run doctor
+npm start
+```
+
+`doctor` 检查 Node、浏览器、执行器位置、配置和端口，不登录、不发送任务、不验证账号额度。Harness 的安装与模型调用需要网络；真实 ChatGPT 操作需要可访问 ChatGPT 的网络和自己的账号。
+
+也可以双击仓库根目录的 `start.bat`：依赖缺失时安装锁定依赖，服务就绪后打开实际配置的地址。`start.bat` 文本保持 ASCII，避免 cmd 误解析中文；项目目录和界面支持中文。PowerShell 启动器可在应用目录执行 `.\start.ps1 --port=3800`，命令行启动可使用 `npm start -- --port=3800 --open`。如果 PowerShell 禁止运行 npm.ps1，可直接使用 `npm.cmd` 或在命令提示符中运行。
 
 然后打开 <http://127.0.0.1:3700>。首次执行项目或主动打开 GPT 时，在工作台专用 Chrome 窗口中登录 ChatGPT；登录态保存在本机 `browser-profile/`。
 
@@ -65,7 +89,8 @@ GPT 浏览器采用无启动窗口模式，连接后复用已有 ChatGPT 页面�
 ├── docs/gpt-workbench-rules.md GPT 固定角色、通信协议和规划规范
 ├── skills/workbench-executor/ DeepSeek 执行规范的随程序原本
 ├── web/                        原生 HTML/CSS/JavaScript 界面
-├── config/config.json          本地配置
+├── config/config.json          随版本发布的默认配置
+├── config/config.local.json    本机覆盖配置（可选，不提交）
 ├── test/                       回归与界面测试
 ├── projects/<项目>/
 │   ├── source/                 默认源码目录
@@ -155,9 +180,31 @@ GPT 在 `<PLAN>` / `<UPDATED_PLAN>` 中返回 JSON 对象，使用 `tasks` 数�
 
 结果时间必须用 `new Date().toISOString()` 或 `[DateTime]::UtcNow.ToString('o')` 生成 UTC；不能给北京时间追加 `Z`。如果结果身份均匹配、只有时间无效，DeepSeek 最多进行一次“只重发结果”的修复，不立即回滚源码；其他协议校验仍保留。已完成派发的迟到重复结果不会触发下一任务回滚。检查点异步复制并排除依赖与构建物；以工作台目录为源码时还排除其 `browser-profile/`、项目存储目录和 `logs/`，普通源码中的同名目录仍正常备份。
 
+## 换电脑与移动目录
+
+新用户拉取源码后安装依赖、配置自己的账号即可。`node_modules/`、`projects/`、`logs/`、`browser-profile/` 和本机配置均不纳入 Git；所需目录会在运行时创建。
+
+整套数据要搬迁时，先结束工作台与它管理的执行服务，再自行复制项目数据。默认 `source/` 会随项目迁移；外部源码目录若已失效，工作台会提示重新选择，阻止任务在错误目录执行。浏览器登录态受 Windows 用户加密保护，换电脑后请重新登录，不要复制他人的登录态。Windows 开机自启注册需在新位置重新运行 `register-autostart.ps1`。
+
+本次只取消当前版本对运行数据的跟踪，旧 Git 历史仍可能包含先前误提交的个人数据；对外公开完整历史前需另行清理历史。
+
 ## 常用配置
 
-编辑 `config/config.json`：
+默认配置在 `config/config.json`。个人设置写入 `config/config.local.json`，只填需要覆盖的字段；可以复制 `config/config.local.example.json` 后编辑。更新仓库不会覆盖这个本机文件。
+
+优先级：命令行参数 > 环境变量 > `--config=文件` / `WORKBENCH_CONFIG` 指定的覆盖文件 > 本机配置 > 默认配置。对象逐字段合并，数组整体替换。所有相对配置路径以应用目录（`双agent工作台/`）为基准，与打开终端的目录无关。
+
+`DSH_BIN` 可指定 Harness 的 `lib/bin.js`，`CHROME_PATH` 可指定浏览器 exe；通常留空即可自动寻找。`WORKBENCH_PORT` 可改端口。`WORKBENCH_DATA_DIR` 或 `--data-dir=目录` 可统一指定 projects、logs、browser-profile 的存放目录；`projectsRoot` / `--projects=目录` 可单独指定项目存放位置。选择外部源码时仍由用户通过界面选择绝对路径。
+
+默认不锁定特定 ChatGPT 订阅模型，使用网页当前模型；如要指定，配置 `gpt.modelName` 和 `gpt.modelMatch`。DeepSeek 模型和凭据从用户自己的 Harness 配置读取，不随仓库分发。
+
+| 配置 | 用途 |
+|---|---|
+| `gpt.chromePath` / `deepseek.uiChromePath` | 浏览器位置，留空自动寻找 Chrome/Edge |
+| `deepseek.dshBin` | Harness JS 入口，留空自动寻找本地/npm 全局安装 |
+| `deepseek.nodeBin` | Node 路径，留空复用启动工作台的 Node |
+| `dataDir` / `projectsRoot` | 数据根目录 / 项目存放目录，可为相对路径 |
+
 
 | 配置 | 用途 |
 |---|---|
@@ -187,17 +234,21 @@ GPT 在 `<PLAN>` / `<UPDATED_PLAN>` 中返回 JSON 对象，使用 `tasks` 数�
 
 ## 测试
 
+在仓库根目录执行：
+
 ```powershell
-npm test                         # 核心、协议、GPT Mock、中文路径
-npm run test:performance          # 隔离 Chrome DOM：桥延迟和流式完整性，不使用账号
-node test\verify-task009.mjs    # 独立启动静态服务的综合 UI 回归
-node controller\index.mjs --gpt=mock --executor=mock --selftest
-node test\snake-browser-smoke.mjs # 本次生成的贪吃蛇样例：真实浏览器交互回归
+npm test                 # 核心、协议、Mock、目录和可移植性回归
+npm run test:ui          # 隔离静态服务的 Dashboard 回归，需要浏览器
+npm run test:performance # 隔离 DOM 的浏览器桥测试，不使用账号
+npm run selftest         # 临时目录中的模拟闭环，结束后清理
 ```
+
+仓库提供 Windows Node.js 22/24 的 CI 工作流，在推送或提交拉取请求后运行。主测试在无浏览器时明确跳过浏览器集成部分，`test:ui` 则要求安装浏览器。人工截图位于 test 目录，测试不依赖作者的项目样例。
 
 真实 DeepSeek 环境验证会消耗模型资源，仅在需要时运行：
 
 ```powershell
+cd 双agent工作台
 npm run test:runner
 node controller\visible_probe.mjs
 ```

@@ -1,3 +1,4 @@
+import { testBrowserPath } from "./browser-test-support.mjs";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
@@ -132,11 +133,13 @@ test("规范摘要由实际文档与指挥规则共同生成", () => {
 });
 
 test("隔离 Chrome 的真实附件入口可以同时发送规范和用户文件", async (t) => {
+  const executablePath = testBrowserPath(t);
+  if (!executablePath) return;
   const f = fixture(t);
   const rules = buildGptInstructions();
   const rulesFile = f.store.writeWorkspaceFile(f.id, rules.relative_path, rules.text);
   const userFile = f.store.writeWorkspaceFile(f.id, "attachments/需求.txt", "实现计数器");
-  const browser = await chromium.launch({ executablePath: process.env.CHROME_PATH || "C:/Program Files/Google/Chrome/Application/chrome.exe", headless: true });
+  const browser = await chromium.launch({ executablePath, headless: true });
   try {
     const page = await browser.newPage();
     await page.route("https://bridge.test/**", (route) => route.fulfill({ contentType: "text/html", body: `

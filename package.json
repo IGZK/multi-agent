@@ -1,0 +1,16 @@
+{
+  "name": "dual-agent-workbench-repository",
+  "version": "2.0.7",
+  "private": true,
+  "workspaces": ["双agent工作台"],
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "start": "node 双agent工作台/controller/index.mjs",
+    "demo": "node 双agent工作台/controller/index.mjs --gpt=mock --executor=mock",
+    "doctor": "node 双agent工作台/controller/doctor.mjs",
+    "test": "npm test --workspace=ai-dual-agent-workbench",
+    "test:ui": "npm run test:ui --workspace=ai-dual-agent-workbench",
+    "test:performance": "npm run test:performance --workspace=ai-dual-agent-workbench",
+    "selftest": "node 双agent工作台/controller/index.mjs --gpt=mock --executor=mock --selftest"
+  }
+}

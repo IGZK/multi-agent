@@ -1,2 +1,0 @@
-[WORKBENCH_MANAGED_DISPATCH_V1] 请先用 skill 工具加载 "workbench-executor"，再读取任务信封。
-这是工作台管理会话的首次任务。读取 C:\Users\Administrator\Desktop\双agent\双agent工作台\projects\2026-09-03-test\.gpt_workspace/inbox/task.json，以其中 type/current_task 为唯一执行指令；只处理本次任务。

@@ -1,6 +1,7 @@
+import { testBrowserPath } from "./browser-test-support.mjs";
 // TASK-007 文件夹选择 UI 验证：当前项目展示、切换、空路径占位、长路径省略、选择逻辑不破坏
 import { chromium } from "playwright-core";
-const browser = await chromium.launch({ executablePath: "C:/Program Files/Google/Chrome/Application/chrome.exe", headless: true });
+const browser = await chromium.launch({ executablePath: testBrowserPath(), headless: true });
 const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
 const errors = [];
 let setdirBody = null;

@@ -168,9 +168,9 @@ export function normalizeProjectState(state) {
 
 export class ProjectStore {
   constructor(projectsRoot, logger) {
-    this.projectsRoot = projectsRoot;
+    this.projectsRoot = path.resolve(projectsRoot);
     this.logger = logger;
-    fs.mkdirSync(projectsRoot, { recursive: true });
+    fs.mkdirSync(this.projectsRoot, { recursive: true });
   }
 
   workspaceDir(projectId) {
@@ -192,7 +192,8 @@ export class ProjectStore {
     if (rel === ".gpt_workspace") rel = "";
     else if (rel.startsWith(".gpt_workspace/")) rel = rel.slice(".gpt_workspace/".length);
     const file = path.resolve(ws, rel);
-    if (file !== ws && !file.startsWith(ws + path.sep)) {
+    const relative = path.relative(ws, file);
+    if (relative === ".." || relative.startsWith(".." + path.sep) || path.isAbsolute(relative)) {
       throw new Error("工作区路径越界");
     }
     return file;
@@ -200,20 +201,31 @@ export class ProjectStore {
 
   /**
    * 项目源码目录：用户指定（绝对路径）优先，否则用默认 projects/<id>/source。
-   * 执行者（DeepSeek）与项目分析都在此目录工作。
+   * 执行者（DeepSeek）与项目分析都在此目录工作；路径失效时禁止静默切换目录。
    */
   sourceDir(projectId) {
+    const status = this.sourceDirStatus(projectId);
+    if (status.error) throw new Error(status.error);
+    return status.path;
+  }
+
+  /** 列表和详情仍需展示失效路径，让用户能重新选择目录。读取不改写已有项目。 */
+  sourceDirStatus(projectId) {
+    const defaultDir = path.join(this.projectDir(projectId), "source");
     const st = this.readState(projectId);
-    if (st?.source_dir) {
-      const raw = String(st.source_dir);
-      if (path.isAbsolute(raw)) {
-        const resolved = path.resolve(raw);
-        try {
-          if (fs.statSync(resolved).isDirectory()) return resolved;
-        } catch { /* 无效旧路径回退到项目默认 source */ }
-      }
+    if (!st) return { path: defaultDir, error: `项目不存在: ${projectId}` };
+    const raw = st.source_dir ? String(st.source_dir) : defaultDir;
+    if (!path.isAbsolute(raw)) {
+      return { path: raw, error: `项目文件夹必须是绝对路径，请重新选择项目文件夹: ${raw}` };
     }
-    return path.join(this.projectsRoot, projectId, "source");
+    const resolved = path.resolve(raw);
+    try {
+      if (fs.statSync(resolved).isDirectory()) return { path: resolved, error: null };
+    } catch { /* 目录已搬移、删除或不可访问，必须由用户重新选择。 */ }
+    return {
+      path: resolved,
+      error: `项目文件夹不存在、不可访问或不是目录，请重新选择项目文件夹: ${resolved}`,
+    };
   }
 
   projectDir(projectId) {
@@ -260,13 +272,15 @@ export class ProjectStore {
       if (!entry.isDirectory()) continue;
       const state = this.readState(entry.name);
       if (!state) continue;
+      const source = this.sourceDirStatus(entry.name);
       out.push({
         id: entry.name,
         name: state.project_name || entry.name,
         state: state.state,
         updated_at: state.updated_at,
         created_at: state.created_at,
-        source_dir: this.sourceDir(entry.name),
+        source_dir: source.path,
+        source_dir_error: source.error,
         archived: !!state.archived,
       });
     }

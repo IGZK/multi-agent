@@ -258,8 +258,8 @@ async function refreshDetail() {
     $("#dirHint").textContent = sourceDir || "默认工作台目录";
     $("#dirHint").title = sourceDir || "默认工作台目录";
     $("#dirHint").dataset.path = sourceDir;
-    $("#composerDirLabel").textContent = sourceDir || "默认工作目录";
-    $("#composerDirLabel").title = sourceDir || "默认工作目录";
+    $("#composerDirLabel").textContent = detail.source_dir_error ? "工作目录不可用，请重新选择" : sourceDir || "默认工作目录";
+    $("#composerDirLabel").title = detail.source_dir_error || sourceDir || "默认工作目录";
 
     const selection = detail.deepseek_selection;
     if (document.activeElement !== $("#cModel") && document.activeElement !== $("#cReasoning")) {

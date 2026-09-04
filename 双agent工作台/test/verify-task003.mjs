@@ -1,8 +1,9 @@
+import { testBrowserPath } from "./browser-test-support.mjs";
 // TASK-003 布局运行验证：加载 Dashboard，选中项目，检查布局与无控制台错误
 import { chromium } from "playwright-core";
 
 const browser = await chromium.launch({
-  executablePath: "C:/Program Files/Google/Chrome/Application/chrome.exe",
+  executablePath: testBrowserPath(),
   headless: true,
 });
 const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });

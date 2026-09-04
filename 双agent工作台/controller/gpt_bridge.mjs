@@ -2,7 +2,7 @@
 //
 // 架构：Chrome（独立 Profile，登录态持久化）以 --remote-debugging-port 启动
 //       → playwright-core 通过 CDP 连接（不下载浏览器、不碰用户主 Chrome）
-// 能力：自动打开 ChatGPT、登录态检测、选择 GPT-5.6 Sol、新建会话、
+// 能力：自动打开 ChatGPT、登录态检测、按配置选择模型、新建会话、
 //       自动输入/发送、生成完成检测（停止按钮 + 文本稳定，非固定 sleep）、
 //       读取完整回复、项目级会话隔离（会话 URL 持久化）。
 // 多级回退：data-testid → aria-label → 语义角色 → 键盘事件；全部失败不崩溃，
@@ -12,6 +12,7 @@ import path from "node:path";
 import { spawn } from "node:child_process";
 import { chromium } from "playwright-core";
 import { sleep } from "./logger.mjs";
+import { findBrowser, BROWSER_HELP } from "./browser_runtime.mjs";
 
 export class BridgeError extends Error {
   constructor(code, message) {
@@ -19,22 +20,6 @@ export class BridgeError extends Error {
     this.code = code; // GPT_TIMEOUT | GPT_LOGIN_REQUIRED | GPT_CHALLENGE | GPT_PAGE_ERROR | GPT_BROWSER_ERROR
     this.name = "BridgeError";
   }
-}
-
-const CHROME_CANDIDATES = [
-  "C:/Program Files/Google/Chrome/Application/chrome.exe",
-  "C:/Program Files (x86)/Google/Chrome/Application/chrome.exe",
-  process.env.LOCALAPPDATA + "/Google/Chrome/Application/chrome.exe",
-  "C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe",
-  "C:/Program Files/Microsoft/Edge/Application/msedge.exe",
-];
-
-function findChrome(cfgPath) {
-  if (cfgPath && fs.existsSync(cfgPath)) return cfgPath;
-  for (const p of CHROME_CANDIDATES) {
-    if (p && fs.existsSync(p)) return p;
-  }
-  return null;
 }
 
 async function httpGetJson(url, timeoutMs = 2000) {
@@ -59,7 +44,7 @@ export class GptBridge {
     this.connectPromise = null;
     this.navigationPromise = null;
     this.lastDebugProbe = { at: 0, up: false };
-    this.chromePath = findChrome(this.cfg.chromePath);
+    this.chromePath = findBrowser(this.cfg.chromePath);
     this.profileDir = path.resolve(rootDir, this.cfg.profileDir || "browser-profile");
     this.baseUrl = this.cfg.baseUrl || "https://chatgpt.com/";
     this.live = this.newLive(); // GPT 实时状态（供 Dashboard 展示）
@@ -139,7 +124,7 @@ export class GptBridge {
       throw new BridgeError("GPT_BROWSER_ERROR", "浏览器已启动但连接暂不可用；停止重复唤起，请稍后重试或检查工作台专用浏览器。");
     }
     if (!this.chromePath) {
-      throw new BridgeError("GPT_BROWSER_ERROR", "未找到 Chrome/Edge。请在 config/config.json 的 gpt.chromePath 中指定浏览器路径。");
+      throw new BridgeError("GPT_BROWSER_ERROR", BROWSER_HELP);
     }
     const args = this.chromeArgs();
     this.log("info", `启动浏览器: ${this.chromePath}（调试端口 ${this.cfg.debugPort}，Profile: ${this.profileDir}）`);
@@ -419,17 +404,20 @@ export class GptBridge {
 
   // ---------- 模型选择 ----------
   async selectModel(modelName, matchPatterns) {
+    if (!modelName && !matchPatterns?.length) {
+      this.log("info", "未指定模型，保留 ChatGPT 当前模型");
+      return { selected: null, available: [], chosenBy: "current" };
+    }
     await this.ensureBrowser();
     const chosen = { selected: null, available: [], chosenBy: null };
     try {
-      // 0. 页面是否已显示目标模型（账号默认即 GPT-5.6 Sol 时无需切换）
+      // 0. 页面是否已显示用户配置的目标模型。
       const pageHas = await this.page.evaluate((name) => {
-        const pats = ["GPT-5.6", "GPT-5\\.6", "5\\.6", "Sol", name].filter(Boolean);
-        const re = new RegExp(pats.join("|"), "i");
+        if (!name) return false;
         const labels = [...document.querySelectorAll('button[aria-label*="model" i], button[aria-label*="模型"], [data-testid*="model-switcher"]')]
           .filter((el) => el.getClientRects().length > 0)
           .map((el) => `${el.getAttribute("aria-label") || ""} ${el.innerText || ""}`).join(" ");
-        return re.test(labels);
+        return labels.toLowerCase().includes(name.toLowerCase());
       }, modelName).catch(() => false);
 
       if (pageHas) {
@@ -1020,8 +1008,8 @@ export async function selftest() {
   const r3 = await mock.ask("<ORCHESTRATOR><MSG_TYPE>REVIEW_REQUEST</MSG_TYPE><CONTENT>审查</CONTENT></ORCHESTRATOR>");
   check("mock DONE", parseGptResponse(r3.replyText).status === "DONE");
 
-  const real = new GptBridge({ debugPort: 9333, profileDir: "browser-profile" }, mockLogger, process.cwd());
-  check("find chrome", !!real.chromePath);
+  const real = Object.assign(Object.create(GptBridge.prototype), { logger: mockLogger });
+  check("keep current model by default", (await real.selectModel("", [])).chosenBy === "current");
   const picked = real.pickModel(["GPT-5.6 Sol", "GPT-5.6", "ChatGPT Plus"], "GPT-5.6 Sol", ["GPT-5\\.6", "Sol"]);
   check("model pick exact", picked.best === "GPT-5.6 Sol");
   const picked2 = real.pickModel(["o3", "GPT-5.6", "GPT-4.5"], null, ["5\\.6"]);

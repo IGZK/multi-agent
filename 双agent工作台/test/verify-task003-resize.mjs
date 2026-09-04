@@ -1,8 +1,9 @@
+import { testBrowserPath } from "./browser-test-support.mjs";
 // TASK-003 响应式验证：不同窗口尺寸下布局不错位/遮挡/溢出
 import { chromium } from "playwright-core";
 
 const browser = await chromium.launch({
-  executablePath: "C:/Program Files/Google/Chrome/Application/chrome.exe",
+  executablePath: testBrowserPath(),
   headless: true,
 });
 const page = await browser.newPage();

@@ -798,12 +798,13 @@ test("验证失败按普通失败回滚并重试", async () => {
   } finally { f.cleanup(); }
 });
 
-test("无效的旧源码目录会回退到项目默认 source", () => {
+test("无效的旧源码目录拒绝静默回退到项目默认 source", () => {
   const f = fixture();
   try {
     const id = f.create();
     f.store.writeState(id, { source_dir: path.join(f.root, "不存在") });
-    assert.equal(f.store.sourceDir(id), path.join(f.store.projectsRoot, id, "source"));
+    assert.throws(() => f.store.sourceDir(id), /请重新选择项目文件夹/);
+    assert.equal(f.store.sourceDirStatus(id).path, path.join(f.root, "不存在"));
   } finally { f.cleanup(); }
 });
 
@@ -816,6 +817,18 @@ test("Dashboard 拒绝外部网页发起的写入请求", async () => {
   await server.handle(req, res);
   assert.equal(status, 403);
   assert.match(payload, /拒绝/);
+});
+
+test("Dashboard 等待异步执行窗口打开后返回地址", async () => {
+  const { Readable } = await import("node:stream");
+  const req = Object.assign(Readable.from([Buffer.from(JSON.stringify({ action: "executor_window" }))]), {
+    method: "POST", url: "/api/projects/demo/action", headers: {},
+  });
+  const runner = { async openUiWindow() { await new Promise(setImmediate); return { url: "http://127.0.0.1:1234", opened: true }; } };
+  const server = new DashboardServer({ dashboard: { port: 3700 } }, silent, {}, {}, {}, runner);
+  let payload;
+  await server.handle(req, { writeHead(code) { assert.equal(code, 200); }, end(body) { payload = JSON.parse(body); } });
+  assert.deepEqual(payload, { ok: true, url: "http://127.0.0.1:1234", opened: true });
 });
 
 test("新建项目可由工作目录自动命名并按目录暴露", async () => {

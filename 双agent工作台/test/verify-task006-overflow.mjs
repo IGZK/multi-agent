@@ -1,6 +1,7 @@
+import { testBrowserPath } from "./browser-test-support.mjs";
 // TASK-006：多附件时 Composer 不溢出/不遮挡
 import { chromium } from "playwright-core";
-const browser = await chromium.launch({ executablePath: "C:/Program Files/Google/Chrome/Application/chrome.exe", headless: true });
+const browser = await chromium.launch({ executablePath: testBrowserPath(), headless: true });
 const page = await browser.newPage({ viewport: { width: 1280, height: 800 } });
 const errors = [];
 page.on("pageerror", (e) => errors.push(e.message));

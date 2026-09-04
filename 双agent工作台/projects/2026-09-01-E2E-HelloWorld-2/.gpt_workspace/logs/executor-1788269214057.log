@@ -1,3 +1,0 @@
-TASK-001 执行完毕：已创建 `source/hello.py`，实际运行验证输出 `Hello, World!` 且退出码为 0，报告与 outbox 信封均已写入（按信封要求，本轮仅执行 current_task TASK-001，TASK-002/003 留待后续信封）。
-
-EXECUTOR_DONE

@@ -1,6 +1,0 @@
-[2026-09-01T13:26:54.057Z] [dispatch] type=EXECUTE_PLAN task=TASK-001 attempt=1
-[2026-09-01T13:27:30.477Z] [settle] exitCode=0 timedOut=false ms=36419
-[2026-09-01T13:27:31.986Z] [dispatch] type=EXECUTE_PLAN task=TASK-002 attempt=1
-[2026-09-01T13:27:57.815Z] [settle] exitCode=0 timedOut=false ms=25828
-[2026-09-01T13:27:59.319Z] [dispatch] type=ANALYZE task=- attempt=1
-[2026-09-01T13:29:34.060Z] [settle] exitCode=0 timedOut=false ms=94741

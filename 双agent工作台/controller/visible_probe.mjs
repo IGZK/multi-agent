@@ -7,7 +7,7 @@ import os from "node:os";
 import { fileURLToPath } from "node:url";
 import { DeepseekRunner } from "./deepseek_runner.mjs";
 
-const DSH_BIN = process.env.DSH_BIN || "C:/Users/Administrator/AppData/Roaming/npm/node_modules/@deepseek-ai/dsh/lib/bin.js";
+const DSH_BIN = process.env.DSH_BIN || "";
 const PROFILE = process.env.UI_PROFILE || "workbench-exec";
 
 async function main() {
@@ -32,7 +32,7 @@ async function main() {
     mode: "real",
     visible: true,
     uiOpenWindow: openWindow,
-    nodeBin: "node",
+    nodeBin: process.execPath,
     dshBin: DSH_BIN,
     profile: "headless",
     uiProfile: PROFILE,

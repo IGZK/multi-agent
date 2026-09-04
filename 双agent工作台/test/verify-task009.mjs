@@ -1,3 +1,4 @@
+import { testBrowserPath } from "./browser-test-support.mjs";
 // TASK-009 综合功能与 UI 回归测试（拦截 POST 请求避免干扰运行中的编排器）
 import { chromium } from "playwright-core";
 import fs from "node:fs";
@@ -19,7 +20,7 @@ const staticServer = http.createServer((req, res) => {
 await new Promise((resolve) => staticServer.listen(0, "127.0.0.1", resolve));
 const baseUrl = `http://127.0.0.1:${staticServer.address().port}`;
 
-const browser = await chromium.launch({ executablePath: "C:/Program Files/Google/Chrome/Application/chrome.exe", headless: true });
+const browser = await chromium.launch({ executablePath: testBrowserPath(), headless: true });
 const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
 
 const results = [];

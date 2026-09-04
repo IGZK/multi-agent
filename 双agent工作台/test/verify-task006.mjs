@@ -1,6 +1,7 @@
+import { testBrowserPath } from "./browser-test-support.mjs";
 // TASK-006 附件上传 UI 验证
 import { chromium } from "playwright-core";
-const browser = await chromium.launch({ executablePath: "C:/Program Files/Google/Chrome/Application/chrome.exe", headless: true });
+const browser = await chromium.launch({ executablePath: testBrowserPath(), headless: true });
 const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
 const errors = [];
 let sent = null;

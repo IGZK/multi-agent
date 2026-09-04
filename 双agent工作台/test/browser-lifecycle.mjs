@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { GptBridge } from "../controller/gpt_bridge.mjs";
+import { testBrowserPath } from "./browser-test-support.mjs";
 
 test("启动不恢复历史窗口、不创建空白首页；失败重试不重复启动", async () => {
   const bridge = Object.assign(Object.create(GptBridge.prototype), {
@@ -41,7 +42,8 @@ test("空白页导航失败会关闭新页；已有非空白页不受影响", as
 
 const listen = (server) => new Promise((resolve) => server.listen(0, "127.0.0.1", () => resolve(server.address().port)));
 
-test("隔离真实 Chrome：并发唤起、重连、关闭后重建均只保留一个工作页", { timeout: 60000 }, async () => {
+test("隔离真实 Chrome：并发唤起、重连、关闭后重建均只保留一个工作页", { timeout: 60000 }, async (t) => {
+  if (!testBrowserPath(t)) return;
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "workbench-browser-"));
   const server = http.createServer((_req, res) => res.end('<html><body><div id="prompt-textarea" contenteditable="true"></div></body></html>'));
   const webPort = await listen(server);

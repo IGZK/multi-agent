@@ -75,6 +75,7 @@ export class DashboardServer {
   projectDetail(projectId) {
     const st = this.store.readState(projectId);
     if (!st) return null;
+    const source = this.store.sourceDirStatus(projectId);
     const dir = this.store.projectDir(projectId);
     const logFile = path.join(dir, ".gpt_workspace", "logs");
     let logsTail = "";
@@ -114,7 +115,8 @@ export class DashboardServer {
       gpt_context: this.store.readFileSafe(projectId, "gpt_context.md"),
       conversation: this.store.listConversation(projectId, 40),
       logs_tail: logsTail,
-      source_dir: this.store.sourceDir(projectId),
+      source_dir: source.path,
+      source_dir_error: source.error,
       workspace_dir: this.store.workspaceDir(projectId),
       gpt_live: this.bridge?.getLive?.() || null,
       executor_ui: this.runner?.uiInfo?.(projectId) || null,
@@ -266,7 +268,7 @@ export class DashboardServer {
           return sendJson(res, 200, { ok: true, windowVisible: v });
         } else if (body.action === "executor_window") {
           // 重新打开（或查询）本项目的 DeepSeek 执行窗口
-          const ui = this.runner?.openUiWindow?.(id) || null;
+          const ui = await this.runner?.openUiWindow?.(id) || null;
           if (!ui) return sendJson(res, 200, { ok: true, url: null, hint: "当前没有运行中的执行窗口（仅在 DeepSeek 执行任务时存在）。" });
           return sendJson(res, 200, { ok: true, url: ui.url, opened: ui.opened });
         } else return sendJson(res, 400, { error: "未知 action" });

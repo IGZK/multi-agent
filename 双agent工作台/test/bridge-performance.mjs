@@ -1,3 +1,4 @@
+import { testBrowserPath } from "./browser-test-support.mjs";
 // 隔离浏览器中的可控 DOM，不连接用户账号；测量桥自身延迟与流式完成保护。
 import assert from "node:assert/strict";
 import test from "node:test";
@@ -5,7 +6,9 @@ import { chromium } from "playwright-core";
 import { GptBridge } from "../controller/gpt_bridge.mjs";
 
 test("GPT 桥：空白页复用、快速发送、稳定收包与流式保护", async (t) => {
-  const browser = await chromium.launch({ executablePath: process.env.CHROME_PATH || "C:/Program Files/Google/Chrome/Application/chrome.exe", headless: true });
+  const executablePath = testBrowserPath(t);
+  if (!executablePath) return;
+  const browser = await chromium.launch({ executablePath, headless: true });
   try {
     const page = await browser.newPage();
     await page.route("https://bridge.test/**", (route) => route.fulfill({ contentType: "text/html", body: `

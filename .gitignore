@@ -1,0 +1,13 @@
+# Dependencies and machine-local state (never distribute login sessions).
+node_modules/
+双agent工作台/browser-profile/
+双agent工作台/logs/
+双agent工作台/projects/
+双agent工作台/.selftest-projects/
+双agent工作台/config/config.local.json
+双agent工作台/.local/
+.env
+.env.*
+!.env.example
+*.log
+test-results/
