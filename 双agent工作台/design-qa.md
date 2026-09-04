@@ -1,27 +1,17 @@
-# Design QA — Dashboard v2.0
+# Dashboard 检查说明
 
-## Visual source
+运行根目录 `npm run test:ui`，或在本目录运行：
 
-- Reference: `test/shot-light.png`（v1.7，1440×900）
-- Implementation: `test/shot-v2-light.png` 与 `test/shot-v2-dark.png`（v2.0，1440×900）
-- Combined comparison: `C:\Users\Administrator\.codex\visualizations\2026\09\03\01a06560-f2fc-7111-8585-a3becda871cf\design-qa-comparison.png`
+```text
+node test/verify-task009.mjs
+node --test test/ui-regressions.mjs
+```
 
-## Intentional differences
+两个套件通过 `test/dashboard-fixture.mjs` 共用隔离测试服务：随机本地端口、临时浏览器会话、模拟 API，不连接运行中的工作台，也不读取或修改真实项目数据。异常退出时会关闭浏览器和测试服务。
 
-- 保留双栏、项目头、标签页、内容区和底部 Composer，移除侧栏创建表单与项目头技术信息堆叠。
-- 左栏统一为 280px 紧凑项目列表，行内菜单承载重命名、归档和删除。
-- 项目状态提示统一为 Callout；技术信息、用量、检查点和最近执行集中到“概览”。
-- 原 emoji 和文本符号替换为本地 Lucide 图标；视觉改用语义令牌、单一品牌色与 8px 圆角。
+- 综合界面回归覆盖六个标签页、文件夹选择、项目创建、附件上传/失败/重试/移除、生命周期操作、模型选择、用量展示，以及 1920、1440、1280、1100、900、700px 布局。
+- 状态回归覆盖项目切换期间的目录选择/附件上传/消息提交，草稿隔离，中文输入法确认，重复提交，删除取消/失败，暂停/继续，模型连续保存，同长度消息更新，菜单和键盘焦点，长目录、长文本、多附件及主题保存。
+- 浅色和深色截图由综合套件输出为 `dashboard-light.png`、`dashboard-dark.png`。默认保存在系统临时目录，控制台结果中的 `screenshotDir` 给出位置；也可通过 `UI_SCREENSHOT_DIR` 指定目录。
+- 历史 TASK-003 至 TASK-008 探针的有效检查已并入这两个套件；不再维护旧截图或绑定端口 3700 的重复脚本。
 
-## Checks
-
-- 1440×900 同状态对照：结构层级、边距、控件尺寸、边框和圆角符合重构目标。
-- 应用内浏览器验证：本地图标全部加载，无页面级横向或纵向溢出，Composer 固定在主区域底部。
-- 对话、概览、任务、规划、分析、日志标签可操作；方向键同步焦点和 ARIA 状态。
-- 更多操作菜单、主题切换、新建项目表单和项目创建主流程可操作。
-- 深色主题无不可读文本或错误资源。
-- 自动回归覆盖 1920、1440、1280、900、700px，44/44 通过。
-
-## Result
-
-final result: passed
+最近验证：2026-09-04，综合回归 51 项、状态回归 12 项通过。已查看本次生成的深浅色截图，未见布局遮挡或资源错误。

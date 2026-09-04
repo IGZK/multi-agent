@@ -1,28 +1,13 @@
-import { testBrowserPath } from "./browser-test-support.mjs";
-// TASK-009 综合功能与 UI 回归测试（拦截 POST 请求避免干扰运行中的编排器）
-import { chromium } from "playwright-core";
+import { dashboardFixture } from "./dashboard-fixture.mjs";
 import fs from "node:fs";
-import http from "node:http";
+import os from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 
-const webDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "web");
-const staticServer = http.createServer((req, res) => {
-  const pathname = new URL(req.url, "http://localhost").pathname;
-  const name = pathname === "/" ? "index.html" : pathname.slice(1);
-  const file = path.resolve(webDir, name);
-  if (file !== webDir && !file.startsWith(webDir + path.sep)) { res.writeHead(403); res.end(); return; }
-  if (!fs.existsSync(file)) { res.writeHead(404); res.end(); return; }
-  const type = name.endsWith(".css") ? "text/css" : name.endsWith(".js") ? "text/javascript" : name.endsWith(".svg") ? "image/svg+xml" : name.endsWith(".txt") ? "text/plain" : "text/html";
-  res.writeHead(200, { "Content-Type": `${type}; charset=utf-8` });
-  res.end(fs.readFileSync(file));
-});
-await new Promise((resolve) => staticServer.listen(0, "127.0.0.1", resolve));
-const baseUrl = `http://127.0.0.1:${staticServer.address().port}`;
-
-const browser = await chromium.launch({ executablePath: testBrowserPath(), headless: true });
-const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
-
+const fixture = await dashboardFixture();
+const { page, baseUrl } = fixture;
+const screenshotDir = process.env.UI_SCREENSHOT_DIR ? path.resolve(process.env.UI_SCREENSHOT_DIR) : fs.mkdtempSync(path.join(os.tmpdir(), "dual-agent-ui-"));
+fs.mkdirSync(screenshotDir, { recursive: true });
+try {
 const results = [];
 const errors = [];
 const sentMessages = [];
@@ -88,7 +73,7 @@ ok("页面加载无崩溃", true);
 // 布局：选中项目
 const li = await page.evaluate(() => document.querySelectorAll("#projList li").length);
 ok("项目列表已加载", li > 0);
-await page.click("#projList li");
+await page.click("#projList .project-select");
 await page.waitForTimeout(1000);
 ok("项目已成为当前上下文", await page.evaluate(() => currentProjectId === "demo" && typeof document.querySelector("#btnSetDir").onclick === "function"));
 
@@ -152,7 +137,7 @@ await page.click("#btnPickDir");
 await page.waitForTimeout(400);
 const projDirVal = await page.evaluate(() => document.querySelector("#projDir").value);
 eq("新建表单目录填充", projDirVal, fakeDir);
-await page.click("#projList li");
+await page.click("#projList .project-select");
 await page.waitForTimeout(200);
 
 ok("暂停态显示继续项目", await page.locator("#btnResume").isVisible() && (await page.textContent("#btnResume")).trim() === "继续项目");
@@ -203,6 +188,12 @@ await page.focus("#tab-button-overview");
 await page.keyboard.press("ArrowRight");
 ok("标签页支持方向键", await page.getAttribute("#tab-button-tasks", "aria-selected") === "true");
 await page.click("#tab-button-chat");
+let tabsWork = true;
+for (const name of ["chat", "overview", "tasks", "plan", "analysis", "logs", "chat"]) {
+  await page.click(`#tab-button-${name}`);
+  tabsWork &&= await page.locator(name === "chat" ? "#convoView" : `#tab-${name}`).isVisible();
+}
+ok("全部六个标签页均能打开对应内容", tabsWork);
 
 actions.length = 0;
 await page.click(".more-actions summary");
@@ -294,11 +285,11 @@ const cp = createPayload[0] || {};
 ok("新建界面已移除名称与分类字段", !(await page.locator("#projName").count()) && !(await page.locator("#projCategory").count()));
 ok("新建 payload 仅需任务描述", !cp.name && !cp.category && cp.task === "测试任务描述");
 ok("新建 payload 携带附件", cp.attachments?.length === 2 && cp.attachments.every((item) => item.data.startsWith("data:")));
-await page.click("#projList li");
+await page.click("#projList .project-select");
 await page.waitForTimeout(200);
 
 // 窗口尺寸变化
-const sizes = [[1920,1080],[1440,900],[1280,800],[900,700],[700,600]];
+const sizes = [[1920,1080],[1440,900],[1280,800],[1100,700],[900,700],[700,600]];
 const sizeResults = [];
 for (const [w,h] of sizes) {
   await page.setViewportSize({ width: w, height: h });
@@ -316,20 +307,21 @@ ok("各尺寸无垂直溢出", sizeResults.every(r => !r.overflowY));
 
 // 主题切换
 await page.setViewportSize({ width: 1440, height: 900 });
-await page.screenshot({ path: path.join(webDir, "..", "test", "shot-v2-light.png"), fullPage: true });
+await page.screenshot({ path: path.join(screenshotDir, "dashboard-light.png"), fullPage: true });
 const initialTheme = await page.evaluate(() => document.documentElement.getAttribute("data-theme"));
 await page.click("#btnTheme");
 await page.waitForTimeout(200);
 const theme = await page.evaluate(() => document.documentElement.getAttribute("data-theme"));
 ok("主题可在深浅色之间切换", initialTheme !== theme);
-await page.screenshot({ path: path.join(webDir, "..", "test", "shot-v2-dark.png"), fullPage: true });
+await page.screenshot({ path: path.join(screenshotDir, "dashboard-dark.png"), fullPage: true });
 
 // 仅统计真实的 JS 异常；忽略测试自身制造的资源加载错误(favicon 404 / 拦截新建请求的 400)
 const jsErrors = errors.filter(e => !e.includes("favicon") && !e.includes("400 (Bad Request)") && !e.includes("status of 400"));
 ok("无 JS 控制台错误", jsErrors.length === 0);
 
 const failed = results.filter(r => !r.pass);
-console.log(JSON.stringify({ total: results.length, passed: results.length - failed.length, failed: failed, all: results, jsErrors, dialogs }, null, 2));
-await browser.close();
-await new Promise((resolve) => staticServer.close(resolve));
+console.log(JSON.stringify({ total: results.length, passed: results.length - failed.length, failed: failed, all: results, jsErrors, dialogs, screenshotDir }, null, 2));
+
+
 process.exitCode = failed.length ? 1 : 0;
+} finally { await fixture.close(); }

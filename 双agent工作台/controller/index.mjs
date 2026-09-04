@@ -6,6 +6,8 @@
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
+import net from "node:net";
+import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { Logger, ROOT_DIR, sleep } from "./logger.mjs";
 import { ProjectStore } from "./store.mjs";
@@ -30,32 +32,30 @@ export function buildSystem(opts = {}) {
 }
 
 /**
- * 单实例锁：防止两个工作台进程同时操作同一 projects 目录（会相互恢复对方的项目）。
- * 锁按 projects 目录作用域区分：不同 projects 目录可并行运行（如隔离测试实例）。
+ * Windows 命名管道由系统原子占用，进程退出或崩溃后自动释放。
+ * 按真实 projects 路径互斥，日志位置、目录大小写和联接路径不影响锁。
  * @returns true 表示可以继续运行
  */
 export async function acquireInstanceLock(logger, projectsRoot) {
-  const crypto = await import("node:crypto").catch(() => null);
-  const scope = projectsRoot ? (crypto ? crypto.createHash("md5").update(projectsRoot).digest("hex").slice(0, 8) : path.basename(projectsRoot)) : "default";
-  const lockFile = path.join(logger?.dir || path.join(ROOT_DIR, "logs"), `workbench-${scope}.lock`);
   try {
-    if (fs.existsSync(lockFile)) {
-      const old = JSON.parse(fs.readFileSync(lockFile, "utf8"));
-      try {
-        process.kill(old.pid, 0); // 进程存活则不抛
-        logger?.error("main", `另一个工作台实例正在使用同一项目目录（PID ${old.pid}，启动于 ${old.ts || "?"}）。如需强制启动，先结束该进程或删除 ${lockFile}`);
-        return false;
-      } catch { /* 进程已死，锁过期 */ }
-    }
-    fs.writeFileSync(lockFile, JSON.stringify({ pid: process.pid, ts: new Date().toISOString() }), "utf8");
-    const release = () => { try { fs.unlinkSync(lockFile); } catch { /* ignore */ } };
-    process.on("exit", release);
-    process.on("SIGINT", release);
-    process.on("SIGTERM", release);
+    if (process.platform !== "win32") throw new Error("本项目仅支持 Windows 10/11");
+    const directory = projectsRoot || path.join(ROOT_DIR, "projects");
+    fs.mkdirSync(directory, { recursive: true });
+    const canonical = fs.realpathSync.native(directory).toLowerCase();
+    const scope = createHash("sha256").update(canonical).digest("hex").slice(0, 32);
+    const lock = net.createServer((socket) => socket.end());
+    await new Promise((resolve, reject) => {
+      lock.once("error", reject);
+      lock.listen(`\\\\.\\pipe\\dual-agent-workbench-${scope}`, resolve);
+    });
+    lock.unref();
+    process.once("exit", () => lock.close());
     return true;
   } catch (e) {
-    logger?.warn("main", `实例锁处理失败（继续运行）: ${e.message}`);
-    return true;
+    logger?.error("main", ["EADDRINUSE", "EACCES"].includes(e.code)
+      ? "另一个工作台实例正在使用同一项目目录，请先关闭该实例。"
+      : `无法锁定项目目录，已停止启动: ${e.message}`);
+    return false;
   }
 }
 
@@ -80,7 +80,7 @@ async function main() {
   if (opts.selftest) {
     // 自测中不弹可见执行窗口（保持 headless 微任务验证）
     if (config.deepseek.mode === "real") config.deepseek.visible = false;
-    return runSelftest(orchestrator, store, logger, config, selftestProjectsRoot);
+    return runSelftest(orchestrator, store, logger, config, selftestProjectsRoot, runner);
   }
 
   if (!(await acquireInstanceLock(logger, config.projectsRoot))) {
@@ -98,20 +98,33 @@ async function main() {
   await orchestrator.boot();
 
   // 优雅退出
+  let shuttingDown = false;
+  let failedShutdownHold;
   const shutdown = async () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
     logger.info("main", "收到退出信号，正在关闭…");
-    try { runner.detachAll?.(); } catch (e) { logger.warn("main", `释放执行句柄失败: ${e.message}`); }
-    process.exit(0);
+    server.server?.close();
+    try {
+      await orchestrator.beginShutdown();
+      await runner.detachAll();
+      clearInterval(failedShutdownHold);
+      process.exit(0);
+    } catch (e) {
+      // Keep the instance lock until execution really stops; another instance must not resume it.
+      failedShutdownHold ||= setInterval(() => {}, 60000);
+      shuttingDown = false;
+      logger.error("main", `关闭失败，项目锁已保留，调度已停止。请再次退出以重试清理：${e.message}`);
+    }
   };
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);
   // 保留 Harness 服务，供工作台重启后按持久化的服务地址与会话 ID 接管。
-  process.on("exit", () => { try { runner.detachAll?.(); } catch { /* ignore */ } });
   process.on("uncaughtException", (e) => logger.error("main", `uncaughtException: ${e.stack || e.message}`));
   process.on("unhandledRejection", (e) => logger.error("main", `unhandledRejection: ${e?.stack || e}`));
 }
 
-async function runSelftest(orchestrator, store, logger, config, selftestProjectsRoot) {
+async function runSelftest(orchestrator, store, logger, config, selftestProjectsRoot, runner) {
   logger.info("selftest", "======== 闭环自测（mock GPT + mock 执行者） ========");
   const id = await orchestrator.createProject("自测项目", "创建一个 Python Hello World 项目，并添加一个 README。");
   logger.info("selftest", `测试项目: ${id}`);
@@ -137,6 +150,8 @@ async function runSelftest(orchestrator, store, logger, config, selftestProjects
     && (final.gpt_messages || []).length >= 4;
   logger.info("selftest", `检查: completed=${(final?.completed_tasks || []).length} analysis=${!!store.readFileSafe(id, "project_analysis.md")} final=${!!store.readFileSafe(id, "FINAL_REPORT.md")} gptMsgs=${(final?.gpt_messages || []).length}`);
   logger.info("selftest", ok ? "闭环自测 PASS" : "闭环自测 FAIL");
+  await orchestrator.beginShutdown();
+  await runner.shutdownAll();
   if (selftestProjectsRoot) {
     try { fs.rmSync(selftestProjectsRoot, { recursive: true, force: true }); } catch { /* ignore */ }
   }

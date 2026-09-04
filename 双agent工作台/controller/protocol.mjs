@@ -119,6 +119,8 @@ export function parsePlan(text) {
     id: String(id || "").toUpperCase(), description, priority: "medium", dependencies: [],
     kind: "coding", validation: null, validation_command: null, acceptance_check: null, timeout: null, max_attempts: null,
   });
+  const dependencies = (value) => value.replace(/[\[\]]/g, "").split(/[,，]/)
+    .map((id) => id.trim().replace(/^(['"])(.*)\1$/, "$2").toUpperCase()).filter(Boolean);
   const assignTaskAttr = (task, key, val) => {
     if (key === "description") task.description = val;
     else if (key === "priority") task.priority = val;
@@ -163,10 +165,7 @@ export function parsePlan(text) {
           if (key !== "dependencies") assignTaskAttr(currentTask, key, val);
           else {
             if (val) {
-              for (const d of val.replace(/[\[\]]/g, "").split(/[,，]/)) {
-                const dd = d.trim().replace(/,$/, "");
-                if (dd) currentTask.dependencies.push(dd.toUpperCase());
-              }
+              currentTask.dependencies.push(...dependencies(val));
             } else {
               expectingDeps = true;
             }
@@ -209,10 +208,7 @@ export function parsePlan(text) {
         if (key !== "dependencies") assignTaskAttr(currentTask, key, val);
         else {
           if (val) {
-            for (const d of val.replace(/[\[\]]/g, "").split(/[,，]/)) {
-              const dd = d.trim().replace(/,$/, "");
-              if (dd) currentTask.dependencies.push(dd.toUpperCase());
-            }
+            currentTask.dependencies.push(...dependencies(val));
           } else {
             expectingDeps = true; // 依赖列表在后续行（可能隔空行）
           }

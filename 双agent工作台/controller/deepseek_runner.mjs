@@ -16,11 +16,12 @@ import { resolveDeepseekSelection, planningPolicy, validateTaskContract } from "
 import path from "node:path";
 import os from "node:os";
 import crypto from "node:crypto";
-import { spawn, execFile } from "node:child_process";
+import { spawn } from "node:child_process";
 import { sleep, projectLog, nowIso } from "./logger.mjs";
 import { buildExecutorPrompt, buildExecutorTurnPrompt } from "./prompts.mjs";
 import { UiExecutor } from "./dsh_ui.mjs";
 import { requireDshBin } from "./executor_runtime.mjs";
+import { terminateProcessTree } from "./process_runtime.mjs";
 
 /** 用目录事件即时唤醒，以短轮询作为 Windows/网络盘上的丢事件兜底。 */
 export function createFileWake(directory, targetName) {
@@ -35,6 +36,7 @@ export function createFileWake(directory, targetName) {
     watcher = fs.watch(directory, (_event, name) => {
       if (!name || path.basename(String(name)) === targetName) signal();
     });
+    watcher.on("error", () => { watcher?.close(); watcher = null; signal(); });
   } catch { /* 轮询兜底 */ }
   return {
     wait(ms = 150) {
@@ -45,7 +47,7 @@ export function createFileWake(directory, targetName) {
         timer = setTimeout(() => { if (waiter) waiter = null; resolve(); }, ms);
       });
     },
-    close() { waiter = null; watcher?.close?.(); },
+    close() { const resolve = waiter; waiter = null; resolve?.(); watcher?.close?.(); },
   };
 }
 
@@ -78,6 +80,10 @@ export class DeepseekRunner {
   }
 
   log(level, msg) { this.logger?.[level]?.("deepseek-runner", msg); }
+
+  assertActive(projectId) {
+    if (this.cancelled.has(projectId)) throw new RunnerError("PROJECT_CANCELLED", "项目已暂停或删除");
+  }
 
   /** 组装完整提示词（DeepSeek 系统提示词 + 任务信封） */
   buildPrompt(envelope) {
@@ -120,6 +126,7 @@ export class DeepseekRunner {
    * @returns {exitCode, timedOut, logFile, ms, visible?, sessionId?, uiUrl?}
    */
   async run(projectId, dirs, envelope, store) {
+    if (this.running.has(projectId)) throw new RunnerError("RUNNER_BUSY", "该项目已有任务正在执行");
     this.cancelled.delete(projectId);
     const { workspaceDir, sourceDir } = dirs;
     fs.mkdirSync(sourceDir, { recursive: true });
@@ -155,10 +162,9 @@ export class DeepseekRunner {
       try {
         return await this.runSessionPool(projectId, dirs, envelope, store, prompt);
       } catch (e) {
-        if (["RUNNER_WORKSPACE", "MODEL_SELECTION", "PLAN_POLICY"].includes(e.code)) throw e;
+        if (["RUNNER_WORKSPACE", "MODEL_SELECTION", "PLAN_POLICY", "RUNNER_STOP_FAILED"].includes(e.code)) throw e;
         if (this.running.has(projectId) || this.cancelled.has(projectId)) {
           // 已提交或已取消的任务绝不能改走另一进程重复执行。
-          this.running.delete(projectId);
           throw e;
         }
         if (e instanceof RunnerError) {
@@ -198,12 +204,14 @@ export class DeepseekRunner {
 
     // a. 确保项目可见执行服务（失败→抛错回退 headless，任务尚未开始，安全）
     let server = await this.ui.ensureServer(projectId, logDir);
+    this.assertActive(projectId);
     if (!server) {
       throw new RunnerError("RUNNER_UI_BOOT", `执行服务启动失败（profile=${this.ui.profileName}）`);
     }
 
     // b. 获取（必要时创建）项目会话 —— 一个项目一个会话，跨任务复用；项目间按 projectId 隔离
     const got = await this.ui.getOrCreateSession(projectId, sourceDir);
+    this.assertActive(projectId);
     let sessionId = got.sessionId;
     let sessionReused = got.reused;
     // 会话是否为"新建立"：新会话→编排器重置上下文缓存，下个任务发全量；复用→下个任务发增量
@@ -222,10 +230,12 @@ export class DeepseekRunner {
       }
     };
     await applyModel();
+    this.assertActive(projectId);
     const [reportedModel, usageBeforeValue] = await Promise.all([
       this.ui.currentModel?.(projectId, sessionId, 1000).catch(() => null),
       this.ui.sessionProjection?.(projectId, sessionId, 1000).catch(() => null),
     ]);
+    this.assertActive(projectId);
     let actualModel = reportedModel;
     if (envelope.type === "EXECUTE_PLAN") {
       const errors = validateTaskContract(envelope.current_task, planningPolicy(reportedModel || {}));
@@ -254,6 +264,7 @@ export class DeepseekRunner {
       // ACK 超时不代表任务未入队；直接转 headless 会造成重复执行。
       this.log("warn", `提交 ACK 不确定，继续监听原会话结果: ${e.message}`);
     }
+    this.assertActive(projectId);
     this.log("info", `任务已提交: type=${envelope.type} task=${taskId}（${sessionReused && !got.bootstrap ? "复用会话，精简提示" : "新会话，摘要化提示"}）`);
     projectLog(projectDir, `[dispatch] pool type=${envelope.type} task=${taskId} attempt=${envelope.attempt || 1} session=${sessionId} ui=${server.url}`);
 
@@ -350,7 +361,7 @@ export class DeepseekRunner {
     this.log("warn", `执行超时（${Math.round(timeoutMs / 1000)}s），取消会话 ${sessionId}`);
     await this.ui.cancelSession(projectId, sessionId).catch(() => {});
     const result = await buildResult({ timedOut: true });
-    this.ui.disposeServer(projectId);
+    await this.ui.disposeServer(projectId);
     this.running.delete(projectId);
     result.exitCode = null;
     projectLog(projectDir, `[settle] timeout task=${taskId} ms=${result.ms}`);
@@ -389,8 +400,10 @@ export class DeepseekRunner {
   /** 重启恢复：接管已保存服务与会话，只等待原 dispatch 的结果。 */
   async resume(projectId, dirs, envelope, store) {
     if (this.cfg.mode !== "real" || this.cfg.useSessionPool === false) return null;
+    this.cancelled.delete(projectId);
     const saved = store?.readState?.(projectId)?.session;
     const adopted = await this.ui.adoptSession(projectId, saved, dirs.sourceDir).catch(() => null);
+    this.assertActive(projectId);
     if (!adopted) return null;
     const startedAt = Date.now();
     const timeoutMs = envelope.timeoutMs || this.cfg.executorTimeoutMs || 2700000;
@@ -477,15 +490,18 @@ export class DeepseekRunner {
         stdio: ["ignore", fd, fd], // 输出直接进文件，避免管道
         env: { ...process.env, DSH_HOME: this.ui.dshHome(), DSH_BUNDLED_SKILL_DIR: path.join(this.ui.ensureProfile().dir, "skills") },
         windowsHide: true,
+        detached: process.platform !== "win32",
       });
     } catch (e) {
       fs.closeSync(fd);
       throw new RunnerError("RUNNER_SPAWN", `无法启动执行会话: ${e.message}`);
     }
-    this.running.set(projectId, { pid: child.pid, startedAt });
+    const info = { child, pid: child.pid, startedAt, stopping: null, timedOut: false };
+    this.running.set(projectId, info);
 
     const timeoutMs = envelope.timeoutMs || this.cfg.executorTimeoutMs || 2700000;
-    const result = await new Promise((resolve) => {
+    try {
+    const result = await new Promise((resolve, reject) => {
       let settled = false;
       let timer;
       const finish = (r) => { if (!settled) { settled = true; clearTimeout(timer); resolve(r); } };
@@ -494,18 +510,29 @@ export class DeepseekRunner {
       timer = setTimeout(() => {
         if (settled) return;
         this.log("warn", `执行会话超时（${Math.round(timeoutMs / 1000)}s），强制终止 PID ${child.pid}`);
-        execFile("taskkill", ["/PID", String(child.pid), "/T", "/F"], { stdio: "ignore", windowsHide: true }, () => {});
-        finish({ exitCode: null, timedOut: true });
+        info.timedOut = true;
+        info.stopping ||= terminateProcessTree(child);
+        info.stopping.then((stopped) => {
+          if (!stopped) reject(new RunnerError("RUNNER_STOP_FAILED", "无法确认执行进程已停止，禁止回滚或删除工作区"));
+          else finish({ exitCode: null, timedOut: true });
+        }, reject);
       }, timeoutMs);
       child.once("exit", () => clearTimeout(timer));
     });
-    this.running.delete(projectId);
-    try { fs.closeSync(fd); } catch { /* ignore */ }
+    if (info.stopping && !(await info.stopping)) throw new RunnerError("RUNNER_STOP_FAILED", "无法确认执行进程已停止");
+    result.timedOut = info.timedOut;
     result.logFile = logFile;
     result.ms = Date.now() - startedAt;
     result.cancelled = this.cancelled.has(projectId);
     projectLog(projectDir, `[settle] headless exitCode=${result.exitCode} timedOut=${result.timedOut} ms=${result.ms}`);
     return result;
+    } catch (error) {
+      if (error.code === "RUNNER_STOP_FAILED") { info.stopFailed = true; info.stopping = null; }
+      throw error;
+    } finally {
+      if (!info.stopFailed && this.running.get(projectId) === info) this.running.delete(projectId);
+      fs.closeSync(fd);
+    }
   }
 
   /** mock 执行者：直接落盘文件与 outbox（不调用 LLM），用于编排器闭环演练 */
@@ -562,24 +589,27 @@ export class DeepseekRunner {
   kill(projectId) {
     this.cancelled.add(projectId);
     const info = this.running.get(projectId);
-    if (info?.sessionId && this.ui.info(projectId)) {
-      this.ui.cancelSession(projectId, info.sessionId).catch(() => {});
-      this.ui.disposeServer(projectId);
-      this.running.delete(projectId);
-      return true;
-    }
-    if (info?.pid) {
-      this.log("warn", `强制终止执行会话 PID ${info.pid}（项目 ${projectId}）`);
-      execFile("taskkill", ["/PID", String(info.pid), "/T", "/F"], { stdio: "ignore", windowsHide: true }, () => {});
-      this.running.delete(projectId);
-      return true;
-    }
-    // 无运行会话但服务仍在（例如项目刚完成）→ 也清理
-    if (this.ui.info(projectId)) {
-      this.ui.disposeServer(projectId);
-      return true;
-    }
-    return false;
+    if (info?.stopping) return info.stopping;
+    const hasOwnedService = !!this.ui.servers?.get(projectId)?.child;
+    const cancellation = info?.sessionId ? this.ui.cancelSession(projectId, info.sessionId).catch(() => false) : false;
+    const processStop = info?.child ? terminateProcessTree(info.child) : false;
+    // Adopted services have no owned process handle. Keep their session record
+    // when cancellation cannot be confirmed so the user can retry stopping it.
+    const serviceStop = info?.sessionId && !hasOwnedService
+      ? Promise.resolve(cancellation).then((cancelled) => cancelled ? this.ui.disposeServer(projectId) : undefined)
+      : this.ui.disposeServer(projectId);
+    const stopping = Promise.all([cancellation, processStop, serviceStop]).then(([cancelled, stopped]) => {
+      if ((info?.child && !stopped) || (info?.sessionId && !hasOwnedService && !cancelled)) {
+        throw new RunnerError("RUNNER_STOP_FAILED", "无法确认执行会话已停止，禁止回滚或删除工作区");
+      }
+      if (this.running.get(projectId) === info) this.running.delete(projectId);
+      return !!info;
+    }).catch((error) => {
+      if (info) { info.stopFailed = true; info.stopping = null; }
+      throw error;
+    });
+    if (info) info.stopping = stopping;
+    return stopping;
   }
 
   /** 项目完成后延时释放可见执行服务（给用户留出查看时间） */
@@ -589,16 +619,18 @@ export class DeepseekRunner {
 
   /** 进程退出前关闭全部可见执行服务 */
   shutdownAll() {
-    this.ui.shutdownAll();
+    return Promise.all([...this.running.keys()].map((id) => this.kill(id)).concat(this.ui.shutdownAll()));
   }
 
   detachAll() {
+    const pending = [...this.running.entries()].filter(([, info]) => info.child).map(([id]) => this.kill(id));
     this.ui.detachAll();
+    return Promise.all(pending);
   }
 }
 
 // ---------- 自测：真实 headless 微任务 ----------
-export async function selftest() {
+export async function selftest({ visible = false, openWindow = false } = {}) {
   const logger = { info: () => {}, warn: () => {}, error: () => {} };
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-runner-test-"));
   const dirs = {
@@ -612,8 +644,9 @@ export async function selftest() {
 
   const cfg = {
     mode: "real",
-    visible: false, // 自测保持 headless，避免弹窗
-    useSessionPool: false, // 自测走纯 headless（每任务一个进程），不启动 web 服务
+    visible,
+    uiOpenWindow: openWindow,
+    useSessionPool: visible,
     nodeBin: process.execPath,
     dshBin: "",
     profile: "headless",
@@ -623,30 +656,47 @@ export async function selftest() {
   const envelope = {
     type: "EXECUTE_PLAN",
     plan: { tasks: [] },
-    current_task: { id: "TASK-TEST", description: "在 source 目录创建 runner-test.txt，内容 runner-ok" },
+    current_task: {
+      id: "TASK-TEST", description: "在 source 目录创建 runner-test.txt，内容 runner-ok",
+      kind: "coding", scope: "只处理临时 source/runner-test.txt 及工作区内本任务报告，不修改其他文件。",
+      files: ["runner-test.txt"], inputs: ["source 是空的临时目录；目标文本为 runner-ok。"],
+      outputs: ["runner-test.txt"], dependencies: [],
+      implementation_notes: "用文件工具将 runner-ok 写为 UTF-8 文本，回读检查后按任务信封路径提交执行报告和 v3 outbox。",
+      steps: [{ action: "创建 runner-test.txt，写入 runner-ok。", expected_result: "文件存在，内容为 runner-ok。" },
+        { action: "回读文件并提交本派发的执行报告和结果信封。", expected_result: "报告包含回读结果，outbox 使用收到的 project_id、dispatch_id 和 task_id。" }],
+      edge_cases: ["如果文件已存在，只在内容已经是 runner-ok 时复用；其他内容先 ASK_GPT。"],
+      verification: [{ action: "读取 runner-test.txt 并去除首尾空白。", expected_result: "内容恰好等于 runner-ok。" }],
+      acceptance_check: "runner-test.txt 内容为 runner-ok，且提交与当前 dispatch_id 匹配的 TASK_DONE 结果。",
+      failure_handling: "写入或回读失败时记录具体错误，提交 ASK_GPT，不伪造成功。", open_decisions: [],
+    },
     completed_tasks: [],
     failed_tasks: [],
     gpt_message: null,
     attempt: 1,
   };
   const t0 = Date.now();
+  try {
   const result = await runner.run("selftest", dirs, envelope, null);
   const artifact = path.join(dirs.sourceDir, "runner-test.txt");
   const fileOk = fs.existsSync(artifact) && fs.readFileSync(artifact, "utf8").includes("runner-ok");
   const outbox = (() => { try { return JSON.parse(fs.readFileSync(path.join(dirs.workspaceDir, "outbox", "message.json"), "utf8")); } catch { return null; } })();
 
-  console.log(`真实 headless 执行: exitCode=${result.exitCode} 耗时=${Math.round((Date.now() - t0) / 1000)}s`);
+  console.log(`真实 ${visible ? "会话池" : "headless"} 执行: exitCode=${result.exitCode} 耗时=${Math.round((Date.now() - t0) / 1000)}s`);
   console.log(`文件产出: ${fileOk ? "PASS" : "FAIL"}（${artifact}）`);
   console.log(`outbox 信封: ${outbox ? `PASS（type=${outbox.type}）` : "FAIL（执行者未写 outbox）"}`);
-  const ok = result.exitCode === 0 && fileOk && !!outbox;
+  const ok = result.exitCode === 0 && !result.timedOut && fileOk && outbox?.type === "TASK_DONE"
+    && outbox.dispatch_id === envelope.dispatch_id && outbox.project_id === "selftest" && outbox.task_id === "TASK-TEST"
+    && (!visible || !!result.sessionId);
   console.log(`\nDeepSeek Runner 自测: ${ok ? "ALL PASS" : "FAIL"}`);
-  // 清理
-  try { fs.rmSync(tmp, { recursive: true, force: true }); } catch { /* ignore */ }
   return ok;
+  } finally {
+    await runner.shutdownAll();
+    await fs.promises.rm(tmp, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  }
 }
 
 import { fileURLToPath } from "node:url";
 if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
-  const ok = await selftest();
+  const ok = await selftest({ visible: process.argv.includes("--visible") || process.argv.includes("--open-window"), openWindow: process.argv.includes("--open-window") });
   process.exit(ok ? 0 : 1);
 }

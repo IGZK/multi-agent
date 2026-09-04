@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
-import { spawn, execFile } from "node:child_process";
+import { spawn } from "node:child_process";
+import { terminateProcessTree } from "./process_runtime.mjs";
 
 export class CliRunner {
   constructor(config = {}, logger) {
@@ -18,6 +19,7 @@ export class CliRunner {
   }
 
   async run(projectId, dirs, envelope) {
+    if (this.running.has(projectId)) throw new Error("该项目已有命令行任务正在执行");
     const command = String(this.cfg.command || "").trim();
     if (!command) throw Object.assign(new Error("通用命令行执行器尚未配置 command"), { code: "CLI_NOT_CONFIGURED" });
     const inbox = path.join(dirs.workspaceDir, "inbox", "task.json");
@@ -30,16 +32,20 @@ export class CliRunner {
     const logFile = path.join(dirs.workspaceDir, "logs", `executor-cli-${Date.now()}.log`);
     fs.mkdirSync(path.dirname(logFile), { recursive: true });
     const fd = fs.openSync(logFile, "a");
+    const item = { child: null, startedAt, cancelled: false, timedOut: false, stopping: null };
+    try {
     const child = spawn(command, {
       cwd: dirs.sourceDir,
       shell: true,
       windowsHide: true,
+      detached: process.platform !== "win32",
       stdio: ["ignore", fd, fd],
       env: { ...process.env, WORKBENCH_TASK_FILE: inbox, WORKBENCH_DISPATCH_ID: envelope.dispatch_id },
     });
-    this.running.set(projectId, { child, startedAt });
+    item.child = child;
+    this.running.set(projectId, item);
     const timeoutMs = envelope.timeoutMs || this.cfg.timeoutMs || 2700000;
-    const result = await new Promise((resolve) => {
+    const result = await new Promise((resolve, reject) => {
       let settled = false;
       let timer;
       const finish = (value) => {
@@ -52,25 +58,43 @@ export class CliRunner {
       child.once("error", (error) => finish({ exitCode: -1, error: error.message }));
       child.once("exit", (code) => finish({ exitCode: code }));
       timer = setTimeout(() => {
-        execFile("taskkill", ["/PID", String(child.pid), "/T", "/F"], { windowsHide: true }, () => {});
-        finish({ exitCode: null, timedOut: true });
+        item.timedOut = true;
+        item.stopping ||= terminateProcessTree(child);
+        item.stopping.then((stopped) => {
+          if (!stopped) reject(Object.assign(new Error("无法确认命令行执行进程已停止，禁止回滚或删除工作区"), { code: "RUNNER_STOP_FAILED" }));
+          else finish({ exitCode: null });
+        });
       }, timeoutMs);
     });
-    this.running.delete(projectId);
-    try { fs.closeSync(fd); } catch { /* ignore */ }
-    return { ...result, timedOut: !!result.timedOut, ms: Date.now() - startedAt, logFile, cli: true };
+    if (item.stopping && !(await item.stopping)) throw Object.assign(new Error("无法确认命令行执行进程已停止"), { code: "RUNNER_STOP_FAILED" });
+    return { ...result, timedOut: item.timedOut, cancelled: item.cancelled, ms: Date.now() - startedAt, logFile, cli: true };
+    } catch (error) {
+      if (error.code === "RUNNER_STOP_FAILED") { item.stopFailed = true; item.stopping = null; }
+      throw error;
+    } finally {
+      if (!item.stopFailed && this.running.get(projectId) === item) this.running.delete(projectId);
+      fs.closeSync(fd);
+    }
   }
 
   resume() { return null; }
   isRunning(projectId) { return this.running.has(projectId); }
   kill(projectId) {
     const item = this.running.get(projectId);
-    if (!item?.child?.pid) return false;
-    execFile("taskkill", ["/PID", String(item.child.pid), "/T", "/F"], { windowsHide: true }, () => {});
-    this.running.delete(projectId);
-    return true;
+    if (!item) return false;
+    item.cancelled = true;
+    item.stopping ||= terminateProcessTree(item.child);
+    return item.stopping.then((stopped) => {
+      if (!stopped) {
+        item.stopFailed = true;
+        item.stopping = null;
+        throw Object.assign(new Error("无法确认命令行执行进程已停止，禁止回滚或删除工作区"), { code: "RUNNER_STOP_FAILED" });
+      }
+      if (item.stopFailed && this.running.get(projectId) === item) this.running.delete(projectId);
+      return true;
+    });
   }
   status() { return { mode: "cli", active: [...this.running.entries()].map(([projectId, item]) => ({ projectId, pid: item.child?.pid || null, runningMs: Date.now() - item.startedAt, executor: "cli" })), health: this.health() }; }
-  detachAll() { this.shutdownAll(); }
-  shutdownAll() { for (const id of [...this.running.keys()]) this.kill(id); }
+  detachAll() { return this.shutdownAll(); }
+  shutdownAll() { return Promise.all([...this.running.keys()].map((id) => this.kill(id))); }
 }

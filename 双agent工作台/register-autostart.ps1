@@ -2,7 +2,7 @@
 # Usage:  powershell -ExecutionPolicy Bypass -File register-autostart.ps1
 # Remove: Unregister-ScheduledTask -TaskName "DualAgentWorkbench" -Confirm:$false
 $root = $PSScriptRoot
-$nodePath = (Get-Command node -CommandType Application -ErrorAction Stop).Source
+$nodePath = (Get-Command node -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
 $action = New-ScheduledTaskAction -Execute $nodePath -Argument "`"$root\controller\index.mjs`"" -WorkingDirectory $root
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
 $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Days 3) -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -MultipleInstances IgnoreNew

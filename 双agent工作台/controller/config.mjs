@@ -20,6 +20,12 @@ function merge(base, override) {
   return result;
 }
 
+function positiveInteger(value, key, max = 2147483647) {
+  const number = Number(value);
+  if (!Number.isInteger(number) || number < 1 || number > max) throw new Error(`${key} 必须是 1–${max} 的整数`);
+  return number;
+}
+
 export function parseArgs(argv) {
   const out = {};
   for (const arg of argv) {
@@ -42,12 +48,22 @@ export function loadConfig(opts = {}, rootDir = ROOT_DIR, env = process.env) {
   if (fs.existsSync(localPath)) config = merge(config, readJson(localPath));
   const extraPath = opts.config || env.WORKBENCH_CONFIG;
   if (extraPath) config = merge(config, readJson(path.resolve(rootDir, extraPath)));
+  for (const key of ["dashboard", "gpt", "deepseek", "orchestrator", "executors"]) {
+    if (!config[key] || typeof config[key] !== "object" || Array.isArray(config[key])) throw new Error(`${key} 配置必须是 JSON 对象`);
+  }
+  if (!config.executors.cli || typeof config.executors.cli !== "object" || Array.isArray(config.executors.cli)) throw new Error("executors.cli 配置必须是 JSON 对象");
   if (opts.gpt) config.gpt.mode = opts.gpt;
   if (opts.executor) config.deepseek.mode = opts.executor;
-  config.dashboard.port = Number(opts.port ?? env.WORKBENCH_PORT ?? config.dashboard.port);
-  if (!Number.isInteger(config.dashboard.port) || config.dashboard.port < 1 || config.dashboard.port > 65535) {
-    throw new Error("dashboard.port 必须是 1–65535 的整数");
+  config.dashboard.port = positiveInteger(opts.port ?? env.WORKBENCH_PORT ?? config.dashboard.port, "dashboard.port", 65535);
+  config.gpt.debugPort = positiveInteger(config.gpt.debugPort, "gpt.debugPort", 65535);
+  if (config.gpt.mode === "real" && config.gpt.debugPort === config.dashboard.port) throw new Error("gpt.debugPort 不能与 dashboard.port 相同");
+  for (const [section, values] of Object.entries(config)) {
+    if (!values || typeof values !== "object" || Array.isArray(values)) continue;
+    for (const [key, value] of Object.entries(values)) {
+      if (key.endsWith("Ms")) values[key] = positiveInteger(value, `${section}.${key}`);
+    }
   }
+  config.executors.cli.timeoutMs = positiveInteger(config.executors.cli.timeoutMs, "executors.cli.timeoutMs");
   for (const [key, mode] of [["gpt", config.gpt.mode], ["deepseek", config.deepseek.mode]]) {
     if (!["real", "mock"].includes(mode)) throw new Error(`${key}.mode 必须是 real 或 mock`);
   }

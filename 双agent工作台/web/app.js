@@ -13,6 +13,15 @@ let lastChatCount = 0;
 let windowVisible = null;
 let refreshPromise = null;
 let detailGeneration = 0;
+let viewGeneration = 0;
+let lastProjectsSig = null;
+let creatingProject = false;
+let choosingFolder = false;
+const composerDrafts = new Map();
+const pendingSends = new Set();
+const pendingActions = new Set();
+const pendingModelSaves = new Map();
+let modelSavePromise = Promise.resolve();
 
 const STATE_META = {
   INIT: ["初始化", "info"], WAITING_FOR_LOGIN: ["等待登录", "wait"], GPT_PLANNING: ["GPT 规划中", "run"],
@@ -36,6 +45,13 @@ async function api(url, options) {
 
 function escapeHtml(value) {
   return String(value ?? "").replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[char]);
+}
+
+function externalUrl(value) {
+  try {
+    const url = new URL(value);
+    return ["http:", "https:"].includes(url.protocol) ? url.href : "";
+  } catch { return ""; }
 }
 
 function fmtTokens(value) {
@@ -129,13 +145,14 @@ function selectedModelPayload() {
   return { ...selected, reasoningEffort: $("#dsReasoning").value };
 }
 
-async function refresh(force = false) {
-  if (refreshPromise && !force) return refreshPromise;
+async function refresh() {
+  if (refreshPromise) return refreshPromise;
   const running = (async () => {
     try {
       const data = await api("/api/projects");
       projectsCache = data.projects || [];
       systemCache = data.system || null;
+      if (currentProjectId && !projectsCache.some((project) => project.id === currentProjectId)) showEmptyView();
       renderProjectList();
       renderSystem(data.system);
       if (currentProjectId) await refreshDetail();
@@ -162,7 +179,16 @@ function renderSystem(system) {
 }
 
 function renderProjectList() {
+  const signature = JSON.stringify({ projects: projectsCache, currentProjectId, showArchived });
+  if (signature === lastProjectsSig) return;
+  lastProjectsSig = signature;
   const list = $("#projList");
+  const openProject = list.querySelector(".row-menu[open]")?.closest(".project-row")?.dataset.id;
+  const focused = list.contains(document.activeElement) ? {
+    projectId: document.activeElement.closest(".project-row")?.dataset.id,
+    action: document.activeElement.dataset.act,
+    summary: document.activeElement.tagName === "SUMMARY",
+  } : null;
   list.innerHTML = "";
   const active = projectsCache.filter((project) => !project.archived);
   const archived = projectsCache.filter((project) => project.archived);
@@ -173,6 +199,7 @@ function renderProjectList() {
 
   const addProject = (project) => {
     const row = document.createElement("li");
+    row.dataset.id = project.id;
     row.className = `project-row${project.id === currentProjectId ? " active" : ""}${project.archived ? " archived" : ""}`;
     const [state, style] = stateMeta(project.state);
     row.innerHTML = `
@@ -183,6 +210,7 @@ function renderProjectList() {
       <details class="row-menu"><summary class="icon-button" title="项目操作" aria-label="${escapeHtml(project.name || project.id)} 的项目操作">${icon("ellipsis")}</summary>
         <div class="row-menu-panel"><button data-act="rename" type="button">${icon("square-pen")}重命名</button><button data-act="archive" type="button">${icon("archive")}${project.archived ? "取消归档" : "归档"}</button><button data-act="delete" class="danger" type="button">${icon("trash-2")}删除</button></div>
       </details>`;
+    if (project.id === openProject) row.querySelector("details").open = true;
     row.querySelector(".project-select").onclick = () => selectProject(project.id);
     row.querySelectorAll("[data-act]").forEach((button) => {
       button.onclick = (event) => { event.stopPropagation(); projectAction(project, button.dataset.act); };
@@ -194,28 +222,71 @@ function renderProjectList() {
   if (archived.length) {
     const toggle = document.createElement("li");
     toggle.className = "archived-toggle";
-    toggle.textContent = `${showArchived ? "隐藏" : "显示"}已归档（${archived.length}）`;
-    toggle.onclick = () => { showArchived = !showArchived; renderProjectList(); };
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = `${showArchived ? "隐藏" : "显示"}已归档（${archived.length}）`;
+    button.setAttribute("aria-expanded", String(showArchived));
+    button.onclick = () => { showArchived = !showArchived; renderProjectList(); list.querySelector(".archived-toggle button")?.focus(); };
+    toggle.appendChild(button);
     list.appendChild(toggle);
     if (showArchived) archived.forEach(addProject);
+  }
+  if (focused?.projectId) {
+    const row = [...list.querySelectorAll(".project-row")].find((item) => item.dataset.id === focused.projectId);
+    const target = focused.action ? row?.querySelector(`[data-act="${focused.action}"]`) : row?.querySelector(focused.summary ? "summary" : ".project-select");
+    target?.focus({ preventScroll: true });
   }
 }
 
 async function projectAction(project, actionName) {
-  if (actionName === "rename") {
-    const name = prompt("重命名项目：", project.name || project.id);
-    if (name?.trim()) await actionWith("rename", { name: name.trim() }, project.id);
-  } else if (actionName === "archive") {
-    await actionWith("archive", { archived: !project.archived }, project.id);
-  } else if (actionName === "delete") {
-    if (!confirm(`确认删除项目「${project.name}」？\n该操作不可恢复。`)) return;
-    await actionWith("delete", {}, project.id);
-    if (currentProjectId === project.id) showEmptyView();
+  const key = `${project.id}/${actionName}`;
+  if (pendingActions.has(key)) return;
+  pendingActions.add(key);
+  try {
+    if (actionName === "rename") {
+      const name = prompt("重命名项目：", project.name || project.id);
+      if (name?.trim()) await actionWith("rename", { name: name.trim() }, project.id);
+    } else if (actionName === "archive") {
+      await actionWith("archive", { archived: !project.archived }, project.id);
+    } else if (actionName === "delete") {
+      if (!confirm(`确认删除项目「${project.name}」？\n该操作不可恢复。`)) return;
+      await actionWith("delete", {}, project.id);
+      const draft = composerDrafts.get(project.id);
+      for (const attachment of draft?.attachments || []) if (attachment.preview) URL.revokeObjectURL(attachment.preview);
+      composerDrafts.delete(project.id);
+      if (currentProjectId === project.id) showEmptyView();
+    }
+    closeMenus();
+  } catch (error) { alert(`操作失败：${error.message}`); }
+  finally { pendingActions.delete(key); }
+}
+
+function setProjectContext(projectId) {
+  if (currentProjectId) {
+    const draft = composerDrafts.get(currentProjectId);
+    if (draft) draft.text = composerInput.value;
   }
+  currentProjectId = projectId;
+  viewGeneration++;
+  detailGeneration++;
+  let draft = composerDrafts.get(projectId);
+  if (projectId && !draft) {
+    draft = { text: "", attachments: [] };
+    composerDrafts.set(projectId, draft);
+  }
+  composerInput.value = draft?.text || "";
+  composerAttachments = draft?.attachments || [];
+  composerSend.disabled = pendingSends.has(projectId);
+  for (const selector of ["#composerSaveStatus", "#composerMessageStatus"]) {
+    $(selector).textContent = "";
+    $(selector).classList.remove("show");
+  }
+  renderAttachments();
+  renderProjectList();
 }
 
 function showEmptyView() {
-  currentProjectId = null;
+  setProjectContext(null);
   $("#detail").classList.add("hidden");
   $("#createView").classList.add("hidden");
   $("#emptyHint").classList.remove("hidden");
@@ -227,19 +298,24 @@ async function actionWith(actionName, payload = {}, projectId = currentProjectId
   const result = await api(`/api/projects/${encodeURIComponent(projectId)}/action`, {
     method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: actionName, ...payload }),
   });
+  // A polling request started before the mutation may still contain the old state.
+  if (refreshPromise) await refreshPromise;
   await refresh();
   return result;
 }
 
 function selectProject(projectId) {
-  currentProjectId = projectId;
-  detailGeneration++;
+  setProjectContext(projectId);
   lastChatSig = null; lastChatCount = 0; lastTasksSig = null;
   $("#emptyHint").classList.add("hidden");
   $("#createView").classList.add("hidden");
   $("#detail").classList.remove("hidden");
   $("#currentProjBox").classList.remove("hidden");
-  refreshDetail();
+  $("#detail").inert = true;
+  $("#btnSetDir").disabled = true;
+  $("#dName").textContent = "正在加载项目…";
+  $("#curpName").textContent = "正在加载…";
+  return refreshDetail();
 }
 
 async function refreshDetail() {
@@ -249,6 +325,9 @@ async function refreshDetail() {
   try {
     const detail = await api(`/api/projects/${encodeURIComponent(requestedId)}`);
     if (requestedId !== currentProjectId || generation !== detailGeneration) return;
+    $("#detail").inert = false;
+    $("#btnSetDir").disabled = choosingFolder;
+    autoGrow(composerInput);
     $("#dName").textContent = detail.name || detail.id;
     $("#dName").title = detail.id;
     $("#curpName").textContent = detail.name || detail.id;
@@ -262,7 +341,7 @@ async function refreshDetail() {
     $("#composerDirLabel").title = detail.source_dir_error || sourceDir || "默认工作目录";
 
     const selection = detail.deepseek_selection;
-    if (document.activeElement !== $("#cModel") && document.activeElement !== $("#cReasoning")) {
+    if (!pendingModelSaves.has(requestedId) && document.activeElement !== $("#cModel") && document.activeElement !== $("#cReasoning")) {
       setModelValue($("#cModel"), selection?.model ? modelValue(selection.provider || "deepseek-official", selection.model) : "");
       $("#cReasoning").value = selection?.reasoningEffort || "";
     }
@@ -270,13 +349,16 @@ async function refreshDetail() {
     const pendingVisible = detail.pending?.text && detail.state !== "COMPLETED";
     const pendingTime = detail.pending_elapsed_s == null ? "" : `已等待 ${fmtDuration(detail.pending_elapsed_s)}`;
     callout($("#dPending"), pendingVisible, detail.pending?.text || "", pendingTime);
+    const queuedMessages = Number(detail.queued_messages || 0);
+    callout($("#dQueued"), queuedMessages > 0, `${queuedMessages} 条消息等待发送`, detail.state === "PAUSED" ? "继续项目后发送" : "将在当前步骤完成后发送");
 
     const executorUi = detail.executor_ui;
+    const executorUrl = externalUrl(executorUi?.url);
     const isRunning = ["WAITING_FOR_EXECUTOR", "EXECUTING", "ANALYZING", "DECISION_REQUIRED"].includes(detail.state);
     callout(
-      $("#dExecUi"), !!executorUi?.url,
+      $("#dExecUi"), !!executorUrl,
       `DeepSeek 执行窗口${isRunning ? "正在运行" : "可供回顾"}`,
-      executorUi?.url ? `<a href="${escapeHtml(executorUi.url)}" target="_blank" rel="noopener">打开执行窗口</a>${executorUi.sessions?.length ? ` · ${executorUi.sessions.length} 个会话` : ""}` : "",
+      executorUrl ? `<a href="${escapeHtml(executorUrl)}" target="_blank" rel="noopener">打开执行窗口</a>${executorUi.sessions?.length ? ` · ${executorUi.sessions.length} 个会话` : ""}` : "",
     );
 
     const live = detail.gpt_live;
@@ -335,8 +417,9 @@ function renderOverview(detail) {
   $("#oTokens").textContent = fmtTokens(tokenTotal(totals) + Number(gptUsage.estimatedInputTokens || 0) + Number(gptUsage.estimatedOutputTokens || 0));
   $("#oTask").textContent = detail.user_task || "";
 
-  const gptLink = detail.gpt?.conversation_url
-    ? `<a href="${escapeHtml(detail.gpt.conversation_url)}" target="_blank" rel="noopener">打开会话</a>` : "未创建";
+  const gptUrl = externalUrl(detail.gpt?.conversation_url);
+  const gptLink = gptUrl
+    ? `<a href="${escapeHtml(gptUrl)}" target="_blank" rel="noopener">打开会话</a>` : "未创建";
   $("#oProjectMeta").innerHTML = `
     <dt>状态</dt><dd>${escapeHtml(detail.state || "—")}</dd>
     <dt>更新时间</dt><dd>${escapeHtml(fmtTime(detail.updated_at))}</dd>
@@ -364,7 +447,7 @@ function renderOverview(detail) {
 function renderTasks(detail) {
   const signature = JSON.stringify({
     tasks: detail.tasks, completed: detail.completed_tasks, failed: detail.failed_tasks,
-    current: detail.current_task?.id, metrics: detail.usage?.deepseek?.tasks, validation: detail.validation_results,
+    current: detail.current_task?.id, state: detail.state, metrics: detail.usage?.deepseek?.tasks, validation: detail.validation_results,
   });
   if (signature === lastTasksSig) return;
   lastTasksSig = signature;
@@ -375,14 +458,16 @@ function renderTasks(detail) {
   const metrics = detail.usage?.deepseek?.tasks || [];
   for (const task of detail.tasks || []) {
     const taskMetrics = metrics.filter((item) => item.task_id === task.id);
-    const last = taskMetrics.at(-1);
     const duration = taskMetrics.reduce((total, item) => total + Number(item.duration_ms || 0), 0);
     const tokens = taskMetrics.reduce((total, item) => total + Number(tokenTotal(item.tokens)), 0);
     const validation = detail.validation_results?.[task.id];
     let status = "待办", style = "pending";
     if (completed.has(task.id)) { status = "完成"; style = "completed"; }
     else if (failed.has(task.id)) { status = "失败"; style = "failed"; }
-    else if (detail.current_task?.id === task.id) { status = "执行中"; style = "running"; }
+    else if (detail.current_task?.id === task.id) {
+      status = detail.state === "PAUSED" ? "已暂停" : ["ERROR", "CANCELED", "COMPLETED"].includes(detail.state) ? "已停止" : "执行中";
+      style = status === "执行中" ? "running" : "pending";
+    }
     const execution = taskMetrics.length ? `${fmtDuration(duration / 1000)} · ${taskMetrics.length} 次` : "—";
     const validationSpec = task.validation_command || task.acceptance_check || task.validation;
     const validationText = !validationSpec ? "未配置" : !validation ? "待验证" : validation.skipped ? "自然语言标准（最终审查）" : validation.ok ? "通过" : `失败：${validation.output || validation.error || "命令未通过"}`;
@@ -393,7 +478,7 @@ function renderTasks(detail) {
 }
 
 function renderChat(messages) {
-  const signature = messages.length + ":" + messages.map((message) => `${message.dir}|${message.type || ""}|${message.length || message.text?.length || 0}|${message.ts || ""}`).join("~");
+  const signature = JSON.stringify(messages);
   if (signature === lastChatSig) return;
   const scroller = $("#convoView");
   const nearBottom = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 140;
@@ -418,7 +503,7 @@ function renderChat(messages) {
 }
 
 function showCreateView() {
-  currentProjectId = null;
+  setProjectContext(null);
   $("#emptyHint").classList.add("hidden");
   $("#detail").classList.add("hidden");
   $("#createView").classList.remove("hidden");
@@ -447,56 +532,70 @@ async function chooseProjectFolder() {
 }
 
 async function createProject() {
+  if (creatingProject) return;
   const task = $("#projTask").value.trim();
   if (!task) { alert("请先描述你想完成的工作"); $("#projTask").focus(); return; }
   if (createAttachments.some((item) => item.status === "failed")) return alert("有附件无法使用，请先移除后再创建项目。");
   const button = $("#btnCreate");
   const original = button.innerHTML;
+  const generation = viewGeneration;
+  const submittedText = projectInput.value;
+  const submittedAttachments = [...createAttachments];
   try {
+    creatingProject = true;
     button.disabled = true; button.textContent = "创建中…";
     const payload = { task };
     const sourceDir = $("#projDir").value.trim();
     if (sourceDir) payload.source_dir = sourceDir;
     const selection = selectedModelPayload();
     if (selection) payload.deepseek_selection = selection;
-    if (createAttachments.length) {
-      payload.attachments = await Promise.all(createAttachments.map(async (item) => ({
+    if (submittedAttachments.length) {
+      payload.attachments = await Promise.all(submittedAttachments.map(async (item) => ({
         name: item.name,
         mime: item.type,
         data: await fileAsDataUrl(item.file),
       })));
     }
     const result = await api("/api/projects", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
-    $("#projTask").value = "";
-    $("#projDir").value = "";
-    $("#projDirLabel").textContent = "默认工作目录";
-    $("#projDirLabel").removeAttribute("title");
+    if (projectInput.value === submittedText) projectInput.value = "";
+    if ($("#projDir").value.trim() === sourceDir) {
+      $("#projDir").value = "";
+      $("#projDirLabel").textContent = "默认工作目录";
+      $("#projDirLabel").removeAttribute("title");
+    }
     autoGrow($("#projTask"));
-    clearCreateAttachments();
-    currentProjectId = result.id;
-    $("#createView").classList.add("hidden");
-    $("#detail").classList.remove("hidden");
+    for (const attachment of submittedAttachments) removeCreateAttachment(attachment.id);
+    if (viewGeneration === generation) await selectProject(result.id);
+    if (refreshPromise) await refreshPromise;
     await refresh();
   } catch (error) { alert(`创建失败：${error.message}`); }
-  finally { button.disabled = false; button.innerHTML = original; }
+  finally { creatingProject = false; button.disabled = false; button.innerHTML = original; }
 }
 
 async function action(actionName) {
+  const projectId = currentProjectId;
+  const key = `${projectId}/${actionName}`;
+  if (!projectId || pendingActions.has(key)) return;
+  pendingActions.add(key);
   try { await actionWith(actionName); closeMenus(); }
   catch (error) { alert(`操作失败：${error.message}`); }
+  finally { pendingActions.delete(key); }
 }
 
 async function setCurrentFolder() {
-  if (!currentProjectId) return;
+  if (!currentProjectId || choosingFolder) return;
+  const projectId = currentProjectId;
   const button = $("#btnSetDir");
+  const composerButton = $("#btnComposerDir");
   const original = button.innerHTML;
   const currentPath = $("#dirHint")?.dataset.path || "";
   try {
-    button.disabled = true; button.setAttribute("aria-busy", "true");
+    choosingFolder = true;
+    button.disabled = true; composerButton.disabled = true; button.setAttribute("aria-busy", "true");
     const result = await pickFolder(currentPath);
-    if (result?.path) await actionWith("setdir", { dir: result.path });
+    if (result?.path) await actionWith("setdir", { dir: result.path }, projectId);
   } catch (error) { alert(`修改失败：${error.message}`); }
-  finally { button.disabled = false; button.removeAttribute("aria-busy"); button.innerHTML = original; }
+  finally { choosingFolder = false; button.disabled = false; composerButton.disabled = false; button.removeAttribute("aria-busy"); button.innerHTML = original; }
 }
 
 async function toggleGptWindow() {
@@ -515,19 +614,21 @@ async function openExecutorWindow() {
   try {
     button.disabled = true;
     const result = await actionWith("executor_window");
-    if (result?.url && !result.opened) window.open(result.url, "_blank", "noopener");
+    if (externalUrl(result?.url) && !result.opened) window.open(externalUrl(result.url), "_blank", "noopener");
     if (!result?.url) alert("当前没有可用的执行窗口。");
   } catch (error) { alert(`打开执行窗口失败：${error.message}`); }
   finally { button.disabled = false; }
 }
 
 async function exportAudit() {
+  const projectId = currentProjectId;
+  if (!projectId) return;
   try {
-    const result = await actionWith("export_audit");
+    const result = await actionWith("export_audit", {}, projectId);
     const blob = new Blob([result.content || ""], { type: "text/markdown;charset=utf-8" });
     const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
-    link.href = url; link.download = `${currentProjectId || "project"}-audit.md`; link.click();
+    link.href = url; link.download = `${projectId}-audit.md`; link.click();
     URL.revokeObjectURL(url);
     closeMenus();
   } catch (error) { alert(`导出失败：${error.message}`); }
@@ -541,15 +642,26 @@ async function selectExecutor() {
 let saveStatusTimer = null;
 async function saveComposerModelSelection() {
   if (!currentProjectId) return;
+  const projectId = currentProjectId;
   const selected = splitModelValue($("#cModel").value);
   const effort = $("#cReasoning").value;
+  const selection = selected ? { ...selected, reasoningEffort: effort } : { provider: "", model: "", reasoningEffort: "" };
+  pendingModelSaves.set(projectId, (pendingModelSaves.get(projectId) || 0) + 1);
+  const saving = modelSavePromise.catch(() => {}).then(() => actionWith("deepseek_model", { selection }, projectId));
+  modelSavePromise = saving;
   try {
-    await actionWith("deepseek_model", { selection: selected ? { ...selected, reasoningEffort: effort } : { provider: "", model: "", reasoningEffort: "" } });
+    await saving;
+    if (currentProjectId !== projectId) return;
     const status = $("#composerSaveStatus");
     status.textContent = "模型设置已保存"; status.classList.add("show");
     clearTimeout(saveStatusTimer);
     saveStatusTimer = setTimeout(() => { status.classList.remove("show"); status.textContent = ""; }, 2400);
   } catch (error) { alert(`保存失败：${error.message}`); }
+  finally {
+    const count = pendingModelSaves.get(projectId) - 1;
+    if (count) pendingModelSaves.set(projectId, count);
+    else pendingModelSaves.delete(projectId);
+  }
 }
 
 $("#btnNewProject").onclick = showCreateView;
@@ -587,31 +699,47 @@ function autoGrow(element) {
 }
 
 async function sendComposer() {
-  if (!currentProjectId) return;
+  if (!currentProjectId || pendingSends.has(currentProjectId)) return;
+  const projectId = currentProjectId;
+  const draft = composerDrafts.get(projectId);
+  const submittedText = composerInput.value;
+  const submittedAttachments = [...composerAttachments];
   const text = composerInput.value.trim();
   if (!text && !composerAttachments.length) return;
   if (composerAttachments.some((item) => item.status === "uploading")) return alert("附件仍在上传，请稍候再发送。");
   if (composerAttachments.some((item) => item.status === "failed")) return alert("有附件上传失败，请重试或移除。");
   try {
+    pendingSends.add(projectId);
     composerSend.disabled = true;
-    await api(`/api/projects/${encodeURIComponent(currentProjectId)}/message`, {
+    const result = await api(`/api/projects/${encodeURIComponent(projectId)}/message`, {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text, attachment_ids: composerAttachments.map((item) => item.serverId).filter(Boolean) }),
+      body: JSON.stringify({ text, attachment_ids: submittedAttachments.map((item) => item.serverId).filter(Boolean) }),
     });
-    composerInput.value = ""; autoGrow(composerInput); clearAttachments(); await refreshDetail();
+    if (currentProjectId === projectId) draft.text = composerInput.value;
+    if (draft.text === submittedText) draft.text = "";
+    for (const attachment of submittedAttachments) removeDraftAttachment(draft.attachments, attachment.id);
+    if (currentProjectId === projectId) {
+      composerInput.value = draft.text;
+      autoGrow(composerInput); renderAttachments(); await refreshDetail();
+      if (currentProjectId === projectId) {
+        const status = $("#composerMessageStatus");
+        status.textContent = result.paused ? "已保存，继续项目后发送" : result.queued ? "已加入消息队列，会在当前步骤完成后发送" : "消息已发送";
+        status.classList.add("show");
+      }
+    }
   } catch (error) { alert(`发送失败：${error.message}`); }
-  finally { composerSend.disabled = false; }
+  finally { pendingSends.delete(projectId); composerSend.disabled = pendingSends.has(currentProjectId); }
 }
 
 composerInput.addEventListener("input", () => autoGrow(composerInput));
 composerInput.addEventListener("keydown", (event) => {
-  if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); sendComposer(); }
+  if (event.key === "Enter" && !event.shiftKey && !event.isComposing && event.keyCode !== 229) { event.preventDefault(); sendComposer(); }
 });
 for (const eventName of ["dragover", "drop"]) composerInput.addEventListener(eventName, (event) => event.preventDefault());
 composerSend.onclick = sendComposer;
 projectInput.addEventListener("input", () => autoGrow(projectInput));
 projectInput.addEventListener("keydown", (event) => {
-  if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); createProject(); }
+  if (event.key === "Enter" && !event.shiftKey && !event.isComposing && event.keyCode !== 229) { event.preventDefault(); createProject(); }
 });
 
 function fmtSize(bytes) {
@@ -632,10 +760,18 @@ function fileAsDataUrl(file) {
 async function uploadAttachment(id) {
   const attachment = composerAttachments.find((item) => item.id === id);
   if (!attachment?.file || !currentProjectId) return;
+  const projectId = currentProjectId;
+  const attachments = composerAttachments;
+  if (attachment.size > MAX_ATTACH_SIZE) {
+    Object.assign(attachment, { status: "failed", reason: "文件超过 50MB" });
+    renderAttachments();
+    return;
+  }
   attachment.status = "uploading"; attachment.reason = ""; renderAttachments();
   try {
     const data = await fileAsDataUrl(attachment.file);
-    const result = await api(`/api/projects/${encodeURIComponent(currentProjectId)}/attachments`, {
+    if (!attachments.includes(attachment)) return;
+    const result = await api(`/api/projects/${encodeURIComponent(projectId)}/attachments`, {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ name: attachment.name, mime: attachment.type, data }),
     });
@@ -645,6 +781,7 @@ async function uploadAttachment(id) {
 }
 
 function addFiles(fileList) {
+  if (!currentProjectId) return;
   for (const file of Array.from(fileList || [])) {
     const attachment = { id: ++attachSeq, file, name: file.name, size: file.size, type: file.type, status: "uploading" };
     if (file.size > MAX_ATTACH_SIZE) Object.assign(attachment, { status: "failed", reason: "文件超过 50MB" });
@@ -658,20 +795,18 @@ function addFiles(fileList) {
 }
 
 function removeAttachment(id) {
-  const index = composerAttachments.findIndex((item) => item.id === id);
-  if (index < 0) return;
-  if (composerAttachments[index].preview) URL.revokeObjectURL(composerAttachments[index].preview);
-  composerAttachments.splice(index, 1);
+  removeDraftAttachment(composerAttachments, id);
   renderAttachments();
 }
 
-function retryAttachment(id) { uploadAttachment(id); }
-
-function clearAttachments() {
-  for (const attachment of composerAttachments) if (attachment.preview) URL.revokeObjectURL(attachment.preview);
-  composerAttachments = [];
-  $("#attachList").innerHTML = "";
+function removeDraftAttachment(attachments, id) {
+  const index = attachments.findIndex((item) => item.id === id);
+  if (index < 0) return;
+  if (attachments[index].preview) URL.revokeObjectURL(attachments[index].preview);
+  attachments.splice(index, 1);
 }
+
+function retryAttachment(id) { uploadAttachment(id); }
 
 function addCreateFiles(fileList) {
   for (const file of Array.from(fileList || [])) {
@@ -686,41 +821,16 @@ function addCreateFiles(fileList) {
 }
 
 function removeCreateAttachment(id) {
-  const index = createAttachments.findIndex((item) => item.id === id);
-  if (index < 0) return;
-  if (createAttachments[index].preview) URL.revokeObjectURL(createAttachments[index].preview);
-  createAttachments.splice(index, 1);
+  removeDraftAttachment(createAttachments, id);
   renderCreateAttachments();
 }
 
-function clearCreateAttachments() {
-  for (const attachment of createAttachments) if (attachment.preview) URL.revokeObjectURL(attachment.preview);
-  createAttachments = [];
-  $("#createAttachList").innerHTML = "";
-}
+function renderCreateAttachments() { renderAttachmentList($("#createAttachList"), createAttachments, true); }
+function renderAttachments() { renderAttachmentList($("#attachList"), composerAttachments, false); }
 
-function renderCreateAttachments() {
-  const list = $("#createAttachList");
+function renderAttachmentList(list, attachments, forCreate) {
   list.innerHTML = "";
-  for (const attachment of createAttachments) {
-    const card = document.createElement("div");
-    card.className = `attach-card ${attachment.status}`;
-    const preview = attachment.preview
-      ? `<div class="attach-thumb"><img src="${attachment.preview}" alt="${escapeHtml(attachment.name)}" /></div>`
-      : `<div class="attach-icon">${icon(attachment.type?.startsWith("image/") ? "image" : "paperclip")}</div>`;
-    const state = attachment.status === "failed"
-      ? `<span class="attach-state failed">失败：${escapeHtml(attachment.reason || "无法使用")}</span>`
-      : '<span class="attach-state success">创建时上传</span>';
-    card.innerHTML = `${preview}<div class="attach-info"><div class="attach-name" title="${escapeHtml(attachment.name)}">${escapeHtml(attachment.name)}</div><div class="attach-meta">${fmtSize(attachment.size)} · ${state}</div></div><div class="attach-actions"><button class="attach-act" type="button" title="移除" aria-label="移除附件">移除</button></div>`;
-    card.querySelector("button").onclick = () => removeCreateAttachment(attachment.id);
-    list.appendChild(card);
-  }
-}
-
-function renderAttachments() {
-  const list = $("#attachList");
-  list.innerHTML = "";
-  for (const attachment of composerAttachments) {
+  for (const attachment of attachments) {
     const card = document.createElement("div");
     card.className = `attach-card ${attachment.status}`;
     card.dataset.id = attachment.id;
@@ -728,16 +838,17 @@ function renderAttachments() {
       ? `<div class="attach-thumb"><img src="${attachment.preview}" alt="${escapeHtml(attachment.name)}" /></div>`
       : `<div class="attach-icon">${icon(attachment.type?.startsWith("image/") ? "image" : "paperclip")}</div>`;
     const state = attachment.status === "uploading" ? '<span class="attach-state"><span class="spinner"></span>上传中</span>'
+      : attachment.status === "ready" ? '<span class="attach-state success">创建时上传</span>'
       : attachment.status === "success" ? '<span class="attach-state success">已就绪</span>'
       : `<span class="attach-state failed" title="${escapeHtml(attachment.reason || "")}">失败${attachment.reason ? `：${escapeHtml(attachment.reason)}` : ""}</span>`;
-    card.innerHTML = `${preview}<div class="attach-info"><div class="attach-name" title="${escapeHtml(attachment.name)}">${escapeHtml(attachment.name)}</div><div class="attach-meta">${fmtSize(attachment.size)} · ${state}</div></div><div class="attach-actions">${attachment.status === "failed" ? '<button class="attach-act" data-act="retry" type="button" title="重试" aria-label="重试上传">重试</button>' : ""}<button class="attach-act" data-act="remove" type="button" title="移除" aria-label="移除附件">移除</button></div>`;
+    card.innerHTML = `${preview}<div class="attach-info"><div class="attach-name" title="${escapeHtml(attachment.name)}">${escapeHtml(attachment.name)}</div><div class="attach-meta">${fmtSize(attachment.size)} · ${state}</div></div><div class="attach-actions">${!forCreate && attachment.status === "failed" ? '<button class="attach-act" data-act="retry" type="button" title="重试" aria-label="重试上传">重试</button>' : ""}<button class="attach-act" data-act="remove" type="button" title="移除" aria-label="移除附件">移除</button></div>`;
     card.querySelectorAll("[data-act]").forEach((button) => {
-      button.onclick = () => button.dataset.act === "retry" ? retryAttachment(Number(card.dataset.id)) : removeAttachment(Number(card.dataset.id));
+      button.onclick = () => button.dataset.act === "retry" ? retryAttachment(attachment.id)
+        : forCreate ? removeCreateAttachment(attachment.id) : removeAttachment(attachment.id);
     });
     list.appendChild(card);
   }
 }
-
 $("#btnAttach").onclick = () => $("#fileInput").click();
 $("#btnAttachPhoto").onclick = () => $("#photoInput").click();
 $("#btnCreateAttach").onclick = () => $("#createFileInput").click();

@@ -45,3 +45,18 @@ test("environment overrides config and invalid ports/modes fail before startup",
   assert.throws(() => loadConfig({ gpt: "typo" }, root, {}), /mode/);
   assert.throws(() => parseArgs(["--pot=42"]), /未知参数/);
 });
+
+test("invalid section shapes, debug ports and timeout overflow fail before starting processes", (t) => {
+  const root = fixture(t);
+  for (const [override, expected] of [
+    [{ gpt: null }, /gpt.*JSON/],
+    [{ executors: { cli: [] } }, /executors.cli/],
+    [{ gpt: { debugPort: 70000 } }, /gpt.debugPort/],
+    [{ gpt: { debugPort: 3700 } }, /不能与 dashboard.port 相同/],
+    [{ deepseek: { executorTimeoutMs: -1 } }, /executorTimeoutMs/],
+    [{ executors: { cli: { timeoutMs: 2147483648 } } }, /timeoutMs/],
+  ]) {
+    fs.writeFileSync(path.join(root, "config/config.local.json"), JSON.stringify(override));
+    assert.throws(() => loadConfig({}, root, {}), expected);
+  }
+});

@@ -110,7 +110,7 @@ test("结果时间修复至多一次且暂停后不接纳迟到结果", async ()
     await assert.rejects(orch.handleExecutorResult(id, { exitCode: 0 }, envelope), { code: "PROJECT_CANCELLED" });
     assert.equal(f.store.readState(id).completed_tasks.length, 0);
     f.store.writeOutboxAtomic(id, stale);
-    await assert.rejects(orch.handleExecutorResult(id, {}, { ...envelope, result_repair: { original: stale } }), { code: "OUTBOX_STALE" });
+    await assert.rejects(orch.handleExecutorResult(id, {}, { ...envelope, result_repair: { original: stale } }), { code: "PROJECT_CANCELLED" });
   } finally { f.cleanup(); }
 });
 

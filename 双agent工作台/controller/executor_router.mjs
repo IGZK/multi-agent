@@ -19,7 +19,7 @@ export class ExecutorRouter {
   kill(projectId) {
     const deepseek = this.deepseek.kill(projectId);
     const cli = this.cli.kill(projectId);
-    return deepseek || cli;
+    return Promise.all([deepseek, cli]).then((results) => results.some(Boolean));
   }
   status() {
     const deepseek = this.deepseek.status();
@@ -33,6 +33,6 @@ export class ExecutorRouter {
     return this.deepseek.compactSession(projectId, ...args);
   }
   scheduleUiCleanup(projectId, delayMs) { if (this.type(projectId) === "deepseek") this.deepseek.scheduleUiCleanup(projectId, delayMs); }
-  detachAll() { this.deepseek.detachAll(); this.cli.detachAll(); }
-  shutdownAll() { this.deepseek.shutdownAll(); this.cli.shutdownAll(); }
+  detachAll() { return Promise.all([this.deepseek.detachAll(), this.cli.detachAll()]); }
+  shutdownAll() { return Promise.all([this.deepseek.shutdownAll(), this.cli.shutdownAll()]); }
 }

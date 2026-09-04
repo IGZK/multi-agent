@@ -46,7 +46,7 @@ if ($res -eq [System.Windows.Forms.DialogResult]::OK) {
 /** 生成完整 PowerShell 脚本（把起始路径安全地塞进单引号字符串） */
 export function buildScript(startPath = "") {
   const safe = String(startPath || "").replace(/'/g, "''");
-  return PS_SCRIPT.replace("__START_PATH__", safe);
+  return PS_SCRIPT.replace("__START_PATH__", () => safe);
 }
 
 /** 把脚本编码为 powershell.exe -EncodedCommand 所需的 UTF-16LE base64 */
@@ -86,8 +86,8 @@ export function spawnPowerShell(args, opts = {}) {
       try { child.kill(); } catch { /* ignore */ }
       reject(new Error("选择文件夹超时（对话框已关闭）"));
     }, timeoutMs);
-    child.stdout.on("data", (d) => { stdout += d.toString("utf8"); });
-    child.stderr.on("data", (d) => { stderr += d.toString("utf8"); });
+    child.stdout.setEncoding("utf8").on("data", (d) => { stdout += d; });
+    child.stderr.setEncoding("utf8").on("data", (d) => { stderr += d; });
     child.on("error", (e) => {
       if (settled) return;
       settled = true;

@@ -52,7 +52,8 @@ test("失效的外部源码目录阻止检查点创建与回滚，详情仍允�
     assert.equal(view.source_dir, originalSource);
     assert.match(view.source_dir_error, /请重新选择项目文件夹/);
   }
-  await Orchestrator.prototype.setSourceDir.call({ store, log() {} }, id, movedSource);
+  const orchestrator = new Orchestrator({}, null, {}, { kill() {} }, store);
+  await orchestrator.setSourceDir(id, movedSource);
   assert.equal(store.sourceDir(id), movedSource);
   assert.equal(server.projectDetail(id).source_dir_error, null);
   assert.equal(fs.readFileSync(path.join(movedSource, "项目.txt"), "utf8"), "外部源码");

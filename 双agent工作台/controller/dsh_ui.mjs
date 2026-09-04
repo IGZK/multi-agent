@@ -11,15 +11,16 @@ import http from "node:http";
 import net from "node:net";
 import path from "node:path";
 import os from "node:os";
-import { spawn, execFile } from "node:child_process";
+import { spawn } from "node:child_process";
 import { sleep, ROOT_DIR } from "./logger.mjs";
 import { ensureProfileSkill } from "./workbench_skill.mjs";
 import { openBrowserWindow } from "./browser_runtime.mjs";
 import { requireDshBin } from "./executor_runtime.mjs";
+import { terminateProcessTree } from "./process_runtime.mjs";
 export { openBrowserWindow } from "./browser_runtime.mjs";
 
 /** 与 dsh Web GUI 通信的官方 RPC 客户端。 */
-export function rpc(port, method, payload, timeoutMs = 30000) {
+export function rpc(port, method, payload, timeoutMs = 30000, signal) {
   return new Promise((resolve, reject) => {
     const body = JSON.stringify({
       type: "client-request",
@@ -27,6 +28,13 @@ export function rpc(port, method, payload, timeoutMs = 30000) {
       method,
       payload,
     });
+    let timer;
+    const finish = (error, value) => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", abort);
+      if (error) reject(error); else resolve(value);
+    };
+    const abort = () => req.destroy(new Error(`${method} cancelled`));
     const req = http.request({
       host: "127.0.0.1",
       port,
@@ -37,22 +45,27 @@ export function rpc(port, method, payload, timeoutMs = 30000) {
         "Content-Length": Buffer.byteLength(body),
       },
     }, (res) => {
+      res.setEncoding("utf8");
       let data = "";
       res.on("data", (c) => { data += c; });
+      res.on("error", (error) => finish(error));
       res.on("end", () => {
         try {
           const j = JSON.parse(data);
-          if (j && j.type === "server-response" && j.result && j.result.ok === true) {
-            return resolve(j.result.value);
+          if (res.statusCode >= 200 && res.statusCode < 300 && j && j.type === "server-response" && j.result && j.result.ok === true) {
+            return finish(null, j.result.value);
           }
-          reject(new Error(`${method} failed: ${data.slice(0, 300)}`));
+          finish(new Error(`${method} failed (HTTP ${res.statusCode}): ${data.slice(0, 300)}`));
         } catch (e) {
-          reject(new Error(`${method} bad json: ${data.slice(0, 300)}`));
+          finish(new Error(`${method} bad json: ${data.slice(0, 300)}`));
         }
       });
     });
-    req.setTimeout(timeoutMs, () => req.destroy(new Error(`${method} timeout`)));
-    req.on("error", reject);
+    // Socket inactivity timeouts can be kept alive forever by partial responses.
+    timer = setTimeout(() => req.destroy(new Error(`${method} timeout`)), timeoutMs);
+    req.on("error", (error) => finish(error));
+    signal?.addEventListener("abort", abort, { once: true });
+    if (signal?.aborted) { abort(); return; }
     req.end(body);
   });
 }
@@ -74,10 +87,10 @@ export async function waitPort(port, timeoutMs, signal) {
   const t0 = Date.now();
   while (Date.now() - t0 < timeoutMs && !signal?.aborted) {
     try {
-      await rpc(port, "host.describe", {}, 3000);
+      await rpc(port, "host.describe", {}, Math.min(3000, timeoutMs - (Date.now() - t0)), signal);
       return true;
     } catch {
-      await sleep(100);
+      if (!signal?.aborted) await sleep(Math.min(100, Math.max(0, timeoutMs - (Date.now() - t0))));
     }
   }
   return false;
@@ -95,6 +108,7 @@ export class UiExecutor {
     this.logger = logger;
     this.servers = new Map(); // projectId -> {port,url,child,fd,logFile,startedAt,sessions:Map}
     this.serverStarts = new Map(); // projectId -> Promise，防止预热与正式派发重复启服务
+    this.serverStartSignals = new Map();
     this.disposeTimers = new Map(); // projectId -> timeout
     this.catalogPromise = null;
   }
@@ -149,27 +163,35 @@ export class UiExecutor {
    */
   async ensureServer(projectId, logDir) {
     if (this.serverStarts.has(projectId)) return this.serverStarts.get(projectId);
-    const starting = this.ensureServerOnce(projectId, logDir);
+    this.serverStartSignals ||= new Map();
+    const boot = new AbortController();
+    this.serverStartSignals.set(projectId, boot);
+    this.cancelDispose(projectId);
+    const starting = this.ensureServerOnce(projectId, logDir, boot.signal);
     this.serverStarts.set(projectId, starting);
     try {
       return await starting;
     } finally {
       if (this.serverStarts.get(projectId) === starting) this.serverStarts.delete(projectId);
+      if (this.serverStartSignals.get(projectId) === boot) this.serverStartSignals.delete(projectId);
     }
   }
 
-  async ensureServerOnce(projectId, logDir) {
+  async ensureServerOnce(projectId, logDir, signal) {
     const existing = this.servers.get(projectId);
     if (existing) {
       if (await this.isAlive(existing, 1000)) {
+        if (signal?.aborted) return null;
         this.cancelDispose(projectId);
         return existing;
       }
-      this.disposeServer(projectId);
+      await this.disposeServer(projectId, false);
     }
+    if (signal?.aborted) return null;
     const dshBin = requireDshBin(this.cfg);
     const profile = this.ensureProfile();
     const port = await findFreePort();
+    if (signal?.aborted) return null;
     const logFile = path.join(logDir, `executor-ui-${Date.now()}.log`);
     fs.mkdirSync(logDir, { recursive: true });
     const fd = fs.openSync(logFile, "a");
@@ -187,6 +209,7 @@ export class UiExecutor {
         stdio: ["ignore", fd, fd],
         env: { ...process.env, DSH_HOME: this.dshHome(), DSH_BUNDLED_SKILL_DIR: profile.skillRoot },
         windowsHide: true,
+        detached: process.platform !== "win32",
       });
     } catch (e) {
       try { fs.closeSync(fd); } catch { /* ignore */ }
@@ -208,17 +231,17 @@ export class UiExecutor {
 
     const boot = new AbortController();
     const up = await Promise.race([
-      waitPort(port, this.cfg.uiBootTimeoutMs ?? 90000, boot.signal),
+      waitPort(port, this.cfg.uiBootTimeoutMs ?? 90000, signal ? AbortSignal.any([signal, boot.signal]) : boot.signal),
       new Promise((resolve) => {
         child.once("exit", () => resolve(false));
         child.once("error", (error) => { this.log("error", "无法启动执行器: " + error.message); resolve(false); });
       }), // 服务启动即崩溃 → 快速失败
     ]);
     boot.abort();
-    if (!up) {
+    if (!up || signal?.aborted || this.servers.get(projectId) !== server) {
       const bootMs = Date.now() - server.startedAt;
       this.log("error", `可见执行服务 ${port} 启动失败（${Math.round(bootMs / 1000)}s），日志: ${logFile}`);
-      this.disposeServer(projectId);
+      await this.disposeServer(projectId, false);
       return null;
     }
     this.log("info", `可见执行服务就绪: ${server.url}`);
@@ -412,7 +435,7 @@ export class UiExecutor {
       fd = fs.openSync(logFile, "a");
       child = spawn(this.cfg.nodeBin || process.execPath, [
         dshBin, "--profile", this.profileName, "--port", String(port), "--no-open",
-      ], { cwd: os.homedir(), stdio: ["ignore", fd, fd], windowsHide: true,
+      ], { cwd: os.homedir(), stdio: ["ignore", fd, fd], windowsHide: true, detached: process.platform !== "win32",
         env: { ...process.env, DSH_HOME: this.dshHome(), DSH_BUNDLED_SKILL_DIR: profile.skillRoot } });
       const up = await Promise.race([
         waitPort(port, this.cfg.uiBootTimeoutMs ?? 60000, boot.signal),
@@ -433,9 +456,7 @@ export class UiExecutor {
       return FALLBACK;
     } finally {
       boot.abort();
-      if (child && child.exitCode === null) {
-        execFile("taskkill", ["/PID", String(child.pid), "/T", "/F"], { stdio: "ignore", windowsHide: true }, () => {});
-      }
+      if (child) await terminateProcessTree(child);
       if (fd !== undefined) { try { fs.closeSync(fd); } catch { /* ignore */ } }
     }
   }
@@ -484,16 +505,16 @@ export class UiExecutor {
   }
 
   /** 关闭某项目的可见执行服务。 */
-  disposeServer(projectId) {
+  async disposeServer(projectId, cancelStart = true) {
+    if (cancelStart) this.serverStartSignals?.get(projectId)?.abort();
     this.cancelDispose(projectId);
     const s = this.servers.get(projectId);
     if (!s) return;
     this.servers.delete(projectId);
-    try {
-      if (s.child && s.child.exitCode === null) {
-        execFile("taskkill", ["/PID", String(s.child.pid), "/T", "/F"], { stdio: "ignore", windowsHide: true }, () => {});
-      }
-    } catch { /* ignore */ }
+    if (s.child && !(await terminateProcessTree(s.child))) {
+      this.servers.set(projectId, s);
+      throw Object.assign(new Error("无法确认 Harness 服务已停止，禁止回滚或删除工作区"), { code: "RUNNER_STOP_FAILED" });
+    }
     if (s.fd !== undefined) { try { fs.closeSync(s.fd); } catch { /* ignore */ } }
     this.log("info", `可见执行服务已关闭: ${s.url}（project=${projectId}）`);
   }
@@ -502,13 +523,13 @@ export class UiExecutor {
   scheduleDispose(projectId, delayMs = 30000) {
     if (!this.servers.has(projectId)) return;
     this.cancelDispose(projectId);
-    const t = setTimeout(() => this.disposeServer(projectId), delayMs);
+    const t = setTimeout(() => this.disposeServer(projectId).catch((error) => this.log("error", error.message)), delayMs);
     t.unref?.();
     this.disposeTimers.set(projectId, t);
   }
 
   cancelDispose(projectId) {
-    const t = this.disposeTimers.get(projectId);
+    const t = this.disposeTimers?.get(projectId);
     if (t) {
       clearTimeout(t);
       this.disposeTimers.delete(projectId);
@@ -541,12 +562,15 @@ export class UiExecutor {
 
   /** 退出前关闭全部服务。 */
   shutdownAll() {
-    for (const id of [...this.servers.keys()]) this.disposeServer(id);
+    return Promise.all([...new Set([...this.servers.keys(), ...this.serverStarts.keys()])].map((id) => this.disposeServer(id)));
   }
 
   /** 工作台正常退出时仅放下本地句柄，让 Harness 服务可被下一进程接管。 */
   detachAll() {
+    for (const id of [...this.disposeTimers.keys()]) this.cancelDispose(id);
+    for (const boot of this.serverStartSignals.values()) boot.abort();
     for (const s of this.servers.values()) {
+      s.child?.unref?.();
       if (s.fd !== undefined) { try { fs.closeSync(s.fd); } catch { /* ignore */ } }
     }
     this.servers.clear();

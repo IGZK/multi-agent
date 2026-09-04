@@ -1,16 +1,26 @@
 {
-  "name": "dual-agent-workbench-repository",
-  "version": "2.0.7",
+  "name": "ai-dual-agent-workbench",
+  "version": "2.0.8",
   "private": true,
-  "workspaces": ["双agent工作台"],
+  "type": "module",
+  "description": "双 Agent 协作工作台：ChatGPT 浏览器桥、DeepSeek Harness、本地编排器与 Dashboard",
   "engines": { "node": ">=22" },
   "scripts": {
     "start": "node 双agent工作台/controller/index.mjs",
     "demo": "node 双agent工作台/controller/index.mjs --gpt=mock --executor=mock",
     "doctor": "node 双agent工作台/controller/doctor.mjs",
-    "test": "npm test --workspace=ai-dual-agent-workbench",
-    "test:ui": "npm run test:ui --workspace=ai-dual-agent-workbench",
-    "test:performance": "npm run test:performance --workspace=ai-dual-agent-workbench",
+    "test": "npm run test:core && npm run test:protocol && npm run test:bridge && npm run test:folder && npm run test:portability",
+    "test:core": "node --test 双agent工作台/test/core-regressions.mjs 双agent工作台/test/workspace-regressions.mjs 双agent工作台/test/planning-regressions.mjs 双agent工作台/test/browser-lifecycle.mjs 双agent工作台/test/gpt-instructions-regressions.mjs 双agent工作台/test/backend-safety-regressions.mjs 双agent工作台/test/runtime-safety-regressions.mjs 双agent工作台/test/startup-regressions.mjs",
+    "test:protocol": "node 双agent工作台/controller/protocol.mjs --selftest",
+    "test:bridge": "node 双agent工作台/controller/gpt_bridge.mjs --selftest",
+    "test:folder": "node 双agent工作台/controller/folder_picker.mjs --selftest && node --test 双agent工作台/test/pickdir-http-test.mjs",
+    "test:portability": "node --test 双agent工作台/test/config-portability.mjs 双agent工作台/test/executor-portability.mjs 双agent工作台/test/browser-runtime.mjs 双agent工作台/test/path-portability.mjs",
+    "test:ui": "node 双agent工作台/test/verify-task009.mjs && node 双agent工作台/test/ui-regressions.mjs",
+    "test:performance": "node --test 双agent工作台/test/bridge-performance.mjs",
+    "test:runner": "node 双agent工作台/controller/deepseek_runner.mjs --selftest",
     "selftest": "node 双agent工作台/controller/index.mjs --gpt=mock --executor=mock --selftest"
+  },
+  "dependencies": {
+    "playwright-core": "1.62.1"
   }
 }

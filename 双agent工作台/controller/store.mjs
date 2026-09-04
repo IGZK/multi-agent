@@ -39,9 +39,10 @@ const VALID_STATES = new Set([
 export function slugify(name) {
   return String(name || "project")
     .trim()
-    .replace(/[\\/:*?"<>|\r\n\t]+/g, "-")
+    .replace(/[\\/:*?"<>|\x00-\x1f]+/g, "-")
     .replace(/\s+/g, "-")
-    .slice(0, 40) || "project";
+    .slice(0, 40)
+    .replace(/[. ]+$/, "") || "project";
 }
 
 export function newProjectId(name) {
@@ -170,20 +171,30 @@ export class ProjectStore {
   constructor(projectsRoot, logger) {
     this.projectsRoot = path.resolve(projectsRoot);
     this.logger = logger;
+    this.checkpointOperations = new Map();
     fs.mkdirSync(this.projectsRoot, { recursive: true });
   }
 
   workspaceDir(projectId) {
-    this.assertProjectId(projectId);
-    return path.join(this.projectsRoot, projectId, ".gpt_workspace");
+    const dir = path.join(this.projectDir(projectId), ".gpt_workspace");
+    this.assertNoLink(dir);
+    return dir;
   }
 
   assertProjectId(projectId) {
     const id = String(projectId || "");
-    if (!id || id === "." || id === ".." || /[\\/:*?"<>|\r\n\t]/.test(id)) {
+    if (!id || id !== id.trim() || /[. ]$/.test(id) || /[\\/:*?"<>|\x00-\x1f]/.test(id)) {
       throw new Error("非法项目 ID");
     }
     return id;
+  }
+
+  assertNoLink(file) {
+    try {
+      if (fs.lstatSync(file).isSymbolicLink()) throw new Error("工作区路径不能经过符号链接或目录联接");
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+    }
   }
 
   resolveWorkspacePath(projectId, relPath) {
@@ -195,6 +206,11 @@ export class ProjectStore {
     const relative = path.relative(ws, file);
     if (relative === ".." || relative.startsWith(".." + path.sep) || path.isAbsolute(relative)) {
       throw new Error("工作区路径越界");
+    }
+    let current = ws;
+    for (const part of relative.split(path.sep).filter(Boolean)) {
+      current = path.join(current, part);
+      this.assertNoLink(current);
     }
     return file;
   }
@@ -229,14 +245,23 @@ export class ProjectStore {
   }
 
   projectDir(projectId) {
-    return path.join(this.projectsRoot, this.assertProjectId(projectId));
+    const dir = path.join(this.projectsRoot, this.assertProjectId(projectId));
+    this.assertNoLink(dir);
+    return dir;
   }
 
   createProject(name, task, sourceDir) {
+    let resolvedSource = null;
+    if (sourceDir && String(sourceDir).trim()) {
+      const raw = String(sourceDir).trim();
+      if (!path.isAbsolute(raw)) throw new Error(`项目文件夹必须是绝对路径: ${sourceDir}`);
+      resolvedSource = path.resolve(raw);
+      fs.mkdirSync(resolvedSource, { recursive: true });
+    }
     let id = newProjectId(name);
     let dir = this.projectDir(id);
     if (fs.existsSync(dir)) {
-      dir = dir + "-" + Date.now().toString(36);
+      dir = dir + "-" + crypto.randomUUID();
       id = path.basename(dir); // 目录冲突时以实际目录名为准
     }
     const ws = path.join(dir, ".gpt_workspace");
@@ -249,15 +274,9 @@ export class ProjectStore {
     fs.mkdirSync(path.join(dir, "source"), { recursive: true });
     const state = initialProjectState(id, name, task);
     // 用户指定项目文件夹：校验并创建
-    if (sourceDir && String(sourceDir).trim()) {
-      const raw = String(sourceDir).trim();
-      if (!path.isAbsolute(raw)) {
-        throw new Error(`项目文件夹必须是绝对路径: ${sourceDir}`);
-      }
-      const p = path.resolve(raw);
-      fs.mkdirSync(p, { recursive: true });
-      state.source_dir = p;
-      this.logger?.info("store", `项目文件夹（用户指定）: ${p}`);
+    if (resolvedSource) {
+      state.source_dir = resolvedSource;
+      this.logger?.info("store", `项目文件夹（用户指定）: ${resolvedSource}`);
     }
     this.writeState(id, state);
     fs.writeFileSync(path.join(ws, "gpt_context.md"), `# 项目上下文：${name}\n\n创建时间：${new Date().toISOString()}\n\n用户任务：\n\n${task}\n`, "utf8");
@@ -301,7 +320,7 @@ export class ProjectStore {
 
   readState(projectId) {
     try {
-      const file = path.join(this.workspaceDir(projectId), "project_state.json");
+      const file = this.resolveWorkspacePath(projectId, "project_state.json");
       return normalizeProjectState(JSON.parse(fs.readFileSync(file, "utf8")));
     } catch {
       return null;
@@ -310,10 +329,10 @@ export class ProjectStore {
 
   writeState(projectId, patchOrState) {
     const ws = this.workspaceDir(projectId);
-    fs.mkdirSync(ws, { recursive: true });
-    const file = path.join(ws, "project_state.json");
+    const file = this.resolveWorkspacePath(projectId, "project_state.json");
     let next = patchOrState;
     const cur = this.readState(projectId);
+    if (!cur && patchOrState?.project_id !== projectId) throw new Error(`项目不存在或状态损坏: ${projectId}`);
     if (cur && !Array.isArray(patchOrState) && patchOrState && !patchOrState.schema) {
       // 视为增量补丁：浅合并顶层 + 深合并嵌套对象
       next = { ...cur, ...patchOrState, updated_at: new Date().toISOString() };
@@ -323,11 +342,13 @@ export class ProjectStore {
         }
       }
     }
-    next.updated_at = new Date().toISOString();
+    next = { ...next, updated_at: new Date().toISOString() };
     if (next.state && !VALID_STATES.has(next.state)) {
       throw new Error(`非法状态: ${next.state}`);
     }
     const tmp = file + ".tmp";
+    fs.mkdirSync(ws, { recursive: true });
+    this.assertNoLink(tmp);
     fs.writeFileSync(tmp, JSON.stringify(next, null, 2), "utf8");
     fs.renameSync(tmp, file);
     return next;
@@ -346,10 +367,9 @@ export class ProjectStore {
   }
 
   recordGptMessage(projectId, dir, text, meta = {}) {
-    const ws = this.workspaceDir(projectId);
-    const folder = path.join(ws, "conversation", "gpt");
+    const folder = this.resolveWorkspacePath(projectId, "conversation/gpt");
     fs.mkdirSync(folder, { recursive: true });
-    const n = this.countFiles(folder) + 1;
+    const n = fs.readdirSync(folder).reduce((max, name) => Math.max(max, Number(name.match(/^(\d+)_.*\.json$/)?.[1] || 0)), 0) + 1;
     const file = path.join(folder, `${String(n).padStart(4, "0")}_${dir}.json`);
     const chars = String(text || "").length;
     // 内置规范移到附件仍需被模型读取，不能把附件排除后误报 token 节省。
@@ -389,18 +409,17 @@ export class ProjectStore {
     return rec;
   }
 
-  countFiles(dir) {
-    try { return fs.readdirSync(dir).filter((f) => f.endsWith(".json")).length; } catch { return 0; }
-  }
-
   listConversation(projectId, limit = Infinity) {
-    const folder = path.join(this.workspaceDir(projectId), "conversation", "gpt");
     try {
+      const folder = this.resolveWorkspacePath(projectId, "conversation/gpt");
       return fs.readdirSync(folder)
         .filter((f) => f.endsWith(".json"))
         .sort()
         .slice(-limit)
-        .map((f) => JSON.parse(fs.readFileSync(path.join(folder, f), "utf8")));
+        .flatMap((f) => {
+          try { return [JSON.parse(fs.readFileSync(this.resolveWorkspacePath(projectId, `conversation/gpt/${f}`), "utf8"))]; }
+          catch { return []; }
+        });
     } catch {
       return [];
     }
@@ -428,7 +447,7 @@ export class ProjectStore {
   }
 
   readOutboxStatus(projectId) {
-    const file = path.join(this.workspaceDir(projectId), "outbox", "message.json");
+    const file = this.resolveWorkspacePath(projectId, "outbox/message.json");
     try {
       const raw = fs.readFileSync(file, "utf8");
       if (!raw.trim()) return { exists: true, complete: false, data: null, error: "empty" };
@@ -440,14 +459,14 @@ export class ProjectStore {
 
   readInbox(projectId) {
     try {
-      return JSON.parse(fs.readFileSync(path.join(this.workspaceDir(projectId), "inbox", "task.json"), "utf8"));
+      return JSON.parse(fs.readFileSync(this.resolveWorkspacePath(projectId, "inbox/task.json"), "utf8"));
     } catch {
       return null;
     }
   }
 
   writeOutboxAtomic(projectId, value) {
-    const file = path.join(this.workspaceDir(projectId), "outbox", "message.json");
+    const file = this.resolveWorkspacePath(projectId, "outbox/message.json");
     const tmp = file + `.tmp-${process.pid}-${Date.now()}`;
     fs.mkdirSync(path.dirname(file), { recursive: true });
     fs.writeFileSync(tmp, JSON.stringify(value, null, 2), "utf8");
@@ -457,7 +476,7 @@ export class ProjectStore {
 
   clearOutbox(projectId) {
     try {
-      fs.unlinkSync(path.join(this.workspaceDir(projectId), "outbox", "message.json"));
+      fs.unlinkSync(this.resolveWorkspacePath(projectId, "outbox/message.json"));
     } catch { /* ignore */ }
   }
 
@@ -470,8 +489,17 @@ export class ProjectStore {
   }
 
   async createCheckpoint(projectId, taskId, dispatchId) {
+    if (this.checkpointOperations.has(projectId)) throw new Error("项目检查点正在创建");
+    const operation = this.createCheckpointSnapshot(projectId, taskId, dispatchId);
+    this.checkpointOperations.set(projectId, operation);
+    try { return await operation; }
+    finally { this.checkpointOperations.delete(projectId); }
+  }
+
+  async createCheckpointSnapshot(projectId, taskId, dispatchId) {
     const source = path.resolve(this.sourceDir(projectId));
-    if (source === path.parse(source).root) throw new Error("拒绝为磁盘根目录创建检查点");
+    const realSource = fs.realpathSync(source);
+    if (realSource === path.parse(realSource).root) throw new Error("拒绝为磁盘根目录创建检查点");
     const safeTask = String(taskId || "task").replace(/[^a-z0-9_-]+/gi, "-");
     const safeDispatch = String(dispatchId || Date.now()).replace(/[^a-z0-9_-]+/gi, "-");
     const rel = path.join("checkpoints", `${safeTask}-${safeDispatch}`);
@@ -498,6 +526,7 @@ export class ProjectStore {
         dispatch_id: String(dispatchId || ""),
         relative_path: rel.replace(/\\/g, "/"),
         source_dir: source,
+        real_source_dir: realSource,
         created_at: new Date().toISOString(),
         restored_at: null,
         status: "ready",
@@ -516,10 +545,20 @@ export class ProjectStore {
     const st = this.readState(projectId);
     const checkpoint = st?.checkpoint;
     if (!checkpoint?.relative_path) throw new Error("没有可恢复的检查点");
-    const dir = this.resolveWorkspacePath(projectId, checkpoint.relative_path);
-    const snapshot = path.join(dir, "source");
+    const dir = this.checkpointDir(projectId, checkpoint);
+    const snapshot = this.resolveWorkspacePath(projectId, `${checkpoint.relative_path}/source`);
     const source = path.resolve(this.sourceDir(projectId));
     if (source === path.parse(source).root || !fs.existsSync(snapshot)) throw new Error("检查点不可用或源码目录不安全");
+    const manifest = JSON.parse(fs.readFileSync(path.join(dir, "checkpoint.json"), "utf8"));
+    if (!checkpoint.source_dir || path.relative(path.resolve(checkpoint.source_dir), source)
+      || manifest.source_dir !== checkpoint.source_dir || manifest.dispatch_id !== checkpoint.dispatch_id
+      || manifest.task_id !== checkpoint.task_id || !fs.statSync(snapshot).isDirectory()) {
+      throw new Error("检查点与当前源码目录或任务不匹配，拒绝恢复");
+    }
+    const realSource = fs.realpathSync(source);
+    if (realSource === path.parse(realSource).root || (checkpoint.real_source_dir && path.relative(checkpoint.real_source_dir, realSource))) {
+      throw new Error("源码目录实际位置已改变，拒绝恢复检查点");
+    }
     const excluded = this.checkpointExclusions(source);
     fs.mkdirSync(source, { recursive: true });
     for (const entry of fs.readdirSync(source, { withFileTypes: true })) {
@@ -537,10 +576,17 @@ export class ProjectStore {
   clearCheckpoint(projectId) {
     const checkpoint = this.readState(projectId)?.checkpoint;
     if (checkpoint?.relative_path) {
-      const dir = this.resolveWorkspacePath(projectId, checkpoint.relative_path);
+      const dir = this.checkpointDir(projectId, checkpoint);
       fs.rmSync(dir, { recursive: true, force: true });
     }
     this.writeState(projectId, { checkpoint: null });
+  }
+
+  checkpointDir(projectId, checkpoint) {
+    if (!/^checkpoints\/[a-z0-9_-]+$/i.test(checkpoint?.relative_path || "")) {
+      throw new Error("检查点路径无效");
+    }
+    return this.resolveWorkspacePath(projectId, checkpoint.relative_path);
   }
 
   exportAudit(projectId) {

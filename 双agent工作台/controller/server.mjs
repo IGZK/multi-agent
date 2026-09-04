@@ -27,14 +27,21 @@ function readBody(req, maxBytes = 1024 * 1024) {
   return new Promise((resolve, reject) => {
     let size = 0;
     const chunks = [];
+    let done = false;
     req.on("data", (c) => {
+      if (done) return;
       size += c.length;
-      if (size > maxBytes) { reject(new Error("请求体过大")); req.destroy(); return; }
+      if (size > maxBytes) { done = true; chunks.length = 0; reject(Object.assign(new Error("请求体过大"), { statusCode: 413 })); return; }
       chunks.push(c);
     });
     req.on("end", () => {
-      try { resolve(chunks.length ? JSON.parse(Buffer.concat(chunks).toString("utf8")) : {}); }
-      catch { reject(new Error("JSON 解析失败")); }
+      if (done) return;
+      done = true;
+      try {
+        const body = chunks.length ? JSON.parse(Buffer.concat(chunks).toString("utf8")) : {};
+        if (!body || typeof body !== "object" || Array.isArray(body)) throw new Error("请求体必须为 JSON 对象");
+        resolve(body);
+      } catch { reject(Object.assign(new Error("请求体必须为有效 JSON 对象"), { statusCode: 400 })); }
     });
     req.on("error", reject);
   });
@@ -69,6 +76,7 @@ export class DashboardServer {
     this.store = store;
     this.bridge = bridge;
     this.runner = runner;
+    this.pickFolder = pickFolder;
     this.server = null;
   }
 
@@ -108,6 +116,7 @@ export class DashboardServer {
       executor_runs: (st.executor_runs || []).slice(-20),
       gpt: st.gpt,
       pending: st.pending,
+      queued_messages: st.pending_user_messages?.length || 0,
       review_requested: !!st.review_requested,
       plan_text: this.store.readFileSafe(projectId, "project_plan.md"),
       analysis_text: this.store.readFileSafe(projectId, "project_analysis.md"),
@@ -138,12 +147,12 @@ export class DashboardServer {
   }
 
   async handle(req, res) {
-    const url = new URL(req.url, "http://localhost");
-    const p = url.pathname;
     try {
+      const url = new URL(req.url, "http://localhost");
+      const p = url.pathname;
       if (!["GET", "HEAD", "OPTIONS"].includes(req.method)) {
         const origin = req.headers?.origin;
-        const port = this.cfg.dashboard?.port;
+        const port = this.server?.address()?.port ?? this.cfg.dashboard?.port;
         const host = this.cfg.dashboard?.host || "127.0.0.1";
         const allowed = new Set([`http://${host}:${port}`, `http://127.0.0.1:${port}`, `http://localhost:${port}`]);
         if (origin && !allowed.has(origin)) return sendJson(res, 403, { error: "拒绝非本机 Dashboard 的写入请求" });
@@ -177,7 +186,7 @@ export class DashboardServer {
         const body = await readBody(req);
         const startDir = body?.start_dir && String(body.start_dir).trim() ? String(body.start_dir).trim() : "";
         try {
-          const dir = await pickFolder(startDir);
+          const dir = await this.pickFolder(startDir);
           return sendJson(res, 200, { path: dir || null, canceled: !dir });
         } catch (e) {
           return sendJson(res, 500, { error: String(e.message || e) });
@@ -293,8 +302,8 @@ export class DashboardServer {
         if (!text && attachments.length === 0) return sendJson(res, 400, { error: "需要消息或附件" });
         const files = attachments.map((a) => `- ${a.name}: ${this.store.resolveWorkspacePath(id, a.relative_path)}`).join("\n");
         const message = files ? `[本地附件]\n${files}\n\n${text || "请读取并分析这些附件。"}` : text;
-        await this.orchestrator.injectMessage(id, message, attachments);
-        return sendJson(res, 200, { ok: true });
+        const result = await this.orchestrator.injectMessage(id, message, attachments);
+        return sendJson(res, 200, { ok: true, ...result });
       }
       if (req.method === "GET" && p === "/api/deepseek/models") {
         try {
@@ -324,7 +333,7 @@ export class DashboardServer {
       }
       return sendJson(res, 404, { error: `未知路径: ${p}` });
     } catch (e) {
-      return sendJson(res, 500, { error: String(e.message || e) });
+      return sendJson(res, e.statusCode || (e instanceof URIError || e.code === "ERR_INVALID_URL" ? 400 : 500), { error: String(e.message || e) });
     }
   }
 

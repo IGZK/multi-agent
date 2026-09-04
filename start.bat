@@ -1,10 +1,16 @@
 @echo off
 setlocal
+chcp 65001 >nul
 rem Discover the application directory without embedding a non-ASCII folder name.
-for /d %%D in ("%~dp0*") do if exist "%%~fD\controller\index.mjs" (
-  call "%%~fD\start.bat" %*
-  exit /b
+set "workbenchAppDir="
+for /d %%D in ("%~dp0*") do if exist "%%~fD\controller\index.mjs" set "workbenchAppDir=%%~fD"
+if not defined workbenchAppDir (
+  echo Application directory not found. Please restore the complete checkout.
+  pause
+  exit /b 1
 )
-echo Application directory not found. Please restore the complete checkout.
+echo Dual Agent Workbench - the Dashboard address will appear below.
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%workbenchAppDir%\start.ps1" %*
+set "workbenchExitCode=%errorlevel%"
 pause
-exit /b 1
+exit /b %workbenchExitCode%

@@ -303,8 +303,9 @@ export class GptBridge {
    */
   async setWindowVisible(visible) {
     if (!this.page || !this.browser) return false;
+    let cdp;
     try {
-      const cdp = await this.page.context().newCDPSession(this.page);
+      cdp = await this.page.context().newCDPSession(this.page);
       const { windowId } = await cdp.send("Browser.getWindowForTarget");
       await cdp.send("Browser.setWindowBounds", {
         windowId,
@@ -312,17 +313,16 @@ export class GptBridge {
       });
       this.windowVisible = !!visible;
       this.log("info", `浏览器窗口已${visible ? "显示" : "最小化（静默运行）"}`);
-      await cdp.detach().catch(() => {});
       return true;
     } catch (e) {
       this.log("warn", `窗口控制失败: ${e.message}`);
       return false;
-    }
+    } finally { await cdp?.detach().catch(() => {}); }
   }
 
   async getSystemState({ probe = true } = {}) {
     let browserOk = !!this.browser?.isConnected?.() || this.lastDebugProbe.up;
-    if (!browserOk && probe) {
+    if (probe) {
       try { browserOk = await this.isDebugPortUp(); } catch { /* ignore */ }
     }
     let page = { loggedIn: false, challenge: false, loading: false, url: null };
@@ -348,7 +348,9 @@ export class GptBridge {
   async newConversation() {
     await this.ensureBrowser();
     let state = await this.detectState();
-    if (state.loading || !state.url?.startsWith(new URL(this.baseUrl).origin)) state = await this.gotoChat();
+    let sameOrigin = false;
+    try { sameOrigin = new URL(state.url).origin === new URL(this.baseUrl).origin; } catch { /* navigate below */ }
+    if (state.loading || !sameOrigin) state = await this.gotoChat();
     if (!state.loggedIn) {
       throw new BridgeError("GPT_LOGIN_REQUIRED", state.challenge ? "页面出现 Cloudflare 验证/挑战" : "未登录 ChatGPT");
     }
@@ -718,7 +720,7 @@ export class GptBridge {
 
     while (Date.now() - start < timeout) {
       if (shouldAbort?.()) throw new BridgeError("PROJECT_CANCELLED", "项目已暂停或删除");
-      const info = await page.evaluate(() => {
+      const info = await page?.evaluate(() => {
         const arts = [...document.querySelectorAll('[data-message-author-role="assistant"]')];
         const last = arts[arts.length - 1];
         const md = last ? last.querySelector(".markdown") || last : null;
@@ -730,7 +732,7 @@ export class GptBridge {
           .map((node) => node.textContent || "").join(" ").slice(-2000);
         const pageError = /something went wrong|something seems to have gone wrong|an error occurred/i.test(alerts);
         return { count: arts.length, text, stop, challenge, pageError };
-      }).catch(() => null);
+      }).catch(() => null) || null;
 
       if (!info) {
         await this.ensureBrowser().catch(() => {});
@@ -791,7 +793,9 @@ export class GptBridge {
 
   /** 完整一次问答：发送 + 等待完成 */
   async ask(text, timeoutMs) {
+    await this.ensureBrowser();
     const before = await this.assistantCount();
+    if (before < 0) throw new BridgeError("GPT_PAGE_ERROR", "无法确认现有回复数量，已停止发送");
     await this.sendMessage(text);
     const reply = await this.waitForReply(before, timeoutMs);
     return { sentText: text, replyText: reply.text, conversationUrl: this.page?.url() || null };

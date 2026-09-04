@@ -6,6 +6,7 @@ import path from "node:path";
 import test from "node:test";
 import { GptBridge } from "../controller/gpt_bridge.mjs";
 import { testBrowserPath } from "./browser-test-support.mjs";
+import { terminateProcessTree } from "../controller/process_runtime.mjs";
 
 test("启动不恢复历史窗口、不创建空白首页；失败重试不重复启动", async () => {
   const bridge = Object.assign(Object.create(GptBridge.prototype), {
@@ -86,10 +87,11 @@ test("隔离真实 Chrome：并发唤起、重连、关闭后重建均只保留�
     assert.equal(bridge.chromeProcess?.pid, pid, "CDP 断线重连不能重新启动 Chrome");
     assert.equal(browser.contexts()[0].pages().length, 2);
   } finally {
-    try { const cdp = await (browser || bridge.browser)?.newBrowserCDPSession(); await cdp?.send("Browser.close"); } catch { /* already closed */ }
-    bridge.chromeProcess?.kill();
+    // Close the full isolated process tree before removing files; killing only
+    // Chrome's parent leaves utility processes holding the profile on Windows.
+    await terminateProcessTree(bridge.chromeProcess);
     await bridge.dispose();
     await new Promise((resolve) => server.close(resolve));
-    fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    await fs.promises.rm(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
   }
 });

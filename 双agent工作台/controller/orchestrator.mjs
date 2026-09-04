@@ -4,7 +4,8 @@
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
-import { exec } from "node:child_process";
+import { spawn } from "node:child_process";
+import { terminateProcessTree } from "./process_runtime.mjs";
 import { sleep, projectLog, nowIso } from "./logger.mjs";
 import {
   parseGptResponse, parsePlan, fallbackParse, slimPlan,
@@ -15,20 +16,57 @@ import { resolveDeepseekSelection, validatePlanContract, executorGuidance } from
 
 const TOKEN_KEYS = ["uncachedInputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens"];
 
-export function runValidationCommand(command, cwd, timeoutMs = 300000) {
-  return new Promise((resolve) => {
+export function runValidationCommand(command, cwd, timeoutMs = 300000, signal) {
+  let child;
+  const completion = new Promise((resolve, reject) => {
     const started = Date.now();
-    exec(String(command), { cwd, timeout: timeoutMs, maxBuffer: 1024 * 1024, windowsHide: true }, (error, stdout, stderr) => {
+    let output = "", bytes = 0, reason = signal?.aborted ? "cancelled" : null;
+    let timer, stopping, finished = false;
+    const finish = async (code) => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", cancel);
+      if (stopping && !await stopping) return;
       resolve({
-        ok: !error,
+        ok: code === 0 && !reason,
         command: String(command),
-        exit_code: Number.isInteger(error?.code) ? error.code : error ? -1 : 0,
-        timed_out: !!error?.killed,
+        exit_code: Number.isInteger(code) ? code : -1,
+        timed_out: reason === "timeout",
+        cancelled: reason === "cancelled",
         duration_ms: Date.now() - started,
-        output: `${stdout || ""}${stderr || ""}`.slice(-8000),
+        output,
       });
-    });
+    };
+    const stop = (why) => {
+      if (reason) return;
+      reason = why;
+      stopping = terminateProcessTree(child).then((ok) => {
+        if (!ok) {
+          clearTimeout(timer);
+          signal?.removeEventListener("abort", cancel);
+          reject(Object.assign(new Error("无法确认验证进程树已停止，已禁止回滚或删除源码"), { code: "RUNNER_STOP_FAILED" }));
+        }
+        return ok;
+      });
+    };
+    const cancel = () => stop("cancelled");
+    if (reason) { finish(null); return; }
+    child = spawn(String(command), { cwd, shell: true, detached: process.platform !== "win32", windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
+    const collect = (chunk) => {
+      output = (output + chunk).slice(-8000);
+      bytes += Buffer.byteLength(chunk);
+      if (bytes > 1024 * 1024) stop("output_limit");
+    };
+    child.stdout.setEncoding("utf8").on("data", collect);
+    child.stderr.setEncoding("utf8").on("data", collect);
+    child.once("error", (error) => { output = error.message; finish(null); });
+    child.once("close", finish);
+    signal?.addEventListener("abort", cancel, { once: true });
+    timer = setTimeout(() => stop("timeout"), timeoutMs);
   });
+  completion.stop = () => terminateProcessTree(child);
+  return completion;
 }
 
 /** 只把明确的可执行命令交给 shell；自然语言验收标准由执行者自检。 */
@@ -71,6 +109,9 @@ export class Orchestrator {
     this.store = store;
     this.loops = new Map(); // projectId -> Promise
     this.projectEpochs = new Map(); // 取消/删除时递增，阻止旧异步结果回写状态
+    this.validationRuns = new Map();
+    this.projectStops = new Map();
+    this.stopping = false;
     this.gptOwner = null; // 一个“发送 → 等回复”周期只能属于一个项目
     this.gptWaiters = [];
     this.gptWaitingProjects = new Set();
@@ -81,26 +122,45 @@ export class Orchestrator {
 
   log(level, projectId, msg) { this.logger?.[level]?.(`orch:${projectId || "-"}`, msg); }
 
+  assertRunning() {
+    if (this.stopping) throw Object.assign(new Error("工作台正在退出，不能启动新操作"), { code: "PROJECT_CANCELLED" });
+  }
+
+  async beginShutdown() {
+    this.stopping = true;
+    const ids = new Set([...this.loops.keys(), ...this.validationRuns.keys(), ...this.gptActiveOps.keys(), ...this.gptWaitingProjects, this.gptOwner].filter(Boolean));
+    for (const id of ids) this.invalidateProject(id);
+    await Promise.all([...this.validationRuns.keys()].map((id) => this.stopValidation(id)));
+  }
+
+  async stopValidation(projectId) {
+    const run = this.validationRuns.get(projectId);
+    if (!run) return;
+    if (!run.stopFailed) return run.completion;
+    if (!await run.completion.stop()) throw Object.assign(new Error("仍无法确认验证进程树已停止"), { code: "RUNNER_STOP_FAILED" });
+    if (this.validationRuns.get(projectId) === run) this.validationRuns.delete(projectId);
+  }
+
   projectEpoch(projectId) { return this.projectEpochs.get(projectId) || 0; }
   invalidateProject(projectId) {
     const next = this.projectEpoch(projectId) + 1;
     this.projectEpochs.set(projectId, next);
+    this.validationRuns.get(projectId)?.abort();
     return next;
   }
 
   async acquireGpt(projectId) {
-    if (this.gptOwner === projectId) return;
+    const epoch = this.projectEpoch(projectId);
+    if (this.gptOwner === projectId) { this.assertProjectActive(projectId, epoch); return; }
     if (this.gptOwner) {
       await new Promise((resolve) => this.gptWaiters.push({ projectId, resolve }));
     } else {
       this.gptOwner = projectId;
     }
-    const st = this.store.readState(projectId);
-    if (!st || st.state === "PAUSED") {
+    try { this.assertProjectActive(projectId, epoch); }
+    catch (error) {
       this.releaseGpt(projectId);
-      const e = new Error("项目已暂停或删除");
-      e.code = "PROJECT_CANCELLED";
-      throw e;
+      throw error;
     }
   }
 
@@ -128,8 +188,9 @@ export class Orchestrator {
   gptIsActive(projectId) { return (this.gptActiveOps.get(projectId) || 0) > 0; }
 
   assertProjectActive(projectId, epoch) {
+    this.assertRunning();
     const st = this.store.readState(projectId);
-    if (!st || st.state === "PAUSED" || epoch !== this.projectEpoch(projectId)) {
+    if (!st || ["PAUSED", "CANCELED", "COMPLETED"].includes(st.state) || epoch !== this.projectEpoch(projectId)) {
       const e = new Error("项目已暂停或删除");
       e.code = "PROJECT_CANCELLED";
       throw e;
@@ -142,7 +203,7 @@ export class Orchestrator {
     const projects = this.store.listProjects();
     this.log("info", "-", `扫描到 ${projects.length} 个项目`);
     for (const p of projects) {
-      if (["COMPLETED", "CANCELED"].includes(p.state)) continue;
+      if (["COMPLETED", "CANCELED"].includes(p.state) && !this.store.readState(p.id)?.pending_user_messages?.length) continue;
       this.log("info", p.id, `恢复项目（状态: ${p.state}）`);
       this.prewarmExecutor(p.id);
       this.startLoop(p.id);
@@ -150,7 +211,7 @@ export class Orchestrator {
   }
 
   startLoop(projectId) {
-    if (this.loops.has(projectId)) return;
+    if (this.stopping || this.loops.has(projectId)) return;
     const p = this.runLoop(projectId).catch((e) => {
       this.log("error", projectId, `循环崩溃: ${e.stack || e.message}`);
     });
@@ -162,15 +223,17 @@ export class Orchestrator {
     if (!this.runner.prewarm) return;
     const state = this.store.readState(projectId);
     if (!state || state.session?.session_id || !["INIT", "GPT_PLANNING"].includes(state.state)) return;
-    const dirs = {
-      projectDir: this.store.projectDir(projectId),
-      workspaceDir: this.store.workspaceDir(projectId),
-      sourceDir: this.store.sourceDir(projectId),
-    };
-    Promise.resolve(this.runner.prewarm(projectId, dirs, this.store))
+    Promise.resolve().then(() => {
+      this.assertRunning();
+      return this.runner.prewarm(projectId, {
+        projectDir: this.store.projectDir(projectId),
+        workspaceDir: this.store.workspaceDir(projectId),
+        sourceDir: this.store.sourceDir(projectId),
+      }, this.store);
+    })
       .then(() => {
         const latest = this.store.readState(projectId);
-        if (!latest || ["PAUSED", "CANCELED", "COMPLETED"].includes(latest.state)) this.runner.kill(projectId);
+        if (!latest || ["PAUSED", "CANCELED", "COMPLETED"].includes(latest.state)) return this.runner.kill(projectId);
       })
       .catch((error) => this.log("warn", projectId, `DeepSeek 预热未完成（将在派发时重试）: ${error.message}`));
   }
@@ -178,12 +241,16 @@ export class Orchestrator {
   async runLoop(projectId) {
     const dir = this.store.projectDir(projectId);
     this.log("info", projectId, `循环启动（cwd: ${dir}）`);
-    while (true) {
+    while (!this.stopping) {
       let st = this.store.readState(projectId);
       if (!st) break; // 项目被删除
       if (st.state === "PAUSED") { await sleep(1000); continue; }
-      if (["COMPLETED", "CANCELED"].includes(st.state)) break;
       try {
+        if (await this.flushUserMessages(projectId, st)) continue;
+        st = this.store.readState(projectId);
+        if (!st) break;
+        if (st.state === "PAUSED") continue;
+        if (["COMPLETED", "CANCELED"].includes(st.state)) break;
         await this.step(projectId, st);
         const after = this.store.readState(projectId);
         // “连续错误”只在连续抛错时累积；任一正常状态步骤都会清零。
@@ -203,7 +270,7 @@ export class Orchestrator {
 
   handleError(projectId, st, e) {
     const fresh = this.store.readState(projectId);
-    if (!fresh || fresh.state === "PAUSED" || e.code === "PROJECT_CANCELLED") return;
+    if (!fresh || ["PAUSED", "CANCELED", "COMPLETED"].includes(fresh.state) || e.code === "PROJECT_CANCELLED") return;
     const code = e.code || "UNKNOWN";
     const msg = `${code}: ${e.message}`;
     this.log("error", projectId, `步骤 ${fresh.state || st.state} 出错 → ${msg}`);
@@ -225,6 +292,7 @@ export class Orchestrator {
 
   // ================= 主状态机 =================
   async step(projectId, st) {
+    this.assertProjectActive(projectId, this.projectEpoch(projectId));
     const S = st.state;
     switch (S) {
       case "INIT": return this.stepInit(projectId, st);
@@ -262,6 +330,7 @@ export class Orchestrator {
 
   async stepInitLocked(projectId, st, epoch) {
     await this.bridge.ensureBrowser();
+    this.assertProjectActive(projectId, epoch);
     if (st.gpt?.intro_sent && st.gpt?.conversation_url) {
       // 已发过简介（恢复场景）：先恢复到该项目会话，再进入等待规划。
       await this.openConversation(projectId, st.gpt.conversation_url);
@@ -269,9 +338,12 @@ export class Orchestrator {
       return this.store.transition(projectId, "GPT_PLANNING");
     }
     let pageState = await this.bridge.gotoChat().catch(async () => {
+      this.assertProjectActive(projectId, epoch);
       await this.bridge.ensureBrowser();
+      this.assertProjectActive(projectId, epoch);
       return this.bridge.gotoChat();
     });
+    this.assertProjectActive(projectId, epoch);
 
     // 页面加载中（未渲染出关键元素，且无明确未登录信号）：静默等待，绝不误报"需要登录"
     const graceMs = this.cfg.gpt?.loginGraceMs ?? 45000;
@@ -281,7 +353,9 @@ export class Orchestrator {
         pending: { text: "正在加载 ChatGPT 页面…", ts: nowIso() },
       });
       await sleep(500);
+      this.assertProjectActive(projectId, epoch);
       pageState = await this.bridge.detectState();
+      this.assertProjectActive(projectId, epoch);
     }
 
     if (pageState.challenge) {
@@ -309,6 +383,7 @@ export class Orchestrator {
     }
     // 已登录：静默运行（最小化窗口）
     await this.bridge.setWindowVisible(false);
+    this.assertProjectActive(projectId, epoch);
     // 固定规则由 sendToGpt 作为规范附件提供，消息正文只保留本次任务。
     const initialAttachments = this.store.getAttachments(projectId, st.initial_attachment_ids || []);
     const attachmentNote = initialAttachments.length
@@ -472,7 +547,7 @@ export class Orchestrator {
     const ready = candidates.filter((t) =>
       (t.dependencies || []).every((d) => completed.has(String(d).toUpperCase()))
     );
-    return ready[0] || null;
+    return ready.find((task) => task.id === st.current_task?.id) || ready[0] || null;
   }
 
   pendingTasks(st) {
@@ -505,6 +580,7 @@ export class Orchestrator {
   }
 
   async stepWaitingExecutor(projectId, st) {
+    const epoch = this.projectEpoch(projectId);
     const type = st.pending?.type || "EXECUTE_PLAN";
     const savedEnvelope = this.store.readInbox(projectId);
     if (st.current_dispatch_id && savedEnvelope?.dispatch_id === st.current_dispatch_id) {
@@ -514,6 +590,7 @@ export class Orchestrator {
         try {
           return await this.handleExecutorResult(projectId, { exitCode: 0, timedOut: false, ms: 0, resumed: true }, savedEnvelope);
         } catch (error) {
+          this.assertProjectActive(projectId, epoch);
           if (type === "EXECUTE_PLAN") {
             return this.retryTaskAfterFailure(projectId, savedEnvelope, error.message, error.code || "OUTBOX_INVALID");
           }
@@ -522,10 +599,12 @@ export class Orchestrator {
       }
       const dirs = { projectDir: this.store.projectDir(projectId), workspaceDir: this.store.workspaceDir(projectId), sourceDir: this.store.sourceDir(projectId) };
       const resumed = await this.runner.resume?.(projectId, dirs, savedEnvelope, this.store);
+      this.assertProjectActive(projectId, epoch);
       if (resumed && !resumed.resumeFailed) {
         try {
           return await this.handleExecutorResult(projectId, resumed, savedEnvelope);
         } catch (error) {
+          this.assertProjectActive(projectId, epoch);
           if (type === "EXECUTE_PLAN") {
             return this.retryTaskAfterFailure(projectId, savedEnvelope, error.message, error.code || "EXECUTOR_RESULT_ERROR");
           }
@@ -628,6 +707,7 @@ export class Orchestrator {
    */
   async dispatchExecutor(projectId, type, requestOrTask, envelopeOrNull, attempt = 1) {
     const epoch = this.projectEpoch(projectId);
+    this.assertProjectActive(projectId, epoch);
     const dirs = {
       projectDir: this.store.projectDir(projectId),
       workspaceDir: this.store.workspaceDir(projectId),
@@ -663,6 +743,7 @@ export class Orchestrator {
     try {
       result = await this.runner.run(projectId, dirs, envelope, this.store);
     } catch (error) {
+      this.assertProjectActive(projectId, epoch);
       if (type === "EXECUTE_PLAN") return this.retryTaskAfterFailure(projectId, envelope, error.message, error.code || "RUNNER_ERROR");
       throw error;
     }
@@ -675,10 +756,12 @@ export class Orchestrator {
     try {
       outcome = await this.handleExecutorResult(projectId, result, envelope);
     } catch (error) {
+      this.assertProjectActive(projectId, epoch);
       if (type === "EXECUTE_PLAN") return this.retryTaskAfterFailure(projectId, envelope, error.message, error.code || "EXECUTOR_RESULT_ERROR");
       throw error;
     }
     // 更新项目级上下文缓存基线：复用会话→记录已发送状态（下个任务增量）；新会话→重置（下个任务全量）
+    this.assertProjectActive(projectId, epoch);
     if (result?.freshSession) {
       this.store.writeState(projectId, { context_cache: null });
     } else {
@@ -689,7 +772,14 @@ export class Orchestrator {
   }
 
   async retryTaskAfterFailure(projectId, envelope, summary, code = "TASK_FAILED", reportFile = null) {
-    let st = this.store.readState(projectId);
+    let st = this.assertProjectActive(projectId, this.projectEpoch(projectId));
+    if (code === "RUNNER_STOP_FAILED") {
+      this.store.transition(projectId, "ERROR", {
+        last_error: `${code}: ${summary}`, error_count: this.maxConsecutiveErrors + 1,
+        pending: { text: summary, ts: nowIso(), retryState: "ERROR", errorCode: code },
+      });
+      return null;
+    }
     const taskId = envelope.task_id || envelope.current_task?.id;
     const task = st?.plan?.parsed?.tasks?.find((item) => item.id === taskId) || st?.current_task || envelope.current_task;
     const currentAttempt = Number(envelope.attempt || 1);
@@ -795,8 +885,8 @@ export class Orchestrator {
   }
 
   async handleExecutorResult(projectId, result, envelope) {
-    let st = this.store.readState(projectId);
-    if (!st) return null;
+    const epoch = this.projectEpoch(projectId);
+    let st = this.assertProjectActive(projectId, epoch);
     const outboxStatus = this.store.readOutboxStatus(projectId);
     const outbox = outboxStatus.data;
     if (outbox) {
@@ -829,9 +919,22 @@ export class Orchestrator {
     let validationResult = null;
     if (outbox?.type === "TASK_DONE" && envelope.type === "EXECUTE_PLAN" && (envelope.current_task?.validation_command || envelope.current_task?.validation || envelope.current_task?.acceptance_check)) {
       const command = recognizedValidationCommand(envelope.current_task.validation_command || envelope.current_task.validation);
-      validationResult = command
-        ? await runValidationCommand(command, this.store.sourceDir(projectId), envelope.timeoutMs || 300000)
-        : { ok: true, skipped: true, description: envelope.current_task.acceptance_check || envelope.current_task.validation, reason: "非 shell 命令；保留执行者结果，交由最终审查验收" };
+      const controller = new AbortController();
+      this.validationRuns.set(projectId, controller);
+      try {
+        if (command) {
+          controller.completion = runValidationCommand(command, this.store.sourceDir(projectId), envelope.timeoutMs || 300000, controller.signal);
+          validationResult = await controller.completion;
+        } else {
+          validationResult = { ok: true, skipped: true, description: envelope.current_task.acceptance_check || envelope.current_task.validation, reason: "非 shell 命令；保留执行者结果，交由最终审查验收" };
+        }
+      } catch (error) {
+        controller.stopFailed = error.code === "RUNNER_STOP_FAILED";
+        throw error;
+      } finally {
+        if (!controller.stopFailed && this.validationRuns.get(projectId) === controller) this.validationRuns.delete(projectId);
+      }
+      st = this.assertProjectActive(projectId, epoch);
       validationResult = { ...validationResult, task_id: envelope.task_id, ts: nowIso() };
       this.store.writeState(projectId, { validation_results: { ...(st.validation_results || {}), [envelope.task_id]: validationResult } });
     }
@@ -1100,12 +1203,15 @@ export class Orchestrator {
     try {
       const st = this.store.readState(projectId);
       await this.bridge.ensureBrowser();
+      this.assertProjectActive(projectId, epoch);
       const newConversation = opts.intro || !st.gpt?.conversation_url;
       if (newConversation) {
         await this.bridge.newConversation();
+        this.assertProjectActive(projectId, epoch);
         if (!st.gpt?.model_selected && this.bridge.selectModel) {
           const gcfg = this.cfg.gpt || {};
           const sel = await this.bridge.selectModel(gcfg.modelName, gcfg.modelMatch);
+          this.assertProjectActive(projectId, epoch);
           this.store.writeState(projectId, { gpt: { model_selected: sel.selected || null, models_available: sel.available || [] } });
           if (!sel.selected) this.log("warn", projectId, `未选到目标模型 "${gcfg.modelName}"（可用: ${(sel.available || []).join(", ") || "未枚举"}），使用页面默认模型`);
         }
@@ -1113,6 +1219,7 @@ export class Orchestrator {
         await this.openConversation(projectId, st.gpt.conversation_url);
       }
       const pageState = await this.bridge.detectState();
+      this.assertProjectActive(projectId, epoch);
       if (pageState.challenge || !pageState.loggedIn) {
         const e = new Error(pageState.challenge ? "ChatGPT 验证挑战" : "ChatGPT 未登录");
         e.code = pageState.challenge ? "GPT_CHALLENGE" : "GPT_LOGIN_REQUIRED";
@@ -1127,6 +1234,7 @@ export class Orchestrator {
       const profiledContent = [instructionNote, content, instructions.reminder].filter(Boolean).join("\n\n");
       const msg = wrapOrchestratorMsg(type, profiledContent);
       const baseline = await this.bridge.assistantCount();
+      this.assertProjectActive(projectId, epoch);
       const files = (Array.isArray(opts.attachments) ? opts.attachments : [])
         .map((a) => this.store.resolveWorkspacePath(projectId, a.relative_path));
       const instructionAttachment = attachInstructions ? {
@@ -1182,14 +1290,16 @@ export class Orchestrator {
     try {
       const st = this.store.readState(projectId);
       await this.bridge.ensureBrowser();
+      this.assertProjectActive(projectId, epoch);
       await this.openConversation(projectId, st.gpt?.conversation_url);
+      this.assertProjectActive(projectId, epoch);
       const baseline = st.gpt?.reply_baseline ?? 0;
       this.store.writeState(projectId, {
         pending: { text: "等待 GPT 回复…", ts: nowIso() },
       });
       const cancelled = () => {
         const fresh = this.store.readState(projectId);
-        return epoch !== this.projectEpoch(projectId) || !fresh || fresh.state === "PAUSED";
+        return epoch !== this.projectEpoch(projectId) || !fresh || ["PAUSED", "CANCELED", "COMPLETED"].includes(fresh.state);
       };
       const reply = await this.bridge.waitForReply(baseline, this.cfg.gpt?.replyTimeoutMs, cancelled);
       if (cancelled()) {
@@ -1463,6 +1573,7 @@ export class Orchestrator {
 
   // ================= 控制指令（Dashboard 用） =================
   async createProject(name, task, sourceDir, opts = {}) {
+    this.assertRunning();
     const id = this.store.createProject(name, task, sourceDir);
     const initialAttachments = (Array.isArray(opts.attachments) ? opts.attachments : [])
       .map((item) => this.store.saveAttachment(id, item.name, item.mime, item.buffer));
@@ -1478,6 +1589,7 @@ export class Orchestrator {
 
   /** 重命名项目（仅改显示名，目录 id 不变） */
   async renameProject(projectId, newName) {
+    this.assertRunning();
     const st = this.store.readState(projectId);
     if (!st) throw new Error(`项目不存在: ${projectId}`);
     const name = String(newName || "").trim();
@@ -1488,6 +1600,7 @@ export class Orchestrator {
 
   /** 归档 / 取消归档 */
   async setProjectArchived(projectId, archived) {
+    this.assertRunning();
     const st = this.store.readState(projectId);
     if (!st) throw new Error(`项目不存在: ${projectId}`);
     this.store.writeState(projectId, { archived: !!archived });
@@ -1496,6 +1609,7 @@ export class Orchestrator {
 
   /** 设置项目的 DeepSeek 模型选择 */
   async setProjectDeepseekSelection(projectId, selection) {
+    this.assertRunning();
     const st = this.store.readState(projectId);
     if (!st) throw new Error(`项目不存在: ${projectId}`);
     const sel = {
@@ -1520,6 +1634,7 @@ export class Orchestrator {
   }
 
   async selectExecutor(projectId, type) {
+    this.assertRunning();
     const st = this.store.readState(projectId);
     if (!st) throw new Error(`项目不存在: ${projectId}`);
     if (this.runner.isRunning?.(projectId)) throw new Error("执行中不能切换执行器");
@@ -1534,6 +1649,7 @@ export class Orchestrator {
   }
 
   async compactSession(projectId) {
+    this.assertRunning();
     const st = this.store.readState(projectId);
     if (!st) throw new Error(`项目不存在: ${projectId}`);
     if (["COMPLETED", "CANCELED"].includes(st.state)) throw new Error("已结束项目无需压缩会话");
@@ -1549,10 +1665,12 @@ export class Orchestrator {
 
   /** 删除项目：停止循环 + 释放执行者 + 删除目录 */
   async deleteProject(projectId) {
+    this.assertRunning();
     const st = this.store.readState(projectId);
     if (!st) throw new Error(`项目不存在: ${projectId}`);
     this.invalidateProject(projectId);
-    this.runner.kill(projectId);
+    this.store.transition(projectId, "CANCELED", { pending_user_messages: [], pending: { text: "正在停止并删除项目…", ts: nowIso() } });
+    await this.stopExecutorWork(projectId);
     if (!this.gptWaitingProjects.has(projectId) && !this.gptIsActive(projectId)) this.releaseGpt(projectId);
     this.store.deleteProject(projectId);
     this.log("info", projectId, `项目已删除（${st.project_name}）`);
@@ -1560,19 +1678,32 @@ export class Orchestrator {
 
   /** 修改项目的源码文件夹（用户自选） */
   async setSourceDir(projectId, dir) {
+    this.assertRunning();
     const st = this.store.readState(projectId);
+    const epoch = this.projectEpoch(projectId);
     if (!st) throw new Error(`项目不存在: ${projectId}`);
+    if (!["INIT", "PAUSED", "ERROR", "COMPLETED", "CANCELED"].includes(st.state)
+      || this.runner.isRunning?.(projectId) || this.gptIsActive(projectId)
+      || this.validationRuns.has(projectId) || this.store.checkpointOperations?.has(projectId)) {
+      throw new Error("请先暂停项目，再修改源码文件夹");
+    }
     const raw = String(dir || "").trim();
     if (!raw || !path.isAbsolute(raw)) throw new Error("项目文件夹必须是绝对路径");
     const p = path.resolve(raw);
     fs.mkdirSync(p, { recursive: true });
-    this.store.writeState(projectId, { source_dir: p });
+    if (path.relative(this.store.sourceDirStatus(projectId).path, p) === "") return p;
+    await this.runner.kill(projectId);
+    const fresh = this.store.readState(projectId);
+    if (!fresh || this.projectEpoch(projectId) !== epoch || fresh.state !== st.state) throw new Error("项目状态已改变，请重新选择源码文件夹");
+    this.store.clearCheckpoint(projectId);
+    this.store.writeState(projectId, { source_dir: p, session: null, context_cache: null, current_dispatch_id: null });
     this.log("info", projectId, `项目文件夹已改为: ${p}`);
     return p;
   }
 
   /** 显示/隐藏浏览器窗口 */
   async toggleWindow(show) {
+    this.assertRunning();
     try {
       await this.bridge.ensureBrowser();
       if (this.bridge.page) await this.bridge.setWindowVisible(!!show);
@@ -1587,51 +1718,78 @@ export class Orchestrator {
   }
 
   async pause(projectId) {
+    this.assertRunning();
     const st = this.store.readState(projectId);
-    if (!st || ["COMPLETED", "CANCELED", "PAUSED"].includes(st.state)) return st;
+    if (!st || ["COMPLETED", "CANCELED"].includes(st.state)) return st;
+    if (st.state === "PAUSED") {
+      if (this.validationRuns.has(projectId) || this.projectStops.has(projectId) || this.runner.isRunning?.(projectId)) await this.stopExecutorWork(projectId);
+      return st;
+    }
     this.invalidateProject(projectId);
-    this.runner.kill(projectId);
     const result = this.store.writeState(projectId, {
       state: "PAUSED",
       previous_state: st.state,
       pending: { text: "已暂停（用户操作）。", ts: nowIso(), retryState: st.state },
     });
     if (!this.gptWaitingProjects.has(projectId) && !this.gptIsActive(projectId)) this.releaseGpt(projectId);
+    await this.stopExecutorWork(projectId);
     return result;
   }
 
   async endProject(projectId) {
+    this.assertRunning();
     const st = this.store.readState(projectId);
-    if (!st || ["COMPLETED", "CANCELED"].includes(st.state)) return st;
+    if (!st || st.state === "COMPLETED") return st;
+    if (st.state === "CANCELED") {
+      if (st.pending_user_messages?.length) this.store.writeState(projectId, { pending_user_messages: [] });
+      if (this.validationRuns.has(projectId) || this.projectStops.has(projectId) || this.runner.isRunning?.(projectId)) await this.stopExecutorWork(projectId);
+      if (this.store.readState(projectId)?.pending_user_messages?.length) this.startLoop(projectId);
+      return this.store.readState(projectId);
+    }
     this.invalidateProject(projectId);
-    this.runner.kill(projectId);
     const result = this.store.transition(projectId, "CANCELED", {
+      pending_user_messages: [],
       pending: { text: "项目已由用户手动结束。", ts: nowIso() },
       milestone: { text: "用户手动结束", ts: nowIso() },
     });
     if (!this.gptWaitingProjects.has(projectId) && !this.gptIsActive(projectId)) this.releaseGpt(projectId);
+    await this.stopExecutorWork(projectId);
+    if (this.store.readState(projectId)?.pending_user_messages?.length) this.startLoop(projectId);
     return result;
   }
 
+  async stopExecutorWork(projectId) {
+    if (this.projectStops.has(projectId)) return this.projectStops.get(projectId);
+    const stopped = Promise.all([
+      this.runner.kill(projectId),
+      this.stopValidation(projectId),
+      this.store.checkpointOperations?.get(projectId)?.catch(() => {}),
+    ]);
+    this.projectStops.set(projectId, stopped);
+    try { await stopped; }
+    finally { this.projectStops.delete(projectId); }
+  }
+
   async resume(projectId) {
+    this.assertRunning();
     const st = this.store.readState(projectId);
     if (!st || st.state !== "PAUSED") return st;
+    if (this.validationRuns.has(projectId) || this.projectStops.has(projectId)) throw new Error("正在停止执行，请完成后再继续项目");
     if (st.pending_model_replan?.status === "paused") {
       this.store.writeState(projectId, { pending_model_replan: { ...st.pending_model_replan, status: "ready" } });
       return this.beginModelReplan(projectId);
     }
     const retry = st.pending?.retryState || st.previous_state || "INIT";
-    // 恢复执行者状态：重新分派
-    const retry2 = ["EXECUTING", "WAITING_FOR_EXECUTOR", "ANALYZING", "DECISION_REQUIRED"].includes(retry)
-      ? (st.pending?.type === "ANALYZE" || st.pending?.type === "DECIDE" ? "PLAN_READY" : "EXECUTING")
-      : retry;
-    this.store.writeState(projectId, { error_count: 0, pending: { text: "已恢复运行。", ts: nowIso(), retryState: retry2 } });
-    return this.store.transition(projectId, retry2);
+    // 保留原派发，让等待状态先接收已有结果或恢复检查点；分析/决策也从原步骤继续。
+    this.store.writeState(projectId, { error_count: 0, pending: { text: "已恢复运行。", ts: nowIso(), retryState: retry } });
+    return this.store.transition(projectId, retry);
   }
 
   async retry(projectId) {
+    this.assertRunning();
     const st = this.store.readState(projectId);
     if (!st) return null;
+    if (st.pending?.errorCode === "RUNNER_STOP_FAILED" || this.validationRuns.has(projectId)) throw new Error("尚未确认执行进程已停止，不能重试");
     const retry = st.pending?.retryState || st.previous_state || "INIT";
     this.store.writeState(projectId, {
       error_count: 0,
@@ -1644,8 +1802,10 @@ export class Orchestrator {
   }
 
   async retryTask(projectId) {
+    this.assertRunning();
     const st = this.store.readState(projectId);
     if (!st) throw new Error(`项目不存在: ${projectId}`);
+    if (st.pending?.errorCode === "RUNNER_STOP_FAILED" || this.validationRuns.has(projectId)) throw new Error("尚未确认执行进程已停止，不能重试任务");
     if (this.runner.isRunning?.(projectId)) throw new Error("当前任务仍在执行");
     const task = st.current_task || st.plan?.parsed?.tasks?.find((item) => (st.failed_tasks || []).some((failed) => failed.id === item.id));
     if (!task) throw new Error("没有可重试的任务");
@@ -1664,8 +1824,10 @@ export class Orchestrator {
   }
 
   async restoreCheckpoint(projectId) {
+    this.assertRunning();
     const st = this.store.readState(projectId);
     if (!st) throw new Error(`项目不存在: ${projectId}`);
+    if (st.pending?.errorCode === "RUNNER_STOP_FAILED" || this.validationRuns.has(projectId)) throw new Error("尚未确认执行进程已停止，不能恢复检查点");
     if (this.runner.isRunning?.(projectId)) throw new Error("执行中不能手动恢复检查点");
     const restored = this.store.restoreCheckpoint(projectId);
     this.store.writeState(projectId, { pending: { text: `已恢复任务 ${restored.task_id} 的检查点。`, ts: nowIso(), retryState: st.state } });
@@ -1673,13 +1835,43 @@ export class Orchestrator {
   }
 
   exportAudit(projectId) {
+    this.assertRunning();
     return this.store.exportAudit(projectId);
   }
 
   async injectMessage(projectId, text, attachments = []) {
+    this.assertRunning();
     const st = this.store.readState(projectId);
     if (!st) throw new Error(`项目不存在: ${projectId}`);
-    await this.sendToGpt(projectId, "USER", text, { attachments });
-    return this.store.transition(projectId, "WAITING_FOR_GPT");
+    const message = { id: crypto.randomUUID(), text, attachments, created_at: nowIso() };
+    this.store.writeState(projectId, { pending_user_messages: [...(st.pending_user_messages || []), message] });
+    if (st.state !== "PAUSED") {
+      if (["COMPLETED", "CANCELED"].includes(st.state)) {
+        this.loops.get(projectId)?.finally(() => {
+          if (this.store.readState(projectId)?.pending_user_messages?.length) this.startLoop(projectId);
+        });
+      }
+      this.startLoop(projectId);
+    }
+    return { queued: true, paused: st.state === "PAUSED" };
+  }
+
+  async flushUserMessages(projectId, st) {
+    const messages = st.pending_user_messages || [];
+    if (this.stopping || !messages.length || !["PLAN_READY", "COMPLETED", "CANCELED", "ERROR"].includes(st.state) || st.pending_task_review
+      || st.pending?.errorCode === "RUNNER_STOP_FAILED" || this.gptIsActive(projectId)
+      || this.gptWaitingProjects.has(projectId) || this.runner.isRunning?.(projectId)
+      || this.validationRuns.has(projectId) || this.projectStops.has(projectId)) return false;
+    if (["COMPLETED", "CANCELED"].includes(st.state)) this.invalidateProject(projectId);
+    this.store.transition(projectId, "WAITING_FOR_GPT", { pending: { text: "正在发送追加消息…", ts: nowIso(), retryState: "PLAN_READY" } });
+    const content = messages.map((message) => message.text).join("\n\n");
+    await this.sendToGpt(projectId, "USER", content, { attachments: messages.flatMap((message) => message.attachments || []) });
+    const latest = this.store.readState(projectId);
+    const sentIds = new Set(messages.map((message) => message.id));
+    this.store.writeState(projectId, {
+      pending_user_messages: (latest.pending_user_messages || []).filter((message) => !sentIds.has(message.id)),
+      pending: { text: "追加消息已发送，等待 GPT 回复…", ts: nowIso() },
+    });
+    return true;
   }
 }

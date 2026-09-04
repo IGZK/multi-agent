@@ -121,9 +121,9 @@ code, pre, .mono { font-family: "Cascadia Code", Consolas, monospace; }
 .row-menu-panel button, .action-menu button { width: 100%; min-height: 34px; padding: 6px 10px; justify-content: flex-start; }
 .row-menu-panel button:hover, .action-menu button:hover { background: var(--surface-hover); }
 .row-menu-panel .danger, .action-menu .danger { color: var(--danger); }
-.proj-group { margin: 12px 8px 4px; color: var(--text-subtle); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.archived-toggle { margin: 12px 4px 4px; padding: 7px; border-radius: 6px; color: var(--text-muted); cursor: pointer; }
-.archived-toggle:hover { background: var(--surface-hover); }
+.archived-toggle { margin: 12px 4px 4px; }
+.archived-toggle button { width: 100%; padding: 7px; border: 0; border-radius: 6px; background: transparent; color: var(--text-muted); text-align: left; }
+.archived-toggle button:hover { background: var(--surface-hover); }
 
 .main { min-width: 0; min-height: 0; position: relative; overflow: hidden; background: var(--bg); }
 .empty-hint, .create-view { height: 100%; display: grid; place-content: center; padding: 32px; }
@@ -236,6 +236,8 @@ textarea:focus, select:focus { border-color: var(--focus); outline: 2px solid co
 .composer-model-slot .field > span { display: none; }
 .button.send { min-height: 36px; }
 .composer-hint { display: none; }
+.composer-hint:has(.show) { display: flex; flex-wrap: wrap; gap: 4px 12px; margin-top: 4px; color: var(--text-subtle); font-size: 11px; }
+.composer-message-status { color: var(--success); }
 .composer-save-status { color: var(--success); opacity: 0; transition: opacity .15s; }
 .composer-save-status.show { opacity: 1; }
 .attach-card { flex: 0 0 auto; width: 236px; min-height: 52px; margin: 6px 0; padding: 6px; display: flex; align-items: center; gap: 8px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface-subtle); }
