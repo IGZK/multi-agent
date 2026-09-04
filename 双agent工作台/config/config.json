@@ -12,10 +12,10 @@
     "modelName": "GPT-5.6 Sol",
     "modelMatch": ["GPT-5\\.6", "5\\.6", "Sol"],
     "replyTimeoutMs": 900000,
-    "replyPollMs": 2500,
-    "stableChecks": 2,
+    "replyPollMs": 300,
+    "replyStableMs": 500,
     "maxAnalysisChars": 30000,
-    "loginPollMs": 15000,
+    "loginPollMs": 1000,
     "loginGraceMs": 45000
   },
   "deepseek": {
@@ -24,6 +24,7 @@
     "dshBin": "C:/Users/Administrator/AppData/Roaming/npm/node_modules/@deepseek-ai/dsh/lib/bin.js",
     "profile": "headless",
     "executorTimeoutMs": 2700000,
+    "outboxPollMs": 150,
     "maxRetries": 2,
     "useSessionPool": true,
     "visible": true,
@@ -44,7 +45,7 @@
     }
   },
   "orchestrator": {
-    "stepIntervalMs": 1500,
+    "stepIntervalMs": 100,
     "maxConsecutiveErrors": 3,
     "protocolReprompts": 2
   },

@@ -74,7 +74,7 @@ export async function waitPort(port, timeoutMs) {
       await rpc(port, "host.describe", {}, 3000);
       return true;
     } catch {
-      await sleep(800);
+      await sleep(100);
     }
   }
   return false;
@@ -117,7 +117,9 @@ export class UiExecutor {
     this.cfg = cfg; // config.deepseek（含 visible/uiProfile/uiOpenWindow/uiBootTimeoutMs/uiChromePath）
     this.logger = logger;
     this.servers = new Map(); // projectId -> {port,url,child,fd,logFile,startedAt,sessions:Map}
+    this.serverStarts = new Map(); // projectId -> Promise，防止预热与正式派发重复启服务
     this.disposeTimers = new Map(); // projectId -> timeout
+    this.catalogPromise = null;
   }
 
   log(level, msg) { this.logger?.[level]?.("dsh-ui", msg); }
@@ -148,10 +150,10 @@ export class UiExecutor {
   }
 
   /** 服务进程是否存活且 API 可用。 */
-  async isAlive(server) {
+  async isAlive(server, timeoutMs = 4000) {
     if (!server || (server.child && server.child.exitCode !== null)) return false;
     try {
-      await rpc(server.port, "host.describe", {}, 4000);
+      await rpc(server.port, "host.describe", {}, timeoutMs);
       return true;
     } catch {
       return false;
@@ -163,9 +165,20 @@ export class UiExecutor {
    * @returns {port,url,...} 或 null（启动失败，调用方应回退 headless）
    */
   async ensureServer(projectId, logDir) {
+    if (this.serverStarts.has(projectId)) return this.serverStarts.get(projectId);
+    const starting = this.ensureServerOnce(projectId, logDir);
+    this.serverStarts.set(projectId, starting);
+    try {
+      return await starting;
+    } finally {
+      if (this.serverStarts.get(projectId) === starting) this.serverStarts.delete(projectId);
+    }
+  }
+
+  async ensureServerOnce(projectId, logDir) {
     const existing = this.servers.get(projectId);
     if (existing) {
-      if (await this.isAlive(existing)) {
+      if (await this.isAlive(existing, 1000)) {
         this.cancelDispose(projectId);
         return existing;
       }
@@ -247,9 +260,37 @@ export class UiExecutor {
     const row = (list?.items || []).find((item) => item.sessionId === saved.session_id);
     if (!row) return null;
     if (saved.cwd && path.resolve(saved.cwd) !== path.resolve(sourceDir)) return null;
+    if (!row.cwd || fs.realpathSync(row.cwd) !== fs.realpathSync(sourceDir)) return null;
+    await this.ensureWorkspace(server, projectId, sourceDir, saved.session_id);
     this.servers.set(projectId, server);
     this.cancelDispose(projectId);
     return { server, sessionId: saved.session_id, running: !!row.running };
+  }
+
+  /** 官方工作区归属必须显式关联；cwd 相同并不会自动归组。 */
+  async ensureWorkspace(server, projectId, sourceDir, sessionId = null) {
+    try {
+      const canonical = await fs.promises.realpath(sourceDir);
+      const { workspace, created } = await rpc(server.port, "workspace.create", { path: canonical }, 15000);
+      if (!workspace?.workspaceId || workspace.path !== canonical) throw new Error("工作区路径或 ID 与请求不匹配");
+      // 默认源码目录统一叫 source，用项目名命名新工作区；已有自定义名称不覆盖。
+      if (created && path.basename(canonical) === "source" && path.basename(path.dirname(canonical)) === projectId) {
+        await rpc(server.port, "workspace.rename", {
+          workspaceId: workspace.workspaceId,
+          title: projectId.replace(/^\d{4}-\d{2}-\d{2}-/, ""),
+        }, 15000);
+      }
+      if (sessionId && !(workspace.sessionIds || []).includes(sessionId)) {
+        // 官方支持同 ID、同 cwd 的幂等创建：补归属，不重建会话/历史。
+        const result = await rpc(server.port, "session.create", { workspaceId: workspace.workspaceId, sessionId }, 60000);
+        if (result?.sessionId !== sessionId) throw new Error("补关联返回了不同会话 ID");
+      }
+      return workspace.workspaceId;
+    } catch (cause) {
+      const error = new Error(`Harness 工作区关联失败: ${cause.message}`, { cause });
+      error.code = "RUNNER_WORKSPACE";
+      throw error;
+    }
   }
 
   /**
@@ -261,18 +302,24 @@ export class UiExecutor {
     const s = this.servers.get(projectId);
     if (!s) throw new Error("可见执行服务未就绪");
     if (s.sessionId) {
+      let row;
       try {
         const list = await rpc(s.port, "session.list", {}, 15000);
-        if ((list.items || []).some((x) => x.sessionId === s.sessionId)) {
-          return { sessionId: s.sessionId, reused: true, bootstrap: !!s.needsBootstrap };
-        }
+        row = (list.items || []).find((x) => x.sessionId === s.sessionId);
       } catch { /* 单次查询失败按失效处理 */ }
+      if (row?.cwd && fs.realpathSync(row.cwd) === fs.realpathSync(sourceDir)) {
+        await this.ensureWorkspace(s, projectId, sourceDir, s.sessionId);
+        return { sessionId: s.sessionId, reused: true, bootstrap: !!s.needsBootstrap };
+      }
       s.sessionId = null;
     }
-    const created = await rpc(s.port, "session.create", { cwd: sourceDir }, 60000);
+    const workspaceId = await this.ensureWorkspace(s, projectId, sourceDir);
+    const created = await rpc(s.port, "session.create", { workspaceId }, 60000);
     if (!created || !created.sessionId) throw new Error("session.create 未返回 sessionId");
     s.sessionId = created.sessionId;
     s.needsBootstrap = false;
+    s.modelSelectionKey = null;
+    s.selectedModel = null;
     return { sessionId: created.sessionId, reused: false, bootstrap: false };
   }
 
@@ -281,10 +328,13 @@ export class UiExecutor {
     const s = this.servers.get(projectId);
     if (!s) throw new Error("可见执行服务未就绪");
     const previousSessionId = s.sessionId || null;
-    const created = await rpc(s.port, "session.create", { cwd: sourceDir }, 60000);
+    const workspaceId = await this.ensureWorkspace(s, projectId, sourceDir);
+    const created = await rpc(s.port, "session.create", { workspaceId }, 60000);
     if (!created?.sessionId) throw new Error("session.create 未返回 sessionId");
     s.sessionId = created.sessionId;
     s.needsBootstrap = true;
+    s.modelSelectionKey = null;
+    s.selectedModel = null;
     return { sessionId: created.sessionId, previousSessionId };
   }
 
@@ -294,10 +344,10 @@ export class UiExecutor {
   }
 
   /** 读取 Harness 尾页投影；能力缺失时返回 null，由编排器使用任务数后备阈值。 */
-  async sessionProjection(projectId, sessionId) {
+  async sessionProjection(projectId, sessionId, timeoutMs = 30000) {
     const s = this.servers.get(projectId);
     if (!s) return null;
-    const history = await rpc(s.port, "session.history", { sessionId, maxMessages: 1 }, 30000);
+    const history = await rpc(s.port, "session.history", { sessionId, maxMessages: 1 }, timeoutMs);
     const values = history?.projections?.values;
     if (!values?.tokenUsage && !values?.contextPressure) return null;
     return {
@@ -307,23 +357,27 @@ export class UiExecutor {
     };
   }
 
-  async currentModel(projectId, sessionId) {
+  async currentModel(projectId, sessionId, timeoutMs = 30000) {
     const s = this.servers.get(projectId);
     if (!s) return null;
-    return (await rpc(s.port, "session.models", { sessionId }, 30000))?.current || null;
+    return (await rpc(s.port, "session.models", { sessionId }, timeoutMs))?.current || null;
   }
 
   /** 为会话选择模型/推理等级。selection = {provider, model, reasoningEffort?}。 */
   async selectModel(projectId, sessionId, selection) {
     const s = this.servers.get(projectId);
     if (!s) throw new Error("可见执行服务未就绪");
+    const selectionKey = JSON.stringify(selection || {});
+    if (s.modelSelectionKey === selectionKey) return s.selectedModel || null;
     const res = await rpc(s.port, "session.selectModel", {
       sessionId,
       provider: selection.provider,
       model: selection.model,
       ...(selection.reasoningEffort === void 0 || selection.reasoningEffort === "" ? {} : { reasoningEffort: selection.reasoningEffort }),
-    }, 30000);
-    return res?.selected || null;
+    }, 5000);
+    s.modelSelectionKey = selectionKey;
+    s.selectedModel = res?.selected || null;
+    return s.selectedModel;
   }
 
   /**
@@ -333,6 +387,16 @@ export class UiExecutor {
    */
   async probeModels() {
     if (this.catalogCache) return this.catalogCache;
+    if (this.catalogPromise) return this.catalogPromise;
+    this.catalogPromise = this.probeModelsOnce();
+    try {
+      return await this.catalogPromise;
+    } finally {
+      this.catalogPromise = null;
+    }
+  }
+
+  async probeModelsOnce() {
     const FALLBACK = {
       current: null,
       groups: [{
@@ -397,10 +461,10 @@ export class UiExecutor {
   }
 
   /** 查询会话运行状态；服务不可用返回 null。 */
-  async sessionState(projectId, sessionId) {
+  async sessionState(projectId, sessionId, timeoutMs = 15000) {
     const s = this.servers.get(projectId);
     if (!s) return null;
-    const list = await rpc(s.port, "session.list", {}, 15000);
+    const list = await rpc(s.port, "session.list", {}, timeoutMs);
     const row = (list.items || []).find((x) => x.sessionId === sessionId);
     if (!row) return null;
     return { running: !!row.running, blank: !!row.blank, updatedAt: row.updatedAt };

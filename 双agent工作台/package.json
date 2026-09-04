@@ -1,6 +1,6 @@
 {
   "name": "ai-dual-agent-workbench",
-  "version": "2.0.0",
+  "version": "2.0.6",
   "private": true,
   "type": "module",
   "description": "双 Agent 协作工作台：GPT-5.6 Sol（聊天型 ChatGPT，浏览器桥）+ DeepSeek Harness（无头执行者）+ 本地编排器 + Web Dashboard",
@@ -8,11 +8,12 @@
   "scripts": {
     "start": "node controller/index.mjs",
     "test": "npm run test:core && npm run test:protocol && npm run test:bridge && npm run test:folder",
-    "test:core": "node --test test/core-regressions.mjs",
+    "test:core": "node --test test/core-regressions.mjs test/workspace-regressions.mjs test/planning-regressions.mjs test/browser-lifecycle.mjs test/gpt-instructions-regressions.mjs",
     "test:protocol": "node controller/protocol.mjs --selftest",
     "test:bridge": "node controller/gpt_bridge.mjs --selftest",
     "test:folder": "node controller/folder_picker.mjs --selftest",
-    "test:runner": "node controller/deepseek_runner.mjs --selftest"
+    "test:runner": "node controller/deepseek_runner.mjs --selftest",
+    "test:performance": "node --test test/bridge-performance.mjs"
   },
   "dependencies": {
     "playwright-core": "^1.62.1"

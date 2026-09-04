@@ -13,6 +13,7 @@ export class ExecutorRouter {
   capabilities(type) { return type === "cli" ? this.cli.capabilities() : { modelSelection: true, sessionResume: true, usage: true, visibleWindow: true }; }
   available() { return [{ type: "deepseek", label: "DeepSeek Harness", configured: true, capabilities: this.capabilities("deepseek") }, { type: "cli", label: "通用命令行", configured: this.cli.health().configured, capabilities: this.capabilities("cli") }]; }
   run(projectId, ...args) { return this.selected(projectId).run(projectId, ...args); }
+  prewarm(projectId, ...args) { return this.type(projectId) === "deepseek" ? this.deepseek.prewarm(projectId, ...args) : null; }
   resume(projectId, ...args) { return this.selected(projectId).resume?.(projectId, ...args) || null; }
   isRunning(projectId) { return this.deepseek.isRunning(projectId) || this.cli.isRunning(projectId); }
   kill(projectId) {

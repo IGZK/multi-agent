@@ -90,6 +90,14 @@ export function parseGptResponse(text) {
  */
 export function parsePlan(text) {
   if (!text) return null;
+  // 新计划使用 JSON 保留任务契约；旧文本只用于读取既有计划。
+  if (typeof text === "object" || String(text).trim().startsWith("{")) {
+    try {
+      const plan = typeof text === "object" ? structuredClone(text) : JSON.parse(text);
+      if (!plan || typeof plan !== "object" || Array.isArray(plan)) return null;
+      return { ...plan, raw: typeof text === "string" ? text : JSON.stringify(plan, null, 2) };
+    } catch { return null; }
+  }
   const plan = {
     status: null,
     project_name: null,
@@ -106,16 +114,22 @@ export function parsePlan(text) {
   let currentTask = null;
   let expectingDeps = false; // "dependencies:" 后跨空行收集依赖（GPT 变体格式）
   const LIST_SECTIONS = new Set(["goals", "acceptance_criteria", "constraints", "questions_for_executor"]);
-  const TASK_ATTRS = new Set(["description", "priority", "dependencies", "id", "kind", "validation", "timeout", "max_attempts"]);
+  const TASK_ATTRS = new Set(["description", "priority", "dependencies", "id", "kind", "validation", "validation_command", "acceptance_check", "timeout", "max_attempts", "files", "steps", "outputs", "open_decisions", "failure_handling", "scope", "inputs", "implementation_notes", "edge_cases", "verification"]);
   const newTask = (id, description = "") => ({
     id: String(id || "").toUpperCase(), description, priority: "medium", dependencies: [],
-    kind: "coding", validation: null, timeout: null, max_attempts: null,
+    kind: "coding", validation: null, validation_command: null, acceptance_check: null, timeout: null, max_attempts: null,
   });
   const assignTaskAttr = (task, key, val) => {
     if (key === "description") task.description = val;
     else if (key === "priority") task.priority = val;
     else if (key === "kind") task.kind = ["coding", "test", "analysis", "docs"].includes(val.toLowerCase()) ? val.toLowerCase() : "coding";
     else if (key === "validation") task.validation = val || null;
+    else if (key === "validation_command") task.validation_command = val || null;
+    else if (key === "acceptance_check") task.acceptance_check = val || null;
+    else if (["failure_handling", "scope", "implementation_notes"].includes(key)) task[key] = val || null;
+    else if (["files", "steps", "outputs", "open_decisions", "inputs", "edge_cases", "verification"].includes(key)) {
+      try { task[key] = JSON.parse(val); } catch { task[key] = null; }
+    }
     else if (key === "timeout") task.timeout = Number.isFinite(Number(val)) && Number(val) > 0 ? Number(val) : null;
     else if (key === "max_attempts") task.max_attempts = Number.isFinite(Number(val)) && Number(val) > 0 ? Math.floor(Number(val)) : null;
   };
@@ -355,7 +369,7 @@ export function extractMsgType(text) {
 export function fallbackParse(text) {
   if (!text) return { status: null, plan: null };
   const plan = parsePlan(text);
-  if (plan && plan.tasks.length > 0) {
+  if (plan && Array.isArray(plan.tasks) && plan.tasks.length > 0) {
     return { status: "READY", plan };
   }
   return { status: null, plan: null };

@@ -69,6 +69,7 @@ export function initialProjectState(projectId, name, task) {
     gpt: {
       conversation_url: null,
       intro_sent: false,
+      instructions: null, // 仅在规范附件随消息发送成功后记录；旧项目首次发送时补齐。
       last_reply_text: null,
       last_reply_ts: null,
       model_selected: null,
@@ -100,6 +101,8 @@ export function initialProjectState(projectId, name, task) {
       capabilities: { modelSelection: true, sessionResume: true, usage: true, visibleWindow: true },
     },
     pending_model_replan: null,
+    pending_task_review: null,
+    task_reviews: [],
     compaction: { pending: false, in_progress: false, count: 0, last: null },
     checkpoint: null,
     model_recommendations: [],
@@ -335,11 +338,14 @@ export class ProjectStore {
     const n = this.countFiles(folder) + 1;
     const file = path.join(folder, `${String(n).padStart(4, "0")}_${dir}.json`);
     const chars = String(text || "").length;
-    const estimatedTokens = Math.ceil(chars / 4);
+    // 内置规范移到附件仍需被模型读取，不能把附件排除后误报 token 节省。
+    const attachmentChars = dir === "out" ? Number(meta.instruction_attachment?.characters || 0) : 0;
+    const estimatedTokens = Math.ceil((chars + attachmentChars) / 4);
     const usage = {
       actual: false,
       estimate: true,
       characters: chars,
+      attachmentCharacters: attachmentChars,
       estimatedTokens,
       direction: dir === "out" ? "input" : "output",
     };
@@ -358,7 +364,7 @@ export class ProjectStore {
       if (msgs.length > 200) msgs.splice(0, msgs.length - 200);
       const gptUsage = { ...(state.usage?.gpt || defaultUsage().gpt) };
       if (dir === "out") {
-        gptUsage.sentCharacters += chars;
+        gptUsage.sentCharacters += chars + attachmentChars;
         gptUsage.estimatedInputTokens += estimatedTokens;
       } else {
         gptUsage.receivedCharacters += chars;
@@ -441,7 +447,15 @@ export class ProjectStore {
     } catch { /* ignore */ }
   }
 
-  createCheckpoint(projectId, taskId, dispatchId) {
+  checkpointExclusions(source) {
+    const excluded = new Set([".git", ".gpt_workspace", "node_modules", ".pnpm-store", ".yarn", ".venv", "venv", "dist", "build", "out", "target", "coverage", ".cache"]);
+    if (path.resolve(source) === path.dirname(path.resolve(this.projectsRoot))) {
+      for (const name of ["browser-profile", path.basename(this.projectsRoot), "logs"]) excluded.add(name);
+    }
+    return excluded;
+  }
+
+  async createCheckpoint(projectId, taskId, dispatchId) {
     const source = path.resolve(this.sourceDir(projectId));
     if (source === path.parse(source).root) throw new Error("拒绝为磁盘根目录创建检查点");
     const safeTask = String(taskId || "task").replace(/[^a-z0-9_-]+/gi, "-");
@@ -449,19 +463,21 @@ export class ProjectStore {
     const rel = path.join("checkpoints", `${safeTask}-${safeDispatch}`);
     const dir = this.resolveWorkspacePath(projectId, rel);
     const snapshot = path.join(dir, "source");
-    const excluded = new Set([".git", ".gpt_workspace", "node_modules", ".pnpm-store", ".yarn", ".venv", "venv", "dist", "build", "out", "target", "coverage", ".cache"]);
-    fs.rmSync(dir, { recursive: true, force: true });
-    fs.mkdirSync(snapshot, { recursive: true });
+    const excluded = this.checkpointExclusions(source);
+    await fs.promises.rm(dir, { recursive: true, force: true });
+    await fs.promises.mkdir(snapshot, { recursive: true });
     try {
       if (fs.existsSync(source)) {
-        fs.cpSync(source, snapshot, {
-          recursive: true,
-          filter: (entry) => {
-            const relPath = path.relative(source, entry);
-            if (!relPath) return true;
-            return !excluded.has(relPath.split(path.sep)[0]);
-          },
-        });
+        // 逐个复制顶层条目，避免源码包含工作台时把检查点复制进自身。
+        for (const entry of await fs.promises.readdir(source)) {
+          if (excluded.has(entry)) continue;
+          const from = path.join(source, entry);
+          const relativeSnapshot = path.relative(from, snapshot);
+          if (!relativeSnapshot || (!relativeSnapshot.startsWith(".." + path.sep) && relativeSnapshot !== ".." && !path.isAbsolute(relativeSnapshot))) {
+            throw new Error("源码目录包含检查点目录，无法安全备份");
+          }
+          await fs.promises.cp(from, path.join(snapshot, entry), { recursive: true });
+        }
       }
       const checkpoint = {
         task_id: String(taskId || ""),
@@ -472,11 +488,12 @@ export class ProjectStore {
         restored_at: null,
         status: "ready",
       };
-      fs.writeFileSync(path.join(dir, "checkpoint.json"), JSON.stringify(checkpoint, null, 2), "utf8");
+      await fs.promises.writeFile(path.join(dir, "checkpoint.json"), JSON.stringify(checkpoint, null, 2), "utf8");
+      if (!this.readState(projectId)) throw new Error("项目已删除，停止创建检查点");
       this.writeState(projectId, { checkpoint });
       return checkpoint;
     } catch (error) {
-      fs.rmSync(dir, { recursive: true, force: true });
+      await fs.promises.rm(dir, { recursive: true, force: true });
       throw error;
     }
   }
@@ -489,7 +506,7 @@ export class ProjectStore {
     const snapshot = path.join(dir, "source");
     const source = path.resolve(this.sourceDir(projectId));
     if (source === path.parse(source).root || !fs.existsSync(snapshot)) throw new Error("检查点不可用或源码目录不安全");
-    const excluded = new Set([".git", ".gpt_workspace", "node_modules", ".pnpm-store", ".yarn", ".venv", "venv", "dist", "build", "out", "target", "coverage", ".cache"]);
+    const excluded = this.checkpointExclusions(source);
     fs.mkdirSync(source, { recursive: true });
     for (const entry of fs.readdirSync(source, { withFileTypes: true })) {
       if (excluded.has(entry.name)) continue;
@@ -527,6 +544,14 @@ export class ProjectStore {
       "## 计划",
       "",
       st.plan?.raw || "（无）",
+      "",
+      "## 任务拆分校验",
+      "",
+      JSON.stringify(st.planning_check || { status: "尚未校验" }, null, 2),
+      "",
+      "## GPT 逐任务检查",
+      "",
+      JSON.stringify({ pending: st.pending_task_review || null, history: st.task_reviews || [] }, null, 2),
       "",
       "## 已完成任务",
       "",

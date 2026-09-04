@@ -170,6 +170,8 @@ const opsRight = await page.evaluate(() => {
   return slot.left >= input.right - 1;
 });
 ok("模型/推理在输入框右侧", opsRight);
+await page.focus("#cModel");
+await page.waitForFunction(() => document.querySelector('#cModel option[value="deepseek/chat"]'));
 actions.length = 0;
 await page.evaluate(() => {
   document.querySelector("#cModel").value = "deepseek/chat";
@@ -329,3 +331,4 @@ const failed = results.filter(r => !r.pass);
 console.log(JSON.stringify({ total: results.length, passed: results.length - failed.length, failed: failed, all: results, jsErrors, dialogs }, null, 2));
 await browser.close();
 await new Promise((resolve) => staticServer.close(resolve));
+process.exitCode = failed.length ? 1 : 0;

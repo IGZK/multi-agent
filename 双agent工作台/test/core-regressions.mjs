@@ -5,15 +5,195 @@ import path from "node:path";
 import test from "node:test";
 import { ProjectStore } from "../controller/store.mjs";
 import { mergePlan, slimPlan, validateExecutorOutbox } from "../controller/protocol.mjs";
-import { DeepseekRunner } from "../controller/deepseek_runner.mjs";
+import { DeepseekRunner, currentOutbox } from "../controller/deepseek_runner.mjs";
 import { ExecutorRouter } from "../controller/executor_router.mjs";
-import { Orchestrator, contextSnapshot, tokenUsageDelta } from "../controller/orchestrator.mjs";
+import { Orchestrator, contextSnapshot, tokenUsageDelta, recognizedValidationCommand } from "../controller/orchestrator.mjs";
 import { DashboardServer } from "../controller/server.mjs";
 import { GptBridge } from "../controller/gpt_bridge.mjs";
 import { buildDeepseekPlanningGuidance, buildExecutorPrompt, buildExecutorTurnPrompt } from "../controller/prompts.mjs";
 import { ensureProfileSkill } from "../controller/workbench_skill.mjs";
+import { UiExecutor } from "../controller/dsh_ui.mjs";
 
 const silent = { info() {}, warn() {}, error() {} };
+
+test("忽略上一派发的迟到重复结果，未知派发仍交由严格校验", () => {
+  let dispatch = "old";
+  const store = { readOutboxStatus: () => ({ complete: true, data: { dispatch_id: dispatch } }), readState: () => ({ processed_dispatch_ids: ["old"] }) };
+  assert.equal(currentOutbox(store, "test", { dispatch_id: "new" }).complete, false);
+  dispatch = "unknown";
+  assert.equal(currentOutbox(store, "test", { dispatch_id: "new" }).complete, true);
+  assert.equal(validateExecutorOutbox({ schema_version: 3, type: "TASK_DONE", dispatch_id: dispatch }, { dispatch_id: "new" }).code, "OUTBOX_DISPATCH");
+  dispatch = "new";
+  assert.equal(currentOutbox(store, "test", { dispatch_id: "new" }).complete, true);
+});
+
+test("并发预热与派发只启动一个 DeepSeek 服务", async () => {
+  let starts = 0;
+  const ui = Object.assign(Object.create(UiExecutor.prototype), {
+    serverStarts: new Map(),
+    async ensureServerOnce() { starts++; await new Promise((resolve) => setImmediate(resolve)); return { port: 1234 }; },
+  });
+  const servers = await Promise.all([ui.ensureServer("test", "logs"), ui.ensureServer("test", "logs")]);
+  assert.equal(starts, 1);
+  assert.equal(servers[0], servers[1]);
+});
+
+test("恢复执行会话收包不等待慢诊断且不重新提交", async () => {
+  const f = fixture();
+  try {
+    const id = f.create();
+    const runner = Object.assign(Object.create(DeepseekRunner.prototype), {
+      cfg: { mode: "real", visible: false }, logger: silent, running: new Map(), cancelled: new Set(),
+      ui: {
+        adoptSession: async () => ({ server: { url: "test" }, sessionId: "existing", running: true }),
+        isAlive: () => new Promise(() => {}), sessionState: () => new Promise(() => {}),
+        submitPrompt: () => assert.fail("不得重新提交"),
+      },
+    });
+    f.store.writeState(id, { session: { service_pid: 1 } });
+    setTimeout(() => f.store.writeOutboxAtomic(id, { done: true }), 25);
+    const result = await runner.resume(id, { workspaceDir: f.store.workspaceDir(id), sourceDir: f.store.sourceDir(id) }, { timeoutMs: 1500 }, f.store);
+    assert.equal(result.exitCode, 0);
+    assert.ok(result.ms < 500);
+  } finally { f.cleanup(); }
+});
+
+test("自然语言验收不会作为 shell 命令执行", () => {
+  assert.equal(recognizedValidationCommand("浏览器打开游戏，按方向键能正常移动"), null);
+  assert.equal(recognizedValidationCommand("node --test"), "node --test");
+  assert.equal(recognizedValidationCommand("npm test"), "npm test");
+});
+
+test("项目会话导航失败时不回退首页发送", async () => {
+  const bridge = { page: { url: () => "about:blank", goto: async () => { throw new Error("navigation failed"); } }, gotoChat: () => assert.fail("不得回退首页") };
+  const orch = new Orchestrator(config(), silent, bridge, {}, {});
+  await assert.rejects(orch.openConversation("test", "https://chatgpt.com/c/test"), { code: "GPT_PAGE_ERROR" });
+});
+
+test("结果时间时区错误只重发信封，不回滚成功源码", async () => {
+  const f = fixture();
+  try {
+    const id = f.create();
+    const task = { id: "TASK-001", description: "test", dependencies: [], validation: "页面可游玩" };
+    const envelope = executorEnvelope(id, task);
+    f.store.writeState(id, { state: "WAITING_FOR_EXECUTOR", current_task: task });
+    fs.writeFileSync(path.join(f.store.sourceDir(id), "keep.txt"), "successful work");
+    f.store.writeOutboxAtomic(id, { ...executorResult(envelope, "TASK_DONE"), created_at: new Date(Date.now() + 8 * 3600000).toISOString() });
+    let repairs = 0;
+    const runner = { async run(projectId, dirs, repair, store) {
+      repairs++;
+      assert.equal(repair.dispatch_id, envelope.dispatch_id);
+      assert.match(buildExecutorTurnPrompt(repair), /不要重新编码/);
+      store.writeOutboxAtomic(projectId, { ...repair.result_repair.original, created_at: new Date().toISOString() });
+      return { exitCode: 0, ms: 1 };
+    } };
+    const orch = new Orchestrator(config(), silent, {}, runner, f.store);
+    await orch.handleExecutorResult(id, { exitCode: 0, ms: 10 }, envelope);
+    assert.equal(repairs, 1);
+    assert.equal(fs.readFileSync(path.join(f.store.sourceDir(id), "keep.txt"), "utf8"), "successful work");
+    assert.equal(f.store.readState(id).completed_tasks.length, 1);
+    assert.equal(f.store.readState(id).validation_results[task.id].skipped, true);
+  } finally { f.cleanup(); }
+});
+
+test("结果时间修复至多一次且暂停后不接纳迟到结果", async () => {
+  const f = fixture();
+  try {
+    const id = f.create();
+    const task = { id: "TASK-001" };
+    const envelope = executorEnvelope(id, task);
+    const stale = { ...executorResult(envelope, "TASK_DONE"), created_at: "invalid" };
+    f.store.writeState(id, { state: "WAITING_FOR_EXECUTOR", current_task: task });
+    f.store.writeOutboxAtomic(id, stale);
+    const runner = { kill() {}, async run() { await orch.pause(id); return { exitCode: 0 }; } };
+    const orch = new Orchestrator(config(), silent, {}, runner, f.store);
+    await assert.rejects(orch.handleExecutorResult(id, { exitCode: 0 }, envelope), { code: "PROJECT_CANCELLED" });
+    assert.equal(f.store.readState(id).completed_tasks.length, 0);
+    f.store.writeOutboxAtomic(id, stale);
+    await assert.rejects(orch.handleExecutorResult(id, {}, { ...envelope, result_repair: { original: stale } }), { code: "OUTBOX_STALE" });
+  } finally { f.cleanup(); }
+});
+
+test("检查点异步复制排除工作台运行数据且不递归自身", async () => {
+  const f = fixture();
+  try {
+    const id = f.create();
+    for (const dir of ["browser-profile", "logs", "node_modules"]) {
+      fs.mkdirSync(path.join(f.root, dir));
+      fs.writeFileSync(path.join(f.root, dir, "keep"), "private");
+    }
+    fs.writeFileSync(path.join(f.root, "app.js"), "original");
+    f.store.writeState(id, { source_dir: f.root });
+    let yielded = false;
+    setImmediate(() => { yielded = true; });
+    const cp = await f.store.createCheckpoint(id, "TASK-001", "speed");
+    assert.equal(yielded, true);
+    const snapshot = path.join(f.store.workspaceDir(id), cp.relative_path, "source");
+    assert.deepEqual(fs.readdirSync(snapshot), ["app.js"]);
+    f.store.restoreCheckpoint(id);
+    assert.equal(fs.readFileSync(path.join(f.root, "browser-profile", "keep"), "utf8"), "private");
+  } finally { f.cleanup(); }
+});
+
+test("普通源码的 projects 和 logs 目录仍纳入检查点", async () => {
+  const f = fixture();
+  try {
+    const id = f.create();
+    for (const name of ["projects", "logs"]) {
+      fs.mkdirSync(path.join(f.store.sourceDir(id), name));
+      fs.writeFileSync(path.join(f.store.sourceDir(id), name, "source.js"), "original");
+    }
+    const cp = await f.store.createCheckpoint(id, "TASK-001", "normal-source");
+    assert.deepEqual(fs.readdirSync(path.join(f.store.workspaceDir(id), cp.relative_path, "source")), ["logs", "projects"]);
+  } finally { f.cleanup(); }
+});
+
+for (const action of ["pause", "deleteProject"]) {
+  test(`检查点复制期间 ${action} 后不得派发执行或复活项目`, async () => {
+    const f = fixture();
+    try {
+      const id = f.create();
+      const task = { id: "TASK-001", description: "test", dependencies: [] };
+      f.store.writeState(id, { state: "EXECUTING", current_task: task });
+      let invoked = false;
+      const orch = new Orchestrator(config(), silent, {}, { kill() {}, run() { invoked = true; } }, f.store);
+      const original = f.store.createCheckpoint.bind(f.store);
+      f.store.createCheckpoint = async (...args) => {
+        const cp = original(...args);
+        await orch[action](id);
+        return cp;
+      };
+      await assert.rejects(orch.dispatchExecutor(id, "EXECUTE_PLAN", task, null));
+      assert.equal(invoked, false);
+      if (action === "pause") assert.equal(f.store.readState(id).state, "PAUSED");
+      else assert.equal(f.store.readState(id), null);
+    } finally { f.cleanup(); }
+  });
+}
+
+test("DeepSeek 收包不被慢健康检查和会话查询阻塞", async () => {
+  const f = fixture();
+  try {
+    const id = f.create();
+    const dirs = { projectDir: f.store.projectDir(id), workspaceDir: f.store.workspaceDir(id), sourceDir: f.store.sourceDir(id) };
+    const never = () => new Promise(() => {});
+    const runner = Object.assign(Object.create(DeepseekRunner.prototype), {
+      cfg: { mode: "real", visible: false, executorTimeoutMs: 2000 }, logger: silent,
+      running: new Map(), cancelled: new Set(),
+      ui: {
+        ensureServer: async () => ({ url: "http://127.0.0.1:1" }),
+        getOrCreateSession: async () => ({ sessionId: "test", reused: false }),
+        submitPrompt: async () => { setTimeout(() => f.store.writeOutboxAtomic(id, { done: true }), 25); },
+        isAlive: never, sessionState: never,
+      },
+    });
+    const start = performance.now();
+    const result = await runner.runSessionPool(id, dirs, { type: "ANALYZE" }, f.store, "test");
+    const elapsed = performance.now() - start;
+    assert.equal(result.exitCode, 0);
+    assert.ok(elapsed < 500, `收包耗时 ${elapsed}ms`);
+  } finally { f.cleanup(); }
+});
 
 function fixture() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "dual-agent-test-"));
@@ -258,9 +438,10 @@ test("执行信封不再重复携带完整任务列表", () => {
 test("DeepSeek 档位会改变 GPT 的任务描述策略", () => {
   const strong = buildDeepseekPlanningGuidance({ model: "deepseek-v4-pro", reasoningEffort: "high" });
   const guided = buildDeepseekPlanningGuidance({ model: "deepseek-v4-flash", reasoningEffort: "off" });
-  assert.match(strong, /任务可较粗/);
-  assert.match(guided, /拆成小而自足/);
-  assert.match(guided, /验证命令或检查点/);
+  assert.match(strong, /pro\/high/);
+  assert.match(guided, /逐步指挥/);
+  assert.match(strong, /其他实现细节|均可省略/);
+  assert.match(guided, /实现与对应测试放在同一任务/);
 });
 
 test("GPT 规划请求会带上项目当前 DeepSeek 档位", async () => {
@@ -279,7 +460,7 @@ test("GPT 规划请求会带上项目当前 DeepSeek 档位", async () => {
     const orch = new Orchestrator(config(), silent, bridge, {}, f.store);
     await orch.sendToGpt(id, "PLAN_REQUEST", "规划这个项目", { intro: true });
     assert.match(sent, /deepseek-v4-flash/);
-    assert.match(sent, /拆成小而自足/);
+    assert.match(sent, /flash\/low/);
   } finally { f.cleanup(); }
 });
 
@@ -351,18 +532,23 @@ test("同一项目复用会话时只打开一次执行窗口", async () => {
       profileName: "test",
       ensureServer: async () => server,
       getOrCreateSession: async () => ({ sessionId: "session-1", reused }),
+      currentModel: async () => ({ model: "deepseek-v4-pro", reasoningEffort: "max" }),
       submitPrompt: async () => fs.writeFileSync(outbox, "{}"),
       openWindow: () => { opened++; return { opened: true }; },
       isAlive: async () => true,
     },
   });
   const store = { readState: () => ({}), writeState() {} };
-  const envelope = { type: "EXECUTE_PLAN", current_task: { id: "TASK-001" }, workspace_dir: dirs.workspaceDir };
+  const envelope = { type: "EXECUTE_PLAN", current_task: {
+    id: "TASK-001", description: "验证文件", scope: "检查 main.js", kind: "test", files: ["main.js"],
+    steps: ["读取文件", "检查导出", "验证结果"], outputs: ["验证记录"], open_decisions: [], dependencies: [],
+    acceptance_check: "导出正确", failure_handling: "记录错误",
+  }, workspace_dir: dirs.workspaceDir };
   try {
     await runner.runSessionPool("project", dirs, envelope, store, buildExecutorPrompt(envelope));
     fs.rmSync(outbox, { force: true });
     reused = true;
-    envelope.current_task = { id: "TASK-002" };
+    envelope.current_task = { ...envelope.current_task, id: "TASK-002" };
     await runner.runSessionPool("project", dirs, envelope, store, buildExecutorPrompt(envelope));
     assert.equal(opened, 1);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
@@ -417,12 +603,14 @@ test("恢复等待状态时会重建浏览器并打开保存的会话", async ()
 
 test("浏览器仍连接但页面已关闭时会重建页面", async () => {
   const page = {
+    url: () => "https://chatgpt.com/",
     isClosed: () => false,
     setDefaultTimeout() {},
     on() {},
   };
   const bridge = Object.assign(Object.create(GptBridge.prototype), {
     cfg: { debugPort: 9333 },
+    baseUrl: "https://chatgpt.com/",
     logger: silent,
     page: null,
     browser: {
@@ -492,7 +680,7 @@ test("自动重试成功后不会同时留下失败记录", async () => {
   try {
     const id = f.create();
     const task = { id: "TASK-001", description: "可重试", dependencies: [], max_attempts: 2 };
-    f.store.writeState(id, { state: "WAITING_FOR_EXECUTOR", current_task: task, plan: { parsed: { tasks: [task] } } });
+    f.store.writeState(id, { state: "WAITING_FOR_EXECUTOR", current_task: task, failed_tasks: [{ id: task.id, summary: "旧故障" }], plan: { parsed: { tasks: [task] } } });
     const runner = {
       async run(projectId, dirs, envelope, store) {
         store.writeOutboxAtomic(projectId, executorResult(envelope, "TASK_DONE", "重试成功"));
@@ -501,7 +689,7 @@ test("自动重试成功后不会同时留下失败记录", async () => {
     };
     const orch = new Orchestrator(config(), silent, {}, runner, f.store);
     const envelope = executorEnvelope(id, task);
-    f.store.createCheckpoint(id, task.id, envelope.dispatch_id);
+    await f.store.createCheckpoint(id, task.id, envelope.dispatch_id);
     f.store.writeOutboxAtomic(id, executorResult(envelope, "TASK_FAILED", "首次失败"));
     await orch.handleExecutorResult(id, { exitCode: 1, timedOut: false, ms: 1 }, envelope);
     const state = f.store.readState(id);
@@ -520,7 +708,7 @@ test("任务重试耗尽后会把失败交给 GPT 决策", async () => {
     const orch = new Orchestrator(config(), silent, {}, {}, f.store);
     orch.sendToGpt = async (_projectId, type, text) => { assert.equal(type, "QUERY"); query = text; };
     const envelope = executorEnvelope(id, task, 2);
-    f.store.createCheckpoint(id, task.id, envelope.dispatch_id);
+    await f.store.createCheckpoint(id, task.id, envelope.dispatch_id);
     f.store.writeOutboxAtomic(id, executorResult(envelope, "TASK_FAILED", "仍然失败"));
     await orch.handleExecutorResult(id, { exitCode: 1, timedOut: false, ms: 1 }, envelope);
     assert.match(query, /最终失败任务/);
@@ -548,7 +736,7 @@ test("半写 outbox 不会被视为完整结果", () => {
   } finally { f.cleanup(); }
 });
 
-test("任务检查点恢复源码并保留依赖目录", () => {
+test("任务检查点恢复源码并保留依赖目录", async () => {
   const f = fixture();
   try {
     const id = f.create();
@@ -556,7 +744,7 @@ test("任务检查点恢复源码并保留依赖目录", () => {
     fs.writeFileSync(path.join(source, "app.txt"), "before", "utf8");
     fs.mkdirSync(path.join(source, "node_modules"), { recursive: true });
     fs.writeFileSync(path.join(source, "node_modules", "keep.txt"), "keep", "utf8");
-    f.store.createCheckpoint(id, "TASK-001", "dispatch-1");
+    await f.store.createCheckpoint(id, "TASK-001", "dispatch-1");
     fs.writeFileSync(path.join(source, "app.txt"), "after", "utf8");
     fs.writeFileSync(path.join(source, "extra.txt"), "remove", "utf8");
     f.store.restoreCheckpoint(id);
@@ -572,7 +760,7 @@ test("检查点恢复失败会进入 ERROR 且停止重试", async () => {
     const id = f.create();
     const task = { id: "TASK-001", description: "恢复失败", dependencies: [], max_attempts: 2 };
     const envelope = executorEnvelope(id, task);
-    const checkpoint = f.store.createCheckpoint(id, task.id, envelope.dispatch_id);
+    const checkpoint = await f.store.createCheckpoint(id, task.id, envelope.dispatch_id);
     fs.rmSync(f.store.resolveWorkspacePath(id, `${checkpoint.relative_path}/source`), { recursive: true, force: true });
     f.store.writeState(id, { current_task: task, plan: { parsed: { tasks: [task] } } });
     const orch = new Orchestrator(config(), silent, {}, {}, f.store);
@@ -599,7 +787,7 @@ test("验证失败按普通失败回滚并重试", async () => {
     const orch = new Orchestrator(config(), silent, {}, runner, f.store);
     orch.sendToGpt = async () => {};
     const envelope = executorEnvelope(id, task);
-    f.store.createCheckpoint(id, task.id, envelope.dispatch_id);
+    await f.store.createCheckpoint(id, task.id, envelope.dispatch_id);
     f.store.writeOutboxAtomic(id, executorResult(envelope, "TASK_DONE"));
     await orch.handleExecutorResult(id, { exitCode: 0, timedOut: false, ms: 1 }, envelope);
     const state = f.store.readState(id);

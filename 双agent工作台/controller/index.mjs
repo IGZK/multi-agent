@@ -86,7 +86,7 @@ async function main() {
     try { fs.rmSync(selftestProjectsRoot, { recursive: true, force: true }); } catch { /* ignore */ }
     opts.projectsRoot = selftestProjectsRoot;
   }
-  const { config, logger, bridge, runner, orchestrator, server, store } = buildSystem(opts);
+  const { config, logger, runner, orchestrator, server, store } = buildSystem(opts);
 
   logger.info("main", `============================================`);
   logger.info("main", `双 Agent 协作工作台启动`);

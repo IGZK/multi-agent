@@ -11,6 +11,8 @@ let lastTasksSig = null;
 let lastChatSig = null;
 let lastChatCount = 0;
 let windowVisible = null;
+let refreshPromise = null;
+let detailGeneration = 0;
 
 const STATE_META = {
   INIT: ["初始化", "info"], WAITING_FOR_LOGIN: ["等待登录", "wait"], GPT_PLANNING: ["GPT 规划中", "run"],
@@ -104,7 +106,15 @@ function fillModelSelect(select) {
       select.appendChild(option);
     }
   }
-  if (previous) select.value = previous;
+  if (previous) setModelValue(select, previous);
+}
+
+function setModelValue(select, value) {
+  // 已保存的模型即时展示，不必等冷启动的模型目录探测。
+  if (value && ![...select.options].some((option) => option.value === value)) {
+    select.add(new Option(value, value));
+  }
+  select.value = value;
 }
 
 async function populateModelSelects() {
@@ -119,17 +129,23 @@ function selectedModelPayload() {
   return { ...selected, reasoningEffort: $("#dsReasoning").value };
 }
 
-async function refresh() {
-  try {
-    const data = await api("/api/projects");
-    projectsCache = data.projects || [];
-    systemCache = data.system || null;
-    renderProjectList();
-    renderSystem(data.system);
-    if (currentProjectId) await refreshDetail();
-  } catch (error) {
-    $("#sysStatus").textContent = error.message;
-  }
+async function refresh(force = false) {
+  if (refreshPromise && !force) return refreshPromise;
+  const running = (async () => {
+    try {
+      const data = await api("/api/projects");
+      projectsCache = data.projects || [];
+      systemCache = data.system || null;
+      renderProjectList();
+      renderSystem(data.system);
+      if (currentProjectId) await refreshDetail();
+    } catch (error) {
+      $("#sysStatus").textContent = error.message;
+    }
+  })();
+  refreshPromise = running;
+  try { return await running; }
+  finally { if (refreshPromise === running) refreshPromise = null; }
 }
 
 function renderSystem(system) {
@@ -217,6 +233,7 @@ async function actionWith(actionName, payload = {}, projectId = currentProjectId
 
 function selectProject(projectId) {
   currentProjectId = projectId;
+  detailGeneration++;
   lastChatSig = null; lastChatCount = 0; lastTasksSig = null;
   $("#emptyHint").classList.add("hidden");
   $("#createView").classList.add("hidden");
@@ -227,8 +244,11 @@ function selectProject(projectId) {
 
 async function refreshDetail() {
   if (!currentProjectId) return;
+  const requestedId = currentProjectId;
+  const generation = ++detailGeneration;
   try {
-    const detail = await api(`/api/projects/${encodeURIComponent(currentProjectId)}`);
+    const detail = await api(`/api/projects/${encodeURIComponent(requestedId)}`);
+    if (requestedId !== currentProjectId || generation !== detailGeneration) return;
     $("#dName").textContent = detail.name || detail.id;
     $("#dName").title = detail.id;
     $("#curpName").textContent = detail.name || detail.id;
@@ -243,7 +263,7 @@ async function refreshDetail() {
 
     const selection = detail.deepseek_selection;
     if (document.activeElement !== $("#cModel") && document.activeElement !== $("#cReasoning")) {
-      $("#cModel").value = selection?.model ? modelValue(selection.provider || "deepseek-official", selection.model) : "";
+      setModelValue($("#cModel"), selection?.model ? modelValue(selection.provider || "deepseek-official", selection.model) : "");
       $("#cReasoning").value = selection?.reasoningEffort || "";
     }
 
@@ -297,6 +317,7 @@ async function refreshDetail() {
       if (entry && !entry.configured && !option.textContent.includes("未配置")) option.textContent += "（未配置）";
     }
   } catch (error) {
+    if (requestedId !== currentProjectId || generation !== detailGeneration) return;
     console.error(error);
     callout($("#dError"), true, "无法刷新项目", escapeHtml(error.message));
   }
@@ -363,7 +384,8 @@ function renderTasks(detail) {
     else if (failed.has(task.id)) { status = "失败"; style = "failed"; }
     else if (detail.current_task?.id === task.id) { status = "执行中"; style = "running"; }
     const execution = taskMetrics.length ? `${fmtDuration(duration / 1000)} · ${taskMetrics.length} 次` : "—";
-    const validationText = !task.validation ? "未配置" : !validation ? "待验证" : validation.ok ? "通过" : `失败：${validation.output || validation.error || "命令未通过"}`;
+    const validationSpec = task.validation_command || task.acceptance_check || task.validation;
+    const validationText = !validationSpec ? "未配置" : !validation ? "待验证" : validation.skipped ? "自然语言标准（最终审查）" : validation.ok ? "通过" : `失败：${validation.output || validation.error || "命令未通过"}`;
     const row = document.createElement("tr");
     row.innerHTML = `<td><strong>${escapeHtml(task.id)}</strong></td><td>${escapeHtml(task.description || "")}</td><td>${escapeHtml(task.kind || "coding")}</td><td>${escapeHtml(execution)}</td><td>${taskMetrics.some((item) => item.actual) ? fmtTokens(tokens) : "不可用"}</td><td><div class="validation-result ${validation?.ok ? "ok" : validation ? "failed" : ""}" title="${escapeHtml(validationText)}">${escapeHtml(validationText)}</div></td><td><span class="task-status ${style}">${status}</span></td>`;
     body.appendChild(row);
@@ -774,6 +796,20 @@ function applyTheme(value) {
 themeButton.onclick = () => applyTheme(document.documentElement.dataset.theme === "dark" ? "light" : "dark");
 try { applyTheme(localStorage.getItem("wb-theme") || "light"); } catch { applyTheme("light"); }
 
-populateModelSelects();
-refresh();
-setInterval(refresh, 2000);
+// 模型目录会启动一次临时 Harness；用户首次操作模型控件时再加载，不与首屏/项目打开争抢资源。
+let modelLoadStarted = false;
+const ensureModels = () => {
+  if (modelLoadStarted) return;
+  modelLoadStarted = true;
+  populateModelSelects();
+};
+for (const select of [$("#dsModel"), $("#cModel")]) {
+  select?.addEventListener("focus", ensureModels, { once: true });
+  select?.addEventListener("pointerenter", ensureModels, { once: true });
+}
+
+async function poll() {
+  await refresh();
+  setTimeout(poll, 1000);
+}
+poll();

@@ -159,11 +159,10 @@ export class DashboardServer {
         return sendJson(res, 200, {
           projects: this.store.listProjects(),
           system: {
-            bridge: await this.bridge.getSystemState().catch(() => ({})),
+            bridge: await this.bridge.getSystemState({ probe: false }).catch(() => ({})),
             runner: this.runner.status(),
             mode: { gpt: this.cfg.gpt?.mode, deepseek: this.cfg.deepseek?.mode },
           },
-          log: this.logger.tailText(250),
         });
       }
       const m = p.match(/^\/api\/projects\/([^/]+)$/);

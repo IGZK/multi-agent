@@ -36,3 +36,9 @@ user-invocable: false
 ```
 
 JSON 必须合法。写完 outbox 后最终只回复：`EXECUTOR_DONE`。
+
+outbox 成功写入后立即结束本轮，不再调用任何工具。工作台可能立即消费并删除 outbox、更新 inbox，这不是写入失败；不得再次检查、补写旧结果或继续读取项目状态。
+
+`created_at` 必须从系统时钟程序化生成：Node 使用 `new Date().toISOString()`，PowerShell 使用 `[DateTime]::UtcNow.ToString('o')`。不得把本地时间直接追加 `Z`（例如北京时间会因此错误地领先 UTC 八小时），不得凭空猜测时间。
+
+若信封含 `result_repair`，这是仅重发结果的修复轮次：保留 `result_repair.original` 中的结果字段，仅修正时间并原子重写 outbox；不得重做任务或修改源码。
